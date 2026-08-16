@@ -1,3 +1,4 @@
+#pragma once
 #include "PacketBuffer.h"
 #include <cstring> 
 #include <mutex>

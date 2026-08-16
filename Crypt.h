@@ -12,15 +12,15 @@ constexpr std::size_t AES256_KEY_LEN = 32;
 constexpr std::size_t AES_GCM_NONCE_LEN = 12;
 constexpr std::size_t AES_GCM_TAG_LEN = 16;
 constexpr std::size_t HKDF_SHA256_MAX_OUTPUT_LEN = 255 * 32;
-constexpr std::size_t ED25519_SIG_LEN = 64;      // Ed25519 Ç©Ãû³¤¶È£¨×Ö½Ú£©
-constexpr std::size_t HANDSHAKE_NONCE_LEN = 16;  // ÎÕÊÖËæ»úÊı nonce_c / nonce_s ³¤¶È£¨×Ö½Ú£©
-constexpr std::size_t REGISTER_TOKEN_LEN = 32;   // Ò»´ÎĞÔ×¢²áÁîÅÆ³¤¶È£¨×Ö½Ú£©
+constexpr std::size_t ED25519_SIG_LEN = 64;      // Ed25519 ç­¾åé•¿åº¦ï¼ˆå­—èŠ‚ï¼‰
+constexpr std::size_t HANDSHAKE_NONCE_LEN = 16;  // æ¡æ‰‹éšæœºæ•° nonce_c / nonce_s é•¿åº¦ï¼ˆå­—èŠ‚ï¼‰
+constexpr std::size_t REGISTER_TOKEN_LEN = 32;   // ä¸€æ¬¡æ€§æ³¨å†Œä»¤ç‰Œé•¿åº¦ï¼ˆå­—èŠ‚ï¼‰
 
 
-// ²Á³ı vector µ±Ç°ÒÑ·ÖÅäÇøÓòÖĞµÄÃô¸ĞÊı¾İ£»²»»áÊÍ·ÅÈİÁ¿¡£
+// æ“¦é™¤ vector å½“å‰å·²åˆ†é…åŒºåŸŸä¸­çš„æ•æ„Ÿæ•°æ®ï¼›ä¸ä¼šé‡Šæ”¾å®¹é‡ã€‚
 void secure_wipe(std::vector<std::uint8_t>& buffer) noexcept;
 
-// ·µ»ØµÄ EVP_PKEY* ÓÉµ÷ÓÃ·½Ê¹ÓÃ EVP_PKEY_free() ÊÍ·Å¡£
+// è¿”å›çš„ EVP_PKEY* ç”±è°ƒç”¨æ–¹ä½¿ç”¨ EVP_PKEY_free() é‡Šæ”¾ã€‚
 EVP_PKEY* load_x25519_private_key(const std::string& pem_path);
 EVP_PKEY* load_x25519_public_key(const std::string& pem_path);
 // Generate a new X25519 key pair and write them as PEM files (client.key / client.pub).
@@ -72,27 +72,27 @@ bool parse_inner_packet(
     std::vector<std::uint8_t>& output_payload);
 
 
-// ===================== Ed25519 Éí·İÃÜÔ¿£¨³Ö¾ÃÉí·İ£¬¹«Ë½Ô¿ÑéÖ¤£© =====================
-// Éú³É³Ö¾Ã Ed25519 Éí·İÃÜÔ¿¶Ô£ºË½Ô¿Ğ´Îª PKCS#8 PEM£¬¹«Ô¿Ğ´Îª SPKI PEM£¬
-// Í¬Ê±°Ñ¹«Ô¿ PEM ÎÄ±¾·µ»Ø¸øµ÷ÓÃ·½£¨ÓÃÓÚÕ¹Ê¾ / Ó²±àÂë½ø¶Ô¶Ë³ÌĞò£©¡£
-// ·şÎñÆ÷Éí·İÓÃ SIG_SRV_PRI/SIG_SRV_PUB£¬¿Í»§¶ËÉí·İÓÃ SIG_CLI_PRI/SIG_CLI_PUB¡£
+// Ed25519 èº«ä»½å¯†é’¥ï¼ˆæŒä¹…èº«ä»½ï¼Œå…¬ç§é’¥éªŒè¯ï¼‰
+// ç”ŸæˆæŒä¹… Ed25519 èº«ä»½å¯†é’¥å¯¹ï¼šç§é’¥å†™ä¸º PKCS#8 PEMï¼Œå…¬é’¥å†™ä¸º SPKI PEMï¼Œ
+// åŒæ—¶æŠŠå…¬é’¥ PEM æ–‡æœ¬è¿”å›ç»™è°ƒç”¨æ–¹ï¼ˆç”¨äºå±•ç¤º / ç¡¬ç¼–ç è¿›å¯¹ç«¯ç¨‹åºï¼‰ã€‚
+// æœåŠ¡å™¨èº«ä»½ç”¨ SIG_SRV_PRI/SIG_SRV_PUBï¼Œå®¢æˆ·ç«¯èº«ä»½ç”¨ SIG_CLI_PRI/SIG_CLI_PUBã€‚
 bool generate_ed25519_keypair(
     const std::string& priv_path,
     const std::string& pub_path,
     std::string& pub_pem_out);
 
-// ·µ»ØµÄ EVP_PKEY* ÓÉµ÷ÓÃ·½Ê¹ÓÃ EVP_PKEY_free() ÊÍ·Å¡£
+// è¿”å›çš„ EVP_PKEY* ç”±è°ƒç”¨æ–¹ä½¿ç”¨ EVP_PKEY_free() é‡Šæ”¾ã€‚
 EVP_PKEY* load_ed25519_private_key(const std::string& pem_path);
 EVP_PKEY* load_ed25519_public_key(const std::string& pem_path);
 
-// Ed25519 Ç©Ãû£¨´¿ EdDSA£©£º¶Ô message ¼ÆËã 64 ×Ö½ÚÇ©Ãû£¨ED25519_SIG_LEN£©¡£
-// ½×¶Î1Ê¾Àı£ºsig_payload = nonce_c || nonce_s || DH_SRV_EPHEM_PUB£¬ÓÃ SIG_SRV_PRI Ç©Ãû¡£
+// Ed25519 ç­¾åï¼ˆçº¯ EdDSAï¼‰ï¼šå¯¹ message è®¡ç®— 64 å­—èŠ‚ç­¾åï¼ˆED25519_SIG_LENï¼‰ã€‚
+// é˜¶æ®µ1ç¤ºä¾‹ï¼šsig_payload = nonce_c || nonce_s || DH_SRV_EPHEM_PUBï¼Œç”¨ SIG_SRV_PRI ç­¾åã€‚
 std::vector<std::uint8_t> ed25519_sign(
     EVP_PKEY* private_key,
     const std::uint8_t* message,
     std::size_t message_length);
 
-// Ed25519 ÑéÇ©£ºtrue = Ç©ÃûÓĞĞ§£¬false = Ç©ÃûÎŞĞ§£¨²ÎÊı·Ç·¨Ê±Å×Òì³££©¡£
+// Ed25519 éªŒç­¾ï¼štrue = ç­¾åæœ‰æ•ˆï¼Œfalse = ç­¾åæ— æ•ˆï¼ˆå‚æ•°éæ³•æ—¶æŠ›å¼‚å¸¸ï¼‰ã€‚
 bool ed25519_verify(
     EVP_PKEY* public_key,
     const std::uint8_t* message,
@@ -100,34 +100,34 @@ bool ed25519_verify(
     const std::uint8_t* signature,
     std::size_t signature_length);
 
-// ===================== Ëæ»úÊıÓë×¢²áÁîÅÆ =====================
-// Éú³É length ×Ö½Ú°²È«Ëæ»úÊı£¨Ä¬ÈÏ 16 ×Ö½Ú£¬ÓÃÓÚ nonce_c / nonce_s£©¡£
+// éšæœºæ•°ä¸æ³¨å†Œä»¤ç‰Œ
+// ç”Ÿæˆ length å­—èŠ‚å®‰å…¨éšæœºæ•°ï¼ˆé»˜è®¤ 16 å­—èŠ‚ï¼Œç”¨äº nonce_c / nonce_sï¼‰ã€‚
 std::vector<std::uint8_t> generate_nonce(std::size_t length = HANDSHAKE_NONCE_LEN);
 
-// Éú³ÉÒ»´ÎĞÔ×¢²áÁîÅÆ£¨REGISTER_TOKEN_LEN ×Ö½ÚËæ»úÊı£¬·µ»Ø 64 Î»Ê®Áù½øÖÆ×Ö·û´®£©¡£
+// ç”Ÿæˆä¸€æ¬¡æ€§æ³¨å†Œä»¤ç‰Œï¼ˆREGISTER_TOKEN_LEN å­—èŠ‚éšæœºæ•°ï¼Œè¿”å› 64 ä½åå…­è¿›åˆ¶å­—ç¬¦ä¸²ï¼‰ã€‚
 std::string generate_register_token();
 
-// ===================== »á»°ÃÜÔ¿ÅÉÉú£¨½×¶Î2£ºHKDF-Extract + HKDF-Expand£© =====================
-// HKDF-Extract£ºprk = HKDF-Extract(salt, IKM)£¬·µ»Ø 32 ×Ö½Ú PRK£¨SHA-256£©¡£
+// ä¼šè¯å¯†é’¥æ´¾ç”Ÿï¼ˆé˜¶æ®µ2ï¼šHKDF-Extract + HKDF-Expandï¼‰
+// HKDF-Extractï¼šprk = HKDF-Extract(salt, IKM)ï¼Œè¿”å› 32 å­—èŠ‚ PRKï¼ˆSHA-256ï¼‰ã€‚
 std::vector<std::uint8_t> hkdf_extract(
     const std::vector<std::uint8_t>& ikm,
     const std::vector<std::uint8_t>& salt);
 
-// HKDF-Expand£º´Ó PRK ÅÉÉú output_length ×Ö½ÚÃÜÔ¿²ÄÁÏ¡£
+// HKDF-Expandï¼šä» PRK æ´¾ç”Ÿ output_length å­—èŠ‚å¯†é’¥ææ–™ã€‚
 std::vector<std::uint8_t> hkdf_expand(
     const std::vector<std::uint8_t>& prk,
     const std::string& info,
     std::size_t output_length);
 
-// ·½ÏòĞÔ»á»°ÃÜÔ¿£º¿Í»§¶Ë¡ú·şÎñ¶Ë Óë ·şÎñ¶Ë¡ú¿Í»§¶Ë Á½¸ö·½Ïò¸÷ 32 ×Ö½Ú AES-256 ÃÜÔ¿¡£
-// prk    = HKDF-Extract(salt = nonce_c || nonce_s, IKM = X25519 ¹²ÏíÃØÃÜ)
-// key_tx = HKDF-Expand(prk, "tx", 32)   ¿Í»§¶Ë¡ú·şÎñ¶Ë
-// key_rx = HKDF-Expand(prk, "rx", 32)   ·şÎñ¶Ë¡ú¿Í»§¶Ë
-// Á½¶Ë´«ÈëÏàÍ¬µÄ nonce_c/nonce_s µÃµ½ÏàÍ¬½á¹û£»¿Í»§¶ËÓÃ key_tx ·¢ËÍ¡¢key_rx ½ÓÊÕ£¬·şÎñ¶Ë·´Ö®¡£
+// æ–¹å‘æ€§ä¼šè¯å¯†é’¥ï¼šå®¢æˆ·ç«¯â†’æœåŠ¡ç«¯ ä¸ æœåŠ¡ç«¯â†’å®¢æˆ·ç«¯ ä¸¤ä¸ªæ–¹å‘å„ 32 å­—èŠ‚ AES-256 å¯†é’¥ã€‚
+// prk    = HKDF-Extract(salt = nonce_c || nonce_s, IKM = X25519 å…±äº«ç§˜å¯†)
+// key_tx = HKDF-Expand(prk, "tx", 32)   å®¢æˆ·ç«¯â†’æœåŠ¡ç«¯
+// key_rx = HKDF-Expand(prk, "rx", 32)   æœåŠ¡ç«¯â†’å®¢æˆ·ç«¯
+// ä¸¤ç«¯ä¼ å…¥ç›¸åŒçš„ nonce_c/nonce_s å¾—åˆ°ç›¸åŒç»“æœï¼›å®¢æˆ·ç«¯ç”¨ key_tx å‘é€ã€key_rx æ¥æ”¶ï¼ŒæœåŠ¡ç«¯åä¹‹ã€‚
 struct DirectionalSessionKeys
 {
-    std::vector<std::uint8_t> key_tx; // ¿Í»§¶Ë¡ú·şÎñ¶Ë ·½ÏòÃÜÔ¿
-    std::vector<std::uint8_t> key_rx; // ·şÎñ¶Ë¡ú¿Í»§¶Ë ·½ÏòÃÜÔ¿
+    std::vector<std::uint8_t> key_tx; // å®¢æˆ·ç«¯â†’æœåŠ¡ç«¯ æ–¹å‘å¯†é’¥
+    std::vector<std::uint8_t> key_rx; // æœåŠ¡ç«¯â†’å®¢æˆ·ç«¯ æ–¹å‘å¯†é’¥
 };
 DirectionalSessionKeys derive_directional_session_keys(
     const std::vector<std::uint8_t>& shared_secret,
@@ -135,7 +135,7 @@ DirectionalSessionKeys derive_directional_session_keys(
     const std::vector<std::uint8_t>& nonce_s);
 
 
-// ´Ó PEM ÎÄ±¾¼ÓÔØ Ed25519 ÃÜÔ¿£¨ÓÃÓÚÄÚÖÃÓ²±àÂë¹«Ô¿ / DPAPI ½âÃÜºóµÄË½Ô¿£©¡£
-// ·µ»ØµÄ EVP_PKEY* ÓÉµ÷ÓÃ·½Ê¹ÓÃ EVP_PKEY_free() ÊÍ·Å¡£
+// ä» PEM æ–‡æœ¬åŠ è½½ Ed25519 å¯†é’¥ï¼ˆç”¨äºå†…ç½®ç¡¬ç¼–ç å…¬é’¥ / DPAPI è§£å¯†åçš„ç§é’¥ï¼‰ã€‚
+// è¿”å›çš„ EVP_PKEY* ç”±è°ƒç”¨æ–¹ä½¿ç”¨ EVP_PKEY_free() é‡Šæ”¾ã€‚
 EVP_PKEY* load_ed25519_private_key_pem(const std::string& pem_text);
 EVP_PKEY* load_ed25519_public_key_pem(const std::string& pem_text);

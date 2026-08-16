@@ -33,6 +33,9 @@ public:
         std::string listen_ip = "0.0.0.0";
         uint16_t listen_port = 51820;
 
+        // 多用户：最大并发客户端数（0=默认 64），服务端自动为每个客户端分配虚拟 IP
+        size_t max_clients = 0;
+
         // 身份认证：服务器持久 Ed25519 身份密钥（SIG_SRV_PRI / SIG_SRV_PUB）
         std::string key_sig_path = "keys/server_sig.key";
         std::string key_sig_pub_path = "keys/server_sig.pub";
@@ -57,7 +60,7 @@ public:
     bool is_running() const;
 
 private:
-    // ===== 转发层 =====
+    // 转发层
     void forward_tun_to_udp();     // 通读TUN: 读 IP 包 → udp.send_ip_packet()
     void forward_udp_to_tun();     // 通读UDP: udp.recv_ip_packet() → tun.write_buf()
 

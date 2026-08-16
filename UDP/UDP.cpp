@@ -27,7 +27,7 @@
 
 
 
-// ===================== 握手负载（模仿 TCP 的 ISN/ACK 语义） =====================
+// 握手负载（模仿 TCP 的 ISN/ACK 语义）
 // 三次握手（客户端视角）：
 //   1) SYN     : type = m_hand_request , payload = { isn = 本端ISN,   ack = 0           }
 //   2) SYN+ACK : type = m_hand_response, payload = { isn = 对端ISN,   ack = 本端ISN + 1 }
@@ -59,7 +59,7 @@ namespace{
             std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
-    // ===== 密钥交换辅助（X25519 + HKDF + AES-256-GCM）=====
+    // 密钥交换辅助（X25519 + HKDF + AES-256-GCM）
     constexpr size_t kKeyExchangePayloadSize = 64; // 32B 公钥 + 32B 随机盐
 
     bool random_bytes(std::vector<uint8_t>& out)
@@ -444,7 +444,7 @@ void UDP::recv_work()
         }
 #endif
 
-        // ===== 加密类型：密钥就绪后 m_data / m_heart / m_heart_response 均为密文 =====
+        // 加密类型：密钥就绪后 m_data / m_heart / m_heart_response 均为密文
         if(hdr.type == static_cast<uint8_t>(m_data) ||
            hdr.type == static_cast<uint8_t>(m_heart) ||
            hdr.type == static_cast<uint8_t>(m_heart_response)){
@@ -495,7 +495,7 @@ void UDP::recv_work()
             continue;
         }
 
-        // ===== 明文类型：握手 / 密钥交换 / 断开 =====
+        // 明文类型：握手 / 密钥交换 / 断开
         switch(hdr.type)
         {
         case m_hand_request:
@@ -603,7 +603,7 @@ bool UDP::handle_handshake_Re(const std::vector<uint8_t> &recv_handshake,const t
     memcpy(&hs,recv_handshake.data() + Ktunnel_header,kHandshakePayloadSize);
 
     if(hs.isn != 0){
-        // ===== 本机是发起方，收到对端的 SYN+ACK =====
+        // 本机是发起方，收到对端的 SYN+ACK
         if(hs.ack != m_client_isn + 1){
             fprintf(stderr, "[UDP][HS] SYN+ACK ack mismatch: got %u, expect %u\n",
                     hs.ack, m_client_isn + 1);
@@ -622,7 +622,7 @@ bool UDP::handle_handshake_Re(const std::vector<uint8_t> &recv_handshake,const t
         m_handshaked.store(true);
         return true;
     } else {
-        // ===== 本机是响应方，收到对端的最终 ACK =====
+        // 本机是响应方，收到对端的最终 ACK
         if(hs.ack != m_client_isn + 1){
             fprintf(stderr, "[UDP][HS] final ACK ack mismatch: got %u, expect %u\n",
                     hs.ack, m_client_isn + 1);

@@ -136,8 +136,7 @@ bool VpnCore::is_running() const
     return m_running.load();
 }
 
-// ===== 转发层 =====
-
+// 转发层
 // tun → UDP：读虚拟网卡上的 IP 包，推入 UDP 发送队列
 void VpnCore::forward_tun_to_udp()
 {

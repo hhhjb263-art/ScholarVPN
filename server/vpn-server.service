@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=simple
 # systemd 服务模板：由 sudo ./start.sh install 自动生成 /etc/systemd/system/vpn-server.service
 # 占位符 __SCRIPT_DIR__（脚本所在目录）、__LOGS_DIR__（日志目录）会被自动替换为实际路径，无需手写
+# 运行参数（TUN_IP/VPN_PORT/MAX_CLIENTS/QUIET/KEY_PATH 等）从 /etc/default/vpn-server 读取，
+# 由 start.sh install 自动生成，可手动编辑后 systemctl restart vpn-server 生效；缺失时使用 start.sh 默认值
+EnvironmentFile=-/etc/default/vpn-server
 ExecStartPre=/bin/mkdir -p __LOGS_DIR__
 ExecStart=__SCRIPT_DIR__/start.sh start
 Restart=on-failure

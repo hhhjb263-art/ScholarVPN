@@ -630,8 +630,7 @@ bool parse_inner_packet(
 }
 
 
-// ===================== Ed25519 身份密钥（公私钥验证） =====================
-
+// Ed25519 身份密钥（公私钥验证）
 bool generate_ed25519_keypair(const std::string& private_pem_path,
                               const std::string& public_pem_path,
                               std::string& pub_pem_out)
@@ -816,8 +815,7 @@ bool ed25519_verify(
     throw_openssl_error("Ed25519 signature verification error");
 }
 
-// ===================== 随机数与注册令牌 =====================
-
+// 随机数与注册令牌
 std::vector<std::uint8_t> generate_nonce(std::size_t length)
 {
     if (length == 0) {
@@ -844,8 +842,7 @@ std::string generate_register_token()
     return token;
 }
 
-// ===================== 会话密钥派生（HKDF-Extract + HKDF-Expand） =====================
-
+// 会话密钥派生（HKDF-Extract + HKDF-Expand）
 std::vector<std::uint8_t> hkdf_extract(
     const std::vector<std::uint8_t>& ikm,
     const std::vector<std::uint8_t>& salt)

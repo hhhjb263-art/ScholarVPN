@@ -5,7 +5,7 @@
 #include "tun_macro.h"
 
 
-// Wintun网卡IP/网络参数配置类，用来给虚拟网卡设置地址、MTU、DNS、跃点等
+// Wintun缃戝崱IP/缃戠粶鍙傛暟閰嶇疆绫伙紝鐢ㄦ潵缁欒櫄鎷熺綉鍗¤缃湴鍧�銆丮TU銆丏NS銆佽穬鐐圭瓑
 class AdapterConfig{
 public:
 	explicit AdapterConfig(NET_LUID interfaceLuid);

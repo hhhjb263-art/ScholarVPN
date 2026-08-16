@@ -92,7 +92,7 @@ void secure_wipe(std::vector<std::uint8_t>& buffer) noexcept
     if (!buffer.empty())
         OPENSSL_cleanse(buffer.data(), buffer.size());
 
-    // ·ÀÖ¹µ÷ÓÃÕß¼ÌĞø¶ÁÈ¡¾É³¤¶ÈµÄÊı¾İ¡£
+    // é˜²æ­¢è°ƒç”¨è€…ç»§ç»­è¯»å–æ—§é•¿åº¦çš„æ•°æ®ã€‚
     buffer.clear();
 }
 
@@ -673,8 +673,7 @@ bool parse_inner_packet(
 }
 
 
-// ===================== Ed25519 Éí·İÃÜÔ¿£¨¹«Ë½Ô¿ÑéÖ¤£© =====================
-
+// Ed25519 èº«ä»½å¯†é’¥ï¼ˆå…¬ç§é’¥éªŒè¯ï¼‰
 bool generate_ed25519_keypair(
     const std::string& priv_path,
     const std::string& pub_path,
@@ -694,7 +693,7 @@ bool generate_ed25519_keypair(
         throw_openssl_error("EVP_PKEY_keygen failed");
     PKeyPtr key(raw_key, &EVP_PKEY_free);
 
-    // Ë½Ô¿£ºPKCS#8 PEM
+    // ç§é’¥ï¼šPKCS#8 PEM
     {
         BioPtr bio(BIO_new_file(priv_path.c_str(), "wb"), &BIO_free);
         if (!bio)
@@ -704,7 +703,7 @@ bool generate_ed25519_keypair(
             throw_openssl_error("PEM_write_bio_PrivateKey failed");
     }
 
-    // ¹«Ô¿£ºSPKI PEM
+    // å…¬é’¥ï¼šSPKI PEM
     {
         BioPtr bio(BIO_new_file(pub_path.c_str(), "wb"), &BIO_free);
         if (!bio)
@@ -713,7 +712,7 @@ bool generate_ed25519_keypair(
             throw_openssl_error("PEM_write_bio_PUBKEY failed");
     }
 
-    // Í¬Ê±·µ»Ø¹«Ô¿ PEM ÎÄ±¾£¬±ãÓÚÕ¹Ê¾ / Ó²±àÂë½ø¶Ô¶Ë³ÌĞò
+    // åŒæ—¶è¿”å›å…¬é’¥ PEM æ–‡æœ¬ï¼Œä¾¿äºå±•ç¤º / ç¡¬ç¼–ç è¿›å¯¹ç«¯ç¨‹åº
     {
         BioPtr mem(BIO_new(BIO_s_mem()), &BIO_free);
         if (!mem)
@@ -831,7 +830,7 @@ std::vector<std::uint8_t> ed25519_sign(
     if (!context)
         throw_openssl_error("EVP_MD_CTX_new failed");
 
-    // ´¿ EdDSA£¨Ed25519£©£ºOpenSSL ÒªÇó md ²ÎÊıÎª NULL£¬²»ÄÜ´«ÕªÒªËã·¨
+    // çº¯ EdDSAï¼ˆEd25519ï¼‰ï¼šOpenSSL è¦æ±‚ md å‚æ•°ä¸º NULLï¼Œä¸èƒ½ä¼ æ‘˜è¦ç®—æ³•
     if (EVP_DigestSignInit(
             context.get(), nullptr, nullptr, nullptr, private_key) != 1) {
         throw_openssl_error("EVP_DigestSignInit failed");
@@ -867,7 +866,7 @@ bool ed25519_verify(
     }
     validate_optional_buffer(message, message_length, "message");
     if (signature == nullptr || signature_length != ED25519_SIG_LEN) {
-        return false; // ³¤¶È²»·ûÊÓÎªÎŞĞ§Ç©Ãû
+        return false; // é•¿åº¦ä¸ç¬¦è§†ä¸ºæ— æ•ˆç­¾å
     }
     if (EVP_PKEY_is_a(public_key, "ED25519") != 1) {
         throw std::invalid_argument(
@@ -894,8 +893,7 @@ bool ed25519_verify(
     throw_openssl_error("Ed25519 signature verification error");
 }
 
-// ===================== Ëæ»úÊıÓë×¢²áÁîÅÆ =====================
-
+// éšæœºæ•°ä¸æ³¨å†Œä»¤ç‰Œ
 std::vector<std::uint8_t> generate_nonce(std::size_t length)
 {
     if (length == 0) {
@@ -922,8 +920,7 @@ std::string generate_register_token()
     return token;
 }
 
-// ===================== »á»°ÃÜÔ¿ÅÉÉú£¨HKDF-Extract + HKDF-Expand£© =====================
-
+// ä¼šè¯å¯†é’¥æ´¾ç”Ÿï¼ˆHKDF-Extract + HKDF-Expandï¼‰
 std::vector<std::uint8_t> hkdf_extract(
     const std::vector<std::uint8_t>& ikm,
     const std::vector<std::uint8_t>& salt)
@@ -974,7 +971,7 @@ std::vector<std::uint8_t> hkdf_extract(
 
     const std::size_t digest_len =
         static_cast<std::size_t>(EVP_MD_get_size(EVP_sha256()));
-    std::vector<std::uint8_t> prk(digest_len); // SHA-256 ¡ú 32 ×Ö½Ú
+    std::vector<std::uint8_t> prk(digest_len); // SHA-256 â†’ 32 å­—èŠ‚
     std::size_t prk_len = prk.size();
     if (EVP_KDF_derive(
             context.get(), prk.data(), prk_len, parameters) <= 0) {
@@ -1066,14 +1063,14 @@ DirectionalSessionKeys derive_directional_session_keys(
             "nonce_c / nonce_s cannot be empty");
     }
 
-    // salt = nonce_c || nonce_s£¨Ë³Ğò¹Ì¶¨£¬Á½¶ËÒ»ÖÂ£©
+    // salt = nonce_c || nonce_sï¼ˆé¡ºåºå›ºå®šï¼Œä¸¤ç«¯ä¸€è‡´ï¼‰
     std::vector<std::uint8_t> salt = nonce_c;
     salt.insert(salt.end(), nonce_s.begin(), nonce_s.end());
 
     std::vector<std::uint8_t> prk = hkdf_extract(shared_secret, salt);
     DirectionalSessionKeys keys;
-    keys.key_tx = hkdf_expand(prk, "tx", AES256_KEY_LEN); // ¿Í»§¶Ë¡ú·şÎñ¶Ë
-    keys.key_rx = hkdf_expand(prk, "rx", AES256_KEY_LEN); // ·şÎñ¶Ë¡ú¿Í»§¶Ë
+    keys.key_tx = hkdf_expand(prk, "tx", AES256_KEY_LEN); // å®¢æˆ·ç«¯â†’æœåŠ¡ç«¯
+    keys.key_rx = hkdf_expand(prk, "rx", AES256_KEY_LEN); // æœåŠ¡ç«¯â†’å®¢æˆ·ç«¯
 
     secure_wipe(prk);
     secure_wipe(salt);
@@ -1081,8 +1078,7 @@ DirectionalSessionKeys derive_directional_session_keys(
 }
 
 
-// ===================== Ed25519 ÃÜÔ¿£º´Ó PEM ÎÄ±¾¼ÓÔØ =====================
-
+// Ed25519 å¯†é’¥ï¼šä» PEM æ–‡æœ¬åŠ è½½
 EVP_PKEY* load_ed25519_private_key_pem(const std::string& pem_text)
 {
     if (pem_text.empty()) {

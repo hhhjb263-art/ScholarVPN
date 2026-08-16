@@ -1,12 +1,40 @@
 # ScholarVPN
 
-ScholarVPN 是一个用于学习网络通信、加密协议和 VPN 工作原理的实验性项目，包含 **Windows 客户端**（Wintun 虚拟网卡 + UDP 隧道）与 **Linux 服务端**（TUN 虚拟网卡 + UDP 隧道）。隧道使用自研三阶段身份认证协议：Ed25519 签名防中间人 + 临时 X25519 前向安全密钥交换 + HKDF 密钥派生 + AES-256-GCM 认证加密，客户端/服务器身份均需注册准入，项目持续完善中。
+> ⚠️ **仅供学习研究使用** —— 请先阅读下方的「法律声明」，确认你的使用方式合法合规。
+
+ScholarVPN 是一个**学习实验性质**的项目，用于理解网络通信、加密协议与 VPN 的工作原理。包含 **Windows 客户端**（Wintun 虚拟网卡 + UDP 隧道）与 **Linux 服务端**（TUN 虚拟网卡 + UDP 隧道）。隧道使用自研三阶段身份认证协议：Ed25519 签名防中间人 + 临时 X25519 前向安全密钥交换 + HKDF 密钥派生 + AES-256-GCM 认证加密，客户端/服务器身份均需注册准入。
+
+---
+
+## ⚠️ 法律声明（Legal Notice）
+
+**本项目仅限学习、研究和教育用途**，用于理解 VPN / 隧道 / 加密协议的工作原理。**禁止**以任何形式将本项目用于以下用途：
+
+- ❌ **禁止私自搭建、运营或提供 VPN 服务**，包括但不限于：商业运营、对外提供付费/免费 VPN 服务、为他人转发流量、搭建跨境代理通道等；
+- ❌ 禁止用于**绕过网络监管、突破防火墙、非法访问境外网络**或规避任何国家/地区的法律法规；
+- ❌ 禁止用于任何非法目的，包括但不限于：网络攻击、数据窃取、侵犯他人隐私、传播违法信息等。
+
+**合规责任声明：**
+
+1. 使用者必须遵守**所在国家/地区的全部法律法规**。
+2. 在中国境内，**私自搭建/运营 VPN 服务**可能违反《中华人民共和国计算机信息网络国际联网管理暂行规定》等法律法规，使用者需自行承担全部法律责任。
+3. 项目作者与维护者**不对任何使用者的行为及其后果承担责任**；下载、编译、运行或分发本项目即视为接受本声明。
+
+**合规使用示例（仅供学习）：**
+
+- ✅ 在**自有、可控的实验环境**（本机虚拟机 / 实验室局域网）中学习 TUN/Wintun 虚拟网卡与 UDP 隧道原理；
+- ✅ 研究加密协议（Ed25519 / X25519 / HKDF / AES-256-GCM）与身份认证流程的实现细节；
+- ✅ 用于课堂教学、学术研究与代码阅读。
+
+> 若你无法确保使用方式合法合规，请勿下载、编译或运行本项目。
+
+---
 
 ## 项目介绍
 
 ### 架构
 
-客户端与服务端通过 UDP 建立隧道：客户端创建 Wintun 虚拟网卡，把本机流量封装进自定义 UDP 报文发往服务器；服务器从 TUN 网卡转发到真实网络，回程流量再反向封装回客户端。两端使用同一套自研隧道协议（魔数 `MVPN`，12 字节报文头 + 三阶段身份认证 + 心跳保活），加密层基于 OpenSSL 标准算法。
+客户端与服务端通过 UDP 建立隧道：客户端创建 Wintun 虚拟网卡，把本机流量封装进自定义 UDP 报文发往服务器；服务器从 TUN 网卡转发到真实网络，回程流量再反向封装回客户端。两端使用同一套自研隧道协议（自定义报文头 + 三阶段身份认证 + 心跳保活），加密层基于 OpenSSL 标准算法。
 
 ### 目录结构
 
@@ -21,7 +49,17 @@ ScholarVPN/
 │   ├── route_manager.cpp       路由管理（服务器绕过路由 + 默认路由）
 │   ├── reconnect_manager.cpp   断线自动重连
 │   └── tunnel_protoco.h        隧道协议头定义
-├── server/                    Linux 服务端（CMake 工程：TUN + UDP + 转发 + 加密）
+├── server/                    Linux 服务端（CMake 工程，各模块功能如下）
+│   ├── main.cpp               服务端入口（CLI 解析 + --gen-token）
+│   ├── Buffer/                数据缓冲（PacketBuffer / QueueBuffer）与隧道协议头
+│   ├── UDP/                   传输层：Session 多用户会话模型 + 三阶段认证 / 心跳 / 收发线程
+│   │   └── Session.h          会话模型（每个客户端一个 Session，含认证状态与密钥）
+│   ├── tun/                   TUN 虚拟网卡读写
+│   ├── LinuxAdapter/          网卡 IP / MTU / 路由配置
+│   ├── core/                  VpnCore 转发层（TUN ↔ UDP 桥接，认证通过前禁止转发）
+│   ├── Crypt/                 加密层（Ed25519 / 临时 X25519 / HKDF / AES-256-GCM）
+│   ├── keys/                  身份密钥与客户端准入数据库（不入库，说明见 keys/README.txt）
+│   └── start.sh / vpn-server.service   部署脚本与 systemd 服务模板
 ├── include/                    公共头文件
 ├── third_party/                OpenSSL 3.5.6、Wintun 0.14.1
 ├── Config.cpp / Config.h       客户端 INI 配置读写
@@ -29,15 +67,36 @@ ScholarVPN/
 └── x64/                        Visual Studio 构建输出
 ```
 
-### 隧道协议与加密
+### 隧道协议与加密（概述）
 
-- 报文头 12 字节：`magic(4) + version(1) + type(1) + payload_len(2) + sequence(4)`，魔数 `0x4D56504E`（"MVPN"）
-- **三阶段身份认证**（防中间人 + 身份准入，身份未验证前服务器禁止 TUN 转发）：
-  1. **阶段1（明文）**：客户端发 `nonce_c` → 服务器回 `nonce_s ‖ DH_SRV_EPHEM_PUB ‖ sig_srv`（用持久身份私钥 `SIG_SRV_PRI` 对 `nonce_c‖nonce_s‖DH_SRV_EPHEM_PUB` 签名）→ 客户端用内置的 `SIG_SRV_PUB` 验签，**失败即断开（中间人攻击）** → 客户端生成临时 X25519 密钥对并回 `DH_CLI_EPHEM_PUB`
-  2. **阶段2**：双方 X25519 ECDH 计算共享秘密 → `HKDF-Extract(salt = nonce_c ‖ nonce_s)` → `HKDF-Expand` 派生方向性会话密钥 `key_tx`（客户端→服务端）/ `key_rx`（服务端→客户端），加密隧道开启
-  3. **阶段3（AES-GCM 密文）**：客户端发送身份报文（全部会话上下文 + `client_id` + `SIG_CLI_PUB` + `SIG_CLI_PRI` 签名，注册模式附带一次性 `register_token`）→ 服务器解密 + GCM 校验 → 重建同一身份负载并验签 → 会话绑定检查 → **注册分支**（校验令牌、写入注册表、令牌作废）/ **登录分支**（比对已注册公钥）→ 通过才回复 `identity_ok` 并放行 TUN 流量
-- 心跳保活：认证通过后每 1s 发送，5s 未收到对端任何报文判定失联并自动重连
-- 密钥体系：持久身份密钥为 **Ed25519**（服务器 `SIG_SRV` 硬编码进客户端；客户端 `SIG_CLI` 私钥经 Windows DPAPI 加密存储）；每次会话的加密密钥由**临时 X25519** 派生（前向安全，断开即销毁）
+- 客户端与服务端通过自研 **UDP 隧道协议**通信（自定义报文头，含魔数、版本、类型、序号），具体线格式属于实现细节，不在此展开；
+- **三阶段身份认证**：包含防中间人校验（服务器身份签名验证）与客户端身份准入（注册/登录），**身份未验证通过前服务端禁止转发任何流量**；
+- **加密**：基于 OpenSSL 标准算法，会话密钥支持前向安全，数据面使用认证加密（AES-256-GCM）；
+- **心跳保活**：认证通过后周期发送心跳，对端失联时自动重连；
+- **密钥体系**：持久身份密钥为 Ed25519（服务器公钥内置于客户端；客户端私钥经 Windows DPAPI 加密存储，磁盘不落明文）。
+
+### 多用户支持（服务端）
+
+服务端基于 **Session（会话）模型** 支持多客户端并发：
+
+- 每个客户端（按 UDP 源 IP+端口 识别）对应一个独立 `Session`，认证状态、会话密钥、发送队列与心跳完全隔离；
+- **虚拟 IP 自动分配**：客户端认证通过后，服务端在 TUN 网段内自动分配唯一地址并通告给客户端，客户端连接成功后自动采用；
+- **同身份互踢**：同一 `ClientID` 重复登录时旧的在线会话自动下线；
+- **会话上限与清理**：`--max-clients` 限制并发数（默认 64），未认证会话与失联会话按超时自动清理；
+- TUN 下行按**目的虚拟 IP** 查表转发到对应客户端。
+
+> **多用户部署（NAT 模式）**：多客户端共享服务端出口时，开启内核转发 + NAT（请仅在自有实验环境中使用）：
+>
+> ```bash
+> # 1. 开启 IPv4 转发（持久化写入 /etc/sysctl.conf）
+> sysctl -w net.ipv4.ip_forward=1
+> # 2. NAT：客户端网段访问外网（按实际外网网卡调整 eth0）
+> iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
+> # 3. 启动服务端（默认即多用户，自动分配 10.8.0.2、10.8.0.3 ...）
+> sudo ./build/vpn_server -a 10.8.0.1 -p 51820 --max-clients 100
+> ```
+>
+> `start.sh` 可通过环境变量 `MAX_CLIENTS=100` 传入 `--max-clients`。
 
 ### 配置
 
@@ -56,7 +115,7 @@ ServerPort=51820
 Timeout=5000
 
 [Network]
-VirtualIP=10.8.0.2
+VirtualIP=10.8.0.2           # 多用户服务端下会被服务端分配的虚拟 IP 覆盖
 VirtualPrefix=24
 DNS=8.8.8.8,1.1.1.1
 MTU=1400
@@ -103,6 +162,8 @@ RegisterToken=              # 首次注册填管理员下发的令牌，注册�
 msbuild VPN_.sln /p:Configuration=Debug /p:Platform=x64
 ```
 
+> 构建配置区分服务器身份公钥：**Debug** 用本地测试服务器公钥，**Release** 用正式服务器公钥（见 `src/main.cpp` 的 `kServerSigPubPem`，请自行更换）。
+
 ### 服务端（Linux）
 
 ```bash
@@ -114,12 +175,42 @@ cmake --build build
 生成 `build/vpn_server`，以 root 运行（创建 TUN 网卡需要权限）：
 
 ```bash
-sudo ./build/vpn_server -a 10.8.0.1 -p 51820 --default-route
+sudo ./build/vpn_server -a 10.8.0.1 -p 51820
 ```
 
-服务端常用参数：`-l/--listen`（监听 IP）、`-p/--port`（端口）、`-a/--addr`（隧道内网 IP）、`--prefix`（网段前缀）、`--mtu`、`--default-route`（默认路由指向 TUN）、`-k/--key`（Ed25519 身份私钥，默认 `keys/server_sig.key`）、`-g/--gen-token [n]`（生成 n 个一次性注册令牌）、`--quiet`（精简日志）。
+服务端常用参数：`-l/--listen`（监听 IP）、`-p/--port`（端口）、`-a/--addr`（隧道内网 IP）、`--prefix`（网段前缀）、`--mtu`、`-k/--key`（Ed25519 身份私钥，默认 `keys/server_sig.key`）、`--max-clients`（最大并发客户端数，默认 64，自动分配虚拟 IP）、`-g/--gen-token [n]`（生成 n 个一次性注册令牌）、`--quiet`（精简日志）。
 
-首次启动会自动生成服务器身份密钥对 `keys/server_sig.key` / `keys/server_sig.pub`，请把 `server_sig.pub` 内容硬编码进客户端 `src/main.cpp` 的 `kServerSigPubPem` 常量（客户端用它验证服务器签名，防中间人）。
+**一键部署（start.sh / systemd）**：兼容 Debian/Ubuntu/CentOS/RHEL/Fedora/Arch/OpenWrt，自动选择 iptables / nftables 并配合 ufw / firewalld 放行端口：
+
+```bash
+cd server
+sudo ./start.sh            # 前台运行（Ctrl+C 退出，便于调试）
+sudo ./start.sh -d         # 后台守护运行（异常自动重启 watchdog，重点日志存 logs/）
+sudo ./start.sh install    # 安装为 systemd 服务（推荐，关闭终端不断开）
+sudo ./start.sh status     # 查看运行状态
+sudo ./start.sh logs       # 实时查看重点日志
+sudo ./start.sh uninstall  # 卸载 systemd 服务
+sudo ./start.sh doctor     # 诊断环境，排查断开问题
+```
+
+- 脚本内关键项可用环境变量覆盖：`TUN_IP`、`TUN_PREFIX`、`TUN_MTU`、`VPN_PORT`、`LISTEN_IP`、`KEY_PATH`（默认 `keys/server_sig.key`）、`MAX_CLIENTS`（最大并发客户端数，0=默认 64）、`QUIET`（1=精简日志）等；
+- **systemd 运行参数透传**：`install` 会把当前配置固化为 `/etc/default/vpn-server`（systemd `EnvironmentFile`），使 `--max-clients` 等参数在 systemd 模式下同样生效；可直接编辑该文件后 `systemctl restart vpn-server`；
+- 日志：`logs/vpn-server-YYYYMMDD.log`（按天轮转）；systemd 模式下写 `logs/systemd.log`，也可 `journalctl -u vpn-server -f` 查看。
+
+首次启动会自动生成服务器身份密钥对 `keys/server_sig.key` / `keys/server_sig.pub`，请把 `server_sig.pub` 内容硬编码进客户端 `src/main.cpp` 的 `kServerSigPubPem` 常量（客户端用它验证服务器签名，防中间人）。密钥与客户端准入数据库（`register_tokens.txt` / `registered_clients.txt`）说明见 `server/keys/README.txt`。
+
+### 身份认证与注册
+
+- 给新用户发注册令牌（服务端管理员操作）：
+
+```bash
+sudo ./build/vpn_server --gen-token 5
+# 输出形如 register_token: <64位十六进制>，并追加到 keys/register_tokens.txt
+```
+
+- 客户端把令牌填入 `config.ini` 的 `[Identity] RegisterToken` 并设置 `ClientID` 后首次连接即完成注册（令牌一次性使用，作废后即从令牌文件移除）；之后清空令牌即为登录模式；
+- 已注册客户端公钥保存在 `keys/registered_clients.txt`（每行一个 64 位十六进制 Ed25519 公钥），**私钥/令牌/注册表文件均不得提交到 Git**（`keys/*` 已在 .gitignore 忽略）；
+- 身份验证通过前，`VpnCore` 不会把 TUN 流量转发进隧道（防止未注册客户端接入）。
 
 ### 运行客户端
 
@@ -136,3 +227,11 @@ sudo ./build/vpn_server -a 10.8.0.1 -p 51820 --default-route
 - **UI 界面**：目前是命令行程序，后续增加图形界面与系统托盘，提供更直观的配置与状态展示
 - **智能分流**：按规则分流流量，如国内直连、国外走隧道，避免全局代理
 - **日志与流量统计**：统一日志系统，以及实时流量统计与限速
+
+## 许可证
+
+MIT License（见 `LICENSE`）。第三方组件许可见 `docs/LICENSE.txt` 与 `third_party/` 下对应文件。
+
+---
+
+> ⚠️ 再次提醒：本项目**仅限学习研究**，**禁止私自搭建/运营 VPN 服务**。请遵守所在地法律法规，合法合规地使用。

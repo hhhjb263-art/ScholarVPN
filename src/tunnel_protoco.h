@@ -38,9 +38,9 @@ enum type : uint8_t
 };
 enum HandshakeState {
     HS_IDLE,
-    HS_SEND_REQ,    // 已发送握手请求，等待服务端ACK
+    HS_SEND_REQ,    // 宸插彂閫佹彙鎵嬭姹傦紝绛夊緟鏈嶅姟绔疉CK
     HS_WAIT_ACK,
-    HS_SEND_FIN,    // 收到ACK，发送最终确认包
+    HS_SEND_FIN,    // 鏀跺埌ACK锛屽彂閫佹渶缁堢‘璁ゅ寘
     HS_SUCCESS
 };
 constexpr uint32_t Kmagic = 0x4D56504E;

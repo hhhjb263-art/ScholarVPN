@@ -1,4 +1,4 @@
-﻿#include <iostream>
+#include <iostream>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -189,7 +189,7 @@ static std::string find_key_file(const std::string& appdata_keys_dir, const std:
     return appdata_keys_dir + filename;
 }
 
-// ===================== DPAPI：客户端身份私钥本地加密存储 =====================
+// DPAPI：客户端身份私钥本地加密存储
 // 用当前 Windows 用户的 DPAPI 密钥加密/解密 SIG_CLI_PRI（磁盘不落明文 PEM）。
 
 static bool dpapi_protect(const std::vector<uint8_t>& plain, std::vector<uint8_t>& out)
@@ -221,16 +221,35 @@ static bool dpapi_unprotect(const std::vector<uint8_t>& enc, std::vector<uint8_t
     return true;
 }
 
-// ===================== 服务器身份公钥 SIG_SRV_PUB（硬编码编译进客户端） =====================
+// 服务器身份公钥 SIG_SRV_PUB（硬编码编译进客户端）
 // 把服务器首次运行生成的 keys/server_sig.pub 内容（含 BEGIN/END 行）粘贴到这里，
 // 客户端将用它验证服务器签名（防中间人）。留空时回退读取 keys\server.pub 文件（开发调试用）。
+// 按构建配置区分：Debug 构建用本地测试服务器的公钥；Release 构建用正式服务器的公钥。
+#ifdef _DEBUG
 static const std::string kServerSigPubPem = R"(-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAiVbYlD7lZcF8qpIDFFOEmWXJ5VhZ05jkfIw62XLXsks=
+MCowBQYDK2VwAyEA+A73aBlJFR3H7ozQ0os5SduqQIga6zIpfI5VSFlGE0A=
 -----END PUBLIC KEY-----
 )";
+#else
+static const std::string kServerSigPubPem = R"(-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAPGjH684MS+FZNgngx2mK/I06A6a88Up5Gkr1jU4fFM8=
+-----END PUBLIC KEY-----
+)";
+#endif
 
 int main(int argc, char** argv)
 {
+    // 客户端启动流程（对照看更易理解）：
+    //   1) 设置控制台 UTF-8 + 初始化日志
+    //   2) 读取 %APPDATA%\ScholarVPN\config.ini（首次运行自动生成）
+    //   3) 生成/加载 Ed25519 身份密钥（SIG_CLI_PRI 经 DPAPI 加密存储）
+    //   4) 确定服务器地址与端口（Debug 优先 DebugServerIP，Release 用 ServerIP）
+    //   5) 创建 Wintun 网卡 → 配 IP/MTU/DNS/路由
+    //   6) 启动 ReconnectManager（UDP 隧道 + 三阶段认证 + 断线重连）
+    //   7) 两个桥接线程：TUN→UDP（上行）、UDP→TUN（下行）
+    //   8) 认证通过后若服务端通告了虚拟 IP（多用户），自动覆盖网卡 IP
+    ::SetConsoleOutputCP(CP_UTF8);
+    ::SetConsoleCP(CP_UTF8);
 
     Logger::Init();
 
@@ -309,7 +328,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // ---- 服务器身份公钥 SIG_SRV_PUB：优先用硬编码常量（kServerSigPubPem），
+    // ---- 服务器身份公钥 SIG_SRV_PUB：优先用硬编码常量（kServerSigPubPem，按 Debug/Release 区分），
     //      否则回退读取 keys\server.pub（开发调试用）----
     std::string server_sig_pub_pem = kServerSigPubPem;
     if (server_sig_pub_pem.find("-----BEGIN PUBLIC KEY-----") == std::string::npos)
@@ -472,6 +491,32 @@ int main(int argc, char** argv)
                 route.add_server_bypass_route(to_wstring(remote));
                 route.add_default_route(cfg.Metric);
                 LOG_KEY("[Reconnect] Connected, routes added");
+                // 多用户服务端：采用 identity_ok 通告的虚拟 IP 配置网卡（覆盖 config.ini 的 VirtualIP）
+                auto cur = mgr.udp();
+                if (cur && cur->assigned_ip() != 0)
+                {
+                    const uint32_t ip = cur->assigned_ip();
+                    char ipstr[16] = { 0 };
+                    std::snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
+                                  (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
+                                  (ip >> 8) & 0xFF, ip & 0xFF);
+                    const std::wstring wip = to_wstring(std::string(ipstr));
+                    const uint8_t prefix = cur->assigned_prefix();
+                    if (wip != cfg.VirtualIP)
+                    {
+                        adapter.remove_IPv4_address(cfg.VirtualIP, static_cast<uint8_t>(cfg.VirtualPrefix));
+                        if (adapter.set_IPv4_address(wip, prefix))
+                        {
+                            cfg.VirtualIP = wip;
+                            cfg.VirtualPrefix = prefix;
+                            LOG_KEY("[TUN] 已采用服务端分配的虚拟 IP: %s/%u", ipstr, static_cast<unsigned>(prefix));
+                        }
+                        else
+                        {
+                            LOG_ERR("[TUN] 设置服务端分配的 IP 失败: %s/%u", ipstr, static_cast<unsigned>(prefix));
+                        }
+                    }
+                }
                 // 注册模式连上 = 注册成功：自动清空 config.ini 的 RegisterToken，下次自动走登录
                 if (!cfg.RegisterToken.empty())
                 {

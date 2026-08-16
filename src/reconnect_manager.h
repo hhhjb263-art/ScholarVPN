@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <atomic>
 #include <functional>
@@ -10,7 +10,7 @@
 #include "UDP.h"
 #include "Crypt.h"
 
-// ===================== 连接状态机 =====================
+// 连接状态机
 enum class ConnState
 {
     Stopped = 0,   // 未启动 / 已停止

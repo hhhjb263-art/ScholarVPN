@@ -1,110 +1,102 @@
 #pragma once
 
-#include <cstdint>
-#include <cstddef>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 #include <atomic>
-#include <thread>
-#include <string>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
+
 #include "../Buffer/tunnel_protoco.h"
 #include "../Buffer/QueueBuffer.h"
 #include "../Crypt/crypt.h"
+#include "Session.h"
 
-/*
-虚拟网卡 IP 数据包 → send_ip_packet → 封装隧道协议头 → 
-推入 m_queue_send 发送队列 → send_thread 线程循环取出，通过 UDP socket 发给对端 VPN 客户端
-*/
+// UDP 隧道（服务端，多用户版）：监听一个端口，按 (源IP,端口) 分发到独立 Session，
+// 每个会话各自维护认证 / 密钥 / 发送队列 / 心跳；TUN 下行按目的虚拟 IP 查表转发。
 class UDP
 {
-private:
-    static constexpr size_t VPN_MTU = 1400;
-        // 12 (header) + 1429 (max payload) = 1441, match client
-    static constexpr size_t KMax_packet_size = 1441;
-private:
-    int m_sock = -1;
-    sockaddr_in clt_addr{};
-    socklen_t clt_len {sizeof(clt_addr)};
-    std::thread send_thread;
-    std::thread recv_thread;
-    std::thread heartbeat_thread;   // 心跳保活线程
-    PacketQueue m_queue_send;
-    PacketQueue m_queue_recv;
+public:
+    UDP() = default;
+    ~UDP();
 
-    uint32_t m_client_isn = 0;    // 客户端随机初始序列号（本机）
-    uint32_t m_server_isn = 0;
+    UDP(const UDP&) = delete;
+    UDP& operator=(const UDP&) = delete;
 
-    std::atomic <bool> m_running = false;
-    std::atomic <bool> m_has_client = false;
-    std::atomic <bool> m_handshaked = false;
-    std::atomic <bool> m_need_connect = false;
-    std::atomic<uint32_t> m_seq {0};
-    std::atomic<uint64_t> m_last_heartbeat_ms{0};   // 最近收到对端心跳的时间(ms)
-    mutable std::mutex m_client_mutex;
+    bool is_running() const { return m_running.load(); }
 
-    // ===== 身份认证（Ed25519 + 临时 X25519 三阶段）=====
-    std::shared_ptr<EVP_PKEY> m_sig_priv;      // 服务器持久身份私钥 SIG_SRV_PRI
-    std::string m_keys_dir;                    // register_tokens.txt / registered_clients.txt 所在目录
-    std::vector<uint8_t> m_nonce_c;            // 客户端 nonce_c
-    std::vector<uint8_t> m_nonce_s;            // 服务器 nonce_s
-    std::vector<uint8_t> m_dh_srv_pub;         // 服务器临时 X25519 公钥
-    std::vector<uint8_t> m_dh_cli_pub;         // 客户端临时 X25519 公钥
-    EVP_PKEY* m_dh_srv_priv = nullptr;         // 服务器临时 X25519 私钥（会话级，前向安全）
-    std::atomic<bool> m_authenticated{false};  // 阶段3 身份认证通过 → 放行 TUN 流量
+    // tun_ip / tun_prefix：虚拟 IP 池基准；max_clients：最大并发会话数（0=默认 64）
+    bool start(const std::string& local_ip, uint16_t local_port,
+               const std::string& tun_ip, int tun_prefix,
+               size_t max_clients = 64);
+    void stop();
+    void close();
 
-    // ===== 加密（临时 X25519 + HKDF + AES-256-GCM）=====
-    std::vector<uint8_t> m_key_c2s;            // key_tx 客户端→服务端（服务端接收解密用）
-    std::vector<uint8_t> m_key_s2c;            // key_rx 服务端→客户端（服务端发送加密用）
-    std::atomic<bool> m_enc_ready{false};      // 阶段2 密钥派生完成标志
+    // sig_priv：服务器持久身份私钥 SIG_SRV_PRI；keys_dir：注册/登录数据库目录
+    void set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir = "keys");
+
+    // TUN 读到的 IP 包按目的 IP 转发到对应会话；无匹配会话返回 false
+    bool forward_tun_packet(packet_buffer&& buf);
+    // 从全局接收队列取一个解密后的 IP 包（VpnCore 写入 TUN）
+    bool recv_ip_packet(packet_buffer& buf);
+
+    int client_count() const;
+    size_t max_clients() const { return m_max_clients; }
+
 private:
     void send_work();
     void recv_work();
+    void heartbeat_work();
+    bool start_threads();
+    void stop_threads();
 
-    bool handle_heartbeat();
-    void heartbeat_work();          // 周期发送心跳 + 对端超时检测
-    bool start_threads();           // 启动 send/recv/heartbeat 线程
-    void stop_threads();            // join 全部线程
+    std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr);
+    void release_session(const std::string& key);   // 从表移除 + 释放虚拟 IP + 标记下线
 
-    // ---- 三阶段身份认证 ----
-    void handle_auth_hello(const uint8_t* payload, size_t len);        // 阶段1a：nonce_c → 签名响应
-    void handle_auth_client_hello(const uint8_t* payload, size_t len); // 阶段1b+2：DH 公钥 → 派生密钥
-    void handle_identity(const std::vector<uint8_t>& inner);           // 阶段3：验签 + 注册/登录
-    void reset_auth_state();                                           // 新会话/停止时重置认证与密钥
+    uint32_t allocate_virtual_ip();
+    void release_virtual_ip(uint32_t ip);
 
-    // ---- 注册/登录数据库（文件）----
+    // 认证处理（仅在 recv 线程执行）
+    void handle_auth_hello(Session& s, const uint8_t* payload, size_t len);
+    void handle_auth_client_hello(Session& s, const uint8_t* payload, size_t len);
+    void handle_identity(Session& s, const std::vector<uint8_t>& inner);
+
+    bool send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
+                     std::vector<uint8_t>& tmp_buf);
+    void reply_heartbeat(Session& s);
+
+    // 注册/登录数据库（文本文件）
     static bool file_contains_line(const std::string& path, const std::string& line);
     static bool file_append_line(const std::string& path, const std::string& line);
     static bool file_remove_line(const std::string& path, const std::string& line);
     static std::string to_hex(const uint8_t* data, size_t len);
-public:
-    UDP() = default;
-    ~UDP();
-    UDP(const UDP&) = delete;
-    UDP &operator=(const UDP &) = delete; 
-    UDP(UDP&& other) noexcept;
-    UDP &operator=(UDP&& other) noexcept;
 
-    bool is_running() const;
-    bool is_handshaked() const;
+private:
+    int m_sock = -1;
+    std::thread send_thread;
+    std::thread recv_thread;
+    std::thread heartbeat_thread;
+    std::atomic<bool> m_running{ false };
 
-    bool set_peer(const std::string &ip, uint16_t port);
-    bool start(const std::string &local_ip, uint16_t local_port);      // 服务端：绑定并启动收发线程
-    void stop();                                                       // 停止线程并关闭 socket
-    void close();
+    std::shared_ptr<EVP_PKEY> m_sig_priv;
+    std::string m_keys_dir;
 
-    bool send_ip_packet(packet_buffer && buf);
-    bool send_packet(uint8_t type,const uint8_t *data,size_t len,std::vector<uint8_t>& tmp_buf);
-    bool recv_ip_packet(packet_buffer &buf);
-    uint32_t GenerateISN();
+    // 全局接收队列（各会话解密后的 IP 包 → TUN）
+    PacketQueue m_queue_recv{ 4096 };
 
-    // 配置服务器身份（三阶段认证）
-    //   sig_priv : 服务器持久身份私钥 SIG_SRV_PRI（Ed25519）
-    //   keys_dir : register_tokens.txt / registered_clients.txt 所在目录（默认 keys）
-    void set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir = "keys");
-    bool is_authenticated() const { return m_authenticated.load(); }
-    bool is_encrypted() const;
+    // 会话表（peer_key → Session）
+    size_t m_max_clients = 64;
+    uint8_t m_tun_prefix = 24;
+    mutable std::mutex m_sessions_mutex;
+    std::unordered_map<std::string, std::shared_ptr<Session>> m_sessions;
+    // 虚拟 IP（网络字节序）→ 会话键（TUN 下行转发查表用）
+    mutable std::mutex m_vip_mutex;
+    std::unordered_map<uint32_t, std::string> m_vip_to_key;
+    std::shared_ptr<VirtualIpPool> m_ip_pool;
+
+    static constexpr size_t VPN_MTU = 1400;
+    static constexpr size_t KMax_packet_size = 1441;
 };

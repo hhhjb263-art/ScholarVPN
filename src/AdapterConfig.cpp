@@ -12,9 +12,9 @@ namespace {
 	bool parse(const std::wstring& text, IN_ADDR* output) {
 		*output = {};
 		 const int  result = ::InetPtonW(AF_INET,text.c_str(),output);
-		 // 1 = ×ª»»³É¹¦
-		 // 0 = ¸ñÊ½´íÎó
-		 // <0 = ÏµÍ³´íÎó
+		 // 1 = è½¬æ¢æˆåŠŸ
+		 // 0 = æ ¼å¼é”™è¯¯
+		 // <0 = ç³»ç»Ÿé”™è¯¯
 		 return result == 1;
 	}
 }
@@ -22,14 +22,14 @@ AdapterConfig::AdapterConfig(NET_LUID interfaceLuid): m_interfaceLuid(interfaceL
 
 }
 /*
- * @brief       ÎªWintunĞéÄâÍø¿¨ÅäÖÃ¾²Ì¬IPv4µ¥²¥µØÖ·
- * @param ipAddress    ¿í×Ö·û´®IPv4µØÖ·£¨Èç L"10.0.10.2"£©
- * @param prefixLength  IPv4×ÓÍøÇ°×º³¤¶È£¨0~32£¬³£ÓÃ24=255.255.255.0£©
- * @return      true=ÅäÖÃIP³É¹¦£¬false=²ÎÊı·Ç·¨/½âÎöÊ§°Ü/ÏµÍ³ÅäÖÃÊ§°Ü
+ * @brief       ä¸ºWintunè™šæ‹Ÿç½‘å¡é…ç½®é™æ€IPv4å•æ’­åœ°å€
+ * @param ipAddress    å®½å­—ç¬¦ä¸²IPv4åœ°å€ï¼ˆå¦‚ L"10.0.10.2"ï¼‰
+ * @param prefixLength  IPv4å­ç½‘å‰ç¼€é•¿åº¦ï¼ˆ0~32ï¼Œå¸¸ç”¨24=255.255.255.0ï¼‰
+ * @return      true=é…ç½®IPæˆåŠŸï¼Œfalse=å‚æ•°éæ³•/è§£æå¤±è´¥/ç³»ç»Ÿé…ç½®å¤±è´¥
  *
- * 1. »ùÓÚÍø¿¨Î¨Ò»LUID¾«×¼¶¨Î»Ä¿±êĞéÄâÍø¿¨£¬±ÜÃâĞŞ¸Äµ½ÎïÀíÍø¿¨
- * 2. ½«×Ö·û´®IP×ªÎªÏµÍ³ÄÚºËÊ¶±ğµÄ¶ş½øÖÆÍøÂçĞòIP
- * 3. Ìî³äÍø¿¨IPÅäÖÃ½á¹¹Ìå£¬µ÷ÓÃÏµÍ³APIĞ´Èë¾²Ì¬IPv4µØÖ·
+ * 1. åŸºäºç½‘å¡å”¯ä¸€LUIDç²¾å‡†å®šä½ç›®æ ‡è™šæ‹Ÿç½‘å¡ï¼Œé¿å…ä¿®æ”¹åˆ°ç‰©ç†ç½‘å¡
+ * 2. å°†å­—ç¬¦ä¸²IPè½¬ä¸ºç³»ç»Ÿå†…æ ¸è¯†åˆ«çš„äºŒè¿›åˆ¶ç½‘ç»œåºIP
+ * 3. å¡«å……ç½‘å¡IPé…ç½®ç»“æ„ä½“ï¼Œè°ƒç”¨ç³»ç»ŸAPIå†™å…¥é™æ€IPv4åœ°å€
  */
 
 bool AdapterConfig::set_IPv4_address(const std::wstring& ipAddress, uint8_t prefixLength)
@@ -53,18 +53,18 @@ bool AdapterConfig::set_IPv4_address(const std::wstring& ipAddress, uint8_t pref
         LOG_ERROR("set_IPv4_address: parse ip failed %ls", ipAddress.c_str());
         return false;
     }
-    //ÊÖ¶¯ÅäÖÃip
+    //æ‰‹åŠ¨é…ç½®ip
     row.PrefixOrigin = IpPrefixOriginManual;
     row.SuffixOrigin = IpSuffixOriginManual;
 
-    const NETIO_STATUS  status = CreateUnicastIpAddressEntry(&row); //Ö¸¶¨Íø¿¨´´½¨/Ğ´Èë¾²Ì¬IPv4µ¥²¥µØÖ·
+    const NETIO_STATUS  status = CreateUnicastIpAddressEntry(&row); //æŒ‡å®šç½‘å¡åˆ›å»º/å†™å…¥é™æ€IPv4å•æ’­åœ°å€
     if (status == NO_ERROR) {
         LOG_INFO("CreateUnicastIpAddressEntry success err=%lu", status);
         return true;
     }
     /*
-        ³É¹¦·µ»Øtrue
-        ´æÔÚÒ²·µ»Øtrue
+        æˆåŠŸè¿”å›true
+        å­˜åœ¨ä¹Ÿè¿”å›true
     */
     if (status == ERROR_OBJECT_ALREADY_EXISTS) {
         return true;
@@ -95,7 +95,7 @@ bool AdapterConfig::remove_IPv4_address(const std::wstring &ipAdress, uint8_t pr
         return true;
     }
     /*
-        ³É¹¦·µ»Øtrue
+        æˆåŠŸè¿”å›true
     */
     if (status == ERROR_OBJECT_ALREADY_EXISTS) {
         return true;
@@ -199,10 +199,10 @@ bool AdapterConfig::set_DNS_IPv4(const std::wstring& dnsServers)
 
     settings.NameServer = const_cast<PWSTR> (dnsServers.c_str());
     /*
-    * dnsServers.c_str() ·µ»Ø const wchar_t*
-    * ½á¹¹ÌåNameServer×Ö¶ÎÀàĞÍÊÇ PWSTR (wchar_t*)£¬·Çconst
-    * µ«¹Ù·½ÎÄµµËµÃ÷£ºSetInterfaceDnsSettings Ö»»á¶ÁÈ¡×Ö·û´®£¬²»»áĞŞ¸Ä¡¢²»ÊÍ·ÅÄÚ´æ
-    * Òò´Ë const_cast °şÀëconstÏŞ¶¨ÊÇ°²È«ºÏ·¨²Ù×÷£¬ÎŞÄÚ´æÔ½½ç·çÏÕ
+    * dnsServers.c_str() è¿”å› const wchar_t*
+    * ç»“æ„ä½“NameServerå­—æ®µç±»å‹æ˜¯ PWSTR (wchar_t*)ï¼Œéconst
+    * ä½†å®˜æ–¹æ–‡æ¡£è¯´æ˜ï¼šSetInterfaceDnsSettings åªä¼šè¯»å–å­—ç¬¦ä¸²ï¼Œä¸ä¼šä¿®æ”¹ã€ä¸é‡Šæ”¾å†…å­˜
+    * å› æ­¤ const_cast å‰¥ç¦»consté™å®šæ˜¯å®‰å…¨åˆæ³•æ“ä½œï¼Œæ— å†…å­˜è¶Šç•Œé£é™©
     */
     status = ::SetInterfaceDnsSettings(interfaceGuid, &settings);
     if (status != NO_ERROR) {

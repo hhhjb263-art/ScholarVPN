@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <unistd.h>   // pause()
 
 // 全局：信号处理只置位标志，主线程负责优雅停止
 static volatile std::sig_atomic_t g_stop = 0;
@@ -31,6 +32,7 @@ static void print_usage(const char *prog)
     printf("      --mtu <n>         TUN MTU (默认 1400)\n");
     printf("      --default-route   把默认路由指向 TUN\n");
     printf("  -k, --key <path>      服务器 Ed25519 身份私钥 (默认 keys/server_sig.key)\n");
+    printf("      --max-clients <n> 最大并发客户端数，自动分配虚拟 IP (默认 64)\n");
     printf("  -g, --gen-token [n]   生成 n 个一次性注册令牌(默认1)追加到 keys/register_tokens.txt 后退出\n");
     printf("      --quiet           关闭数据包级日志，只输出重点日志（公网服务器推荐）\n");
     printf("  -h, --help            显示本帮助\n");
@@ -81,6 +83,16 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
             const char *v = next("路径");
             if(!v) return false;
             cfg.key_sig_path = v;
+        }else if(arg == "--max-clients"){
+            const char *v = next("数量");
+            if(!v) return false;
+            const long n = std::strtol(v, nullptr, 10);
+            if(n > 0 && n <= 10000){
+                cfg.max_clients = static_cast<size_t>(n);
+            }else{
+                fprintf(stderr, "参数错误: --max-clients 必须是 1-10000\n");
+                return false;
+            }
         }else if(arg == "-g" || arg == "--gen-token"){
             int count = 1;
             if(i + 1 < argc){

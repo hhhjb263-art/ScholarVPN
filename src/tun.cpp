@@ -41,7 +41,7 @@ namespace {
 		MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &wBuf[0], wcharCount);
 		return wBuf;
 	}
-	// ¼òµ¥Ê®Áù½øÖÆÕªÒª£¨Ö»´òÓ¡Ç° N ×Ö½Ú£©
+	// ç®€å•åå…­è¿›åˆ¶æ‘˜è¦ï¼ˆåªæ‰“å°å‰ N å­—èŠ‚ï¼‰
 	std::string hex_summary(const uint8_t* data, size_t len, size_t max_print = 32)
 	{
 		if (data == nullptr || len == 0) return "<empty>";
@@ -70,11 +70,11 @@ WintunTun::~WintunTun()
 bool WintunTun::init_tun(const std::string& TunName, const std::string& tunnelType)
 {
 	if (m_bInited) {
-		LOG_ERROR("DLL ÒÑ¼ÓÔØ£¬½ûÖ¹ÖØ¸´¼ÓÔØ");
+		LOG_ERROR("DLL å·²åŠ è½½ï¼Œç¦æ­¢é‡å¤åŠ è½½");
 		return false;
 	}
 	if (TunName.empty() || tunnelType.empty()) {
-		LOG_ERROR("²ÎÊıÃû³Æ²»ÄÜÎª¿Õ");
+		LOG_ERROR("å‚æ•°åç§°ä¸èƒ½ä¸ºç©º");
 		::SetLastError(ERROR_INVALID_PARAMETER);
 		return false;
 	}
@@ -87,14 +87,14 @@ bool WintunTun::init_tun(const std::string& TunName, const std::string& tunnelTy
 	);
 	if (m_hDll == nullptr) {
 		DWORD err = ::GetLastError();
-		LOG_ERROR("wintun.dll ¼ÓÔØÊ§°Ü err=%lu", err);
+		LOG_ERROR("wintun.dll åŠ è½½å¤±è´¥ err=%lu", err);
 		return false;
 	}
 
 	if (!load_wintun_api())
 	{
 		DWORD err = ::GetLastError();
-		LOG_ERROR("ÅúÁ¿¼ÓÔØWintunµ¼³öº¯ÊıÊ§°Ü, err=%lu", err);
+		LOG_ERROR("æ‰¹é‡åŠ è½½Wintunå¯¼å‡ºå‡½æ•°å¤±è´¥, err=%lu", err);
 		cleanup_resource();
 		return false;
 	}
@@ -104,7 +104,7 @@ bool WintunTun::init_tun(const std::string& TunName, const std::string& tunnelTy
 	if (!open_or_create_adapter(wTun, wType))
 	{
 		DWORD err = ::GetLastError();
-		LOG_ERROR("Íø¿¨´´½¨/´ò¿ªÊ§°Ü£¬err = %lu", err);
+		LOG_ERROR("ç½‘å¡åˆ›å»º/æ‰“å¼€å¤±è´¥ï¼Œerr = %lu", err);
 		cleanup_resource();
 		return false;
 	}
@@ -112,7 +112,7 @@ bool WintunTun::init_tun(const std::string& TunName, const std::string& tunnelTy
 	if (!fetch_adapter_luid())
 	{
 		DWORD err = ::GetLastError();
-		LOG_ERROR("»ñÈ¡Íø¿¨LUIDÊ§°Ü£¬err = %lu", err);
+		LOG_ERROR("è·å–ç½‘å¡LUIDå¤±è´¥ï¼Œerr = %lu", err);
 		cleanup_resource();
 		return false;
 	}
@@ -120,14 +120,14 @@ bool WintunTun::init_tun(const std::string& TunName, const std::string& tunnelTy
 	m_hsession = m_fnStartSession(m_hAdapter, kSessionRingCapacity);
 	if (m_hsession == nullptr) {
 		DWORD err = ::GetLastError();
-		LOG_ERROR("Æô¶¯Wintun»á»°Ê§°Ü£¬err = %lu", err);
+		LOG_ERROR("å¯åŠ¨Wintunä¼šè¯å¤±è´¥ï¼Œerr = %lu", err);
 		cleanup_resource();
 		return false;
 	}
 
 	m_bInited = true;
 	::SetLastError(ERROR_SUCCESS);
-	LOG_INFO("TunÊÊÅäÆ÷³õÊ¼»¯Íê³É");
+	LOG_INFO("Tuné€‚é…å™¨åˆå§‹åŒ–å®Œæˆ");
 	return true;
 }
 
@@ -135,49 +135,49 @@ bool WintunTun::load_wintun_api()
 {
 	if (m_hDll == nullptr) {
 		::SetLastError(ERROR_INVALID_HANDLE);
-		LOG_ERROR("DLLÄ£¿é¾ä±úÎª¿Õ");
+		LOG_ERROR("DLLæ¨¡å—å¥æŸ„ä¸ºç©º");
 		return false;
 	}
 	bool success = true;
 	if (!load_function(m_hDll, "WintunCreateAdapter", m_fnCreateAdapter))
 	{
-		LOG_ERROR("¼ÓÔØ WintunCreateAdapter Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunCreateAdapter å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunOpenAdapter", m_fnOpenAdapter))
 	{
-		LOG_ERROR("¼ÓÔØ WintunOpenAdapter Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunOpenAdapter å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunCloseAdapter", m_fnCloseAdapter))
 	{
-		LOG_ERROR("¼ÓÔØ WintunCloseAdapter Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunCloseAdapter å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunGetAdapterLUID", m_fnGetAdapterLuid))
 	{
-		LOG_ERROR("¼ÓÔØ WintunGetAdapterLUID Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunGetAdapterLUID å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunStartSession", m_fnStartSession))
 	{
-		LOG_ERROR("¼ÓÔØ WintunStartSession Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunStartSession å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunEndSession", m_fnEndSession))
 	{
-		LOG_ERROR("¼ÓÔØ WintunEndSession Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunEndSession å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunReceivePacket", m_fnReceivePacket))
 	{
-		LOG_ERROR("¼ÓÔØ WintunReceivePacket Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunReceivePacket å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunReleaseReceivePacket", m_fnReleaseReceivePacket))
 	{
-		LOG_ERROR("¼ÓÔØ WintunReleaseReceivePacket Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunReleaseReceivePacket å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunAllocateSendPacket", m_fnAllocateSendPacket))
 	{
-		LOG_ERROR("¼ÓÔØ WintunAllocateSendPacket Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunAllocateSendPacket å¤±è´¥"); success = false;
 	}
 	if (!load_function(m_hDll, "WintunSendPacket", m_fnSendPacket))
 	{
-		LOG_ERROR("¼ÓÔØ WintunSendPacket Ê§°Ü"); success = false;
+		LOG_ERROR("åŠ è½½ WintunSendPacket å¤±è´¥"); success = false;
 	}
 
 	if (!success) {
@@ -188,7 +188,7 @@ bool WintunTun::load_wintun_api()
 		::SetLastError(errorCode);
 		return false;
 	}
-	LOG_INFO("È«²¿Wintun API¼ÓÔØÍê³É");
+	LOG_INFO("å…¨éƒ¨Wintun APIåŠ è½½å®Œæˆ");
 	return true;
 }
 
@@ -196,19 +196,19 @@ bool WintunTun::open_or_create_adapter(const std::wstring& TunName, const std::w
 {
 	if (m_fnOpenAdapter == nullptr || m_fnCreateAdapter == nullptr) {
 		::SetLastError(ERROR_PROC_NOT_FOUND);
-		LOG_ERROR("Open/CreateAdapterº¯ÊıÎ´¼ÓÔØ");
+		LOG_ERROR("Open/CreateAdapterå‡½æ•°æœªåŠ è½½");
 		return false;
 	}
 
 	m_hAdapter = m_fnOpenAdapter(TunName.c_str());
 	if (m_hAdapter != nullptr) {
-		LOG_DEBUG("ÊÊÅäÆ÷ %ls ÒÑ´æÔÚ£¬Ö±½Ó´ò¿ª", TunName.c_str());
+		LOG_DEBUG("é€‚é…å™¨ %ls å·²å­˜åœ¨ï¼Œç›´æ¥æ‰“å¼€", TunName.c_str());
 		return true;
 	}
 	DWORD openError = ::GetLastError();
 	if (openError != ERROR_FILE_NOT_FOUND && openError != ERROR_NOT_FOUND)
 	{
-		LOG_ERROR("´ò¿ªÊÊÅäÆ÷Ê§°Ü£¬´íÎóÂë:%lu", openError);
+		LOG_ERROR("æ‰“å¼€é€‚é…å™¨å¤±è´¥ï¼Œé”™è¯¯ç :%lu", openError);
 		::SetLastError(openError);
 		return false;
 	}
@@ -216,10 +216,10 @@ bool WintunTun::open_or_create_adapter(const std::wstring& TunName, const std::w
 	if (m_hAdapter == nullptr)
 	{
 		DWORD err = ::GetLastError();
-		LOG_ERROR("´´½¨ÊÊÅäÆ÷Ê§°Ü err=%lu", err);
+		LOG_ERROR("åˆ›å»ºé€‚é…å™¨å¤±è´¥ err=%lu", err);
 		return false;
 	}
-	LOG_DEBUG("´´½¨ĞÂÊÊÅäÆ÷ %ls ³É¹¦", TunName.c_str());
+	LOG_DEBUG("åˆ›å»ºæ–°é€‚é…å™¨ %ls æˆåŠŸ", TunName.c_str());
 	return true;
 }
 
@@ -228,7 +228,7 @@ bool WintunTun::fetch_adapter_luid()
 	m_ifliud = {};
 	if (m_hAdapter == nullptr || m_fnGetAdapterLuid == nullptr) {
 		::SetLastError(ERROR_INVALID_HANDLE);
-		LOG_ERROR("ÊÊÅäÆ÷¾ä±ú»òAPIÎª¿Õ");
+		LOG_ERROR("é€‚é…å™¨å¥æŸ„æˆ–APIä¸ºç©º");
 		return false;
 	}
 
@@ -236,15 +236,15 @@ bool WintunTun::fetch_adapter_luid()
 	if (m_fnGetAdapterLuid == nullptr)
 	{
 		DWORD err = ::GetLastError();
-		LOG_ERROR("»ñÈ¡LUID½Ó¿Úµ÷ÓÃÊ§°Ü err=%lu", err);
+		LOG_ERROR("è·å–LUIDæ¥å£è°ƒç”¨å¤±è´¥ err=%lu", err);
 		return false;
 	}
 	if (m_ifliud.Value == 0) {
 		::SetLastError(ERROR_INVALID_DATA);
-		LOG_ERROR("»ñÈ¡µ½ÎŞĞ§LUID");
+		LOG_ERROR("è·å–åˆ°æ— æ•ˆLUID");
 		return false;
 	}
-	LOG_DEBUG("ÊÊÅäÆ÷LUID»ñÈ¡³É¹¦");
+	LOG_DEBUG("é€‚é…å™¨LUIDè·å–æˆåŠŸ");
 	return true;
 }
 
@@ -253,7 +253,7 @@ uint8_t* WintunTun::read_packet(DWORD* outPackLen)
 	*outPackLen = 0;
 	if (!is_ready() || m_fnReceivePacket == nullptr) {
 		::SetLastError(ERROR_INVALID_HANDLE);
-		LOG_ERROR("read_packet£ºÊµÀıÎ´¾ÍĞ÷»òAPIÎ´¼ÓÔØ");
+		LOG_ERROR("read_packetï¼šå®ä¾‹æœªå°±ç»ªæˆ–APIæœªåŠ è½½");
 		return nullptr;
 	}
 	BYTE* packet = m_fnReceivePacket(m_hsession, outPackLen);
@@ -268,29 +268,29 @@ bool WintunTun::write_packet(const uint8_t* RawIPdata, DWORD len)
 {
 	if (!is_ready()) {
 		::SetLastError(ERROR_INVALID_HANDLE);
-		LOG_ERROR("write_packet£ºÊµÀıÎ´¾ÍĞ÷");
+		LOG_ERROR("write_packetï¼šå®ä¾‹æœªå°±ç»ª");
 		return false;
 	}
 	if (RawIPdata == nullptr || len == 0 || len > WINTUN_MAX_IP_PACKET_SIZE) {
 		::SetLastError(ERROR_INVALID_PARAMETER);
-		LOG_ERROR("write_packet£ºÊı¾İ°ü³¤¶È·Ç·¨ len=%lu", len);
+		LOG_ERROR("write_packetï¼šæ•°æ®åŒ…é•¿åº¦éæ³• len=%lu", len);
 		return false;
 	}
 	if (m_fnAllocateSendPacket == nullptr || m_fnSendPacket == nullptr) {
 		::SetLastError(ERROR_PROC_NOT_FOUND);
-		LOG_ERROR("write_packet£º·¢°üAPIÎ´¼ÓÔØ");
+		LOG_ERROR("write_packetï¼šå‘åŒ…APIæœªåŠ è½½");
 		return false;
 	}
 
 	BYTE* send_packet = m_fnAllocateSendPacket(m_hsession, len);
 	if (send_packet == nullptr) {
 		DWORD err = ::GetLastError();
-		LOG_WARN("·ÖÅä·¢ËÍ»º³åÇøÊ§°Ü err=%lu£¨»·ĞÎ»º³åÇøÂú£©", err);
+		LOG_WARN("åˆ†é…å‘é€ç¼“å†²åŒºå¤±è´¥ err=%luï¼ˆç¯å½¢ç¼“å†²åŒºæ»¡ï¼‰", err);
 		return false;
 	}
 	std::memcpy(send_packet, RawIPdata, len);
 	m_fnSendPacket(m_hsession, send_packet);
-	LOG_TRACE("·¢ËÍIPÊı¾İ°ü£¬³¤¶È£º%lu", len);
+	LOG_TRACE("å‘é€IPæ•°æ®åŒ…ï¼Œé•¿åº¦ï¼š%lu", len);
 	return true;
 }
 
@@ -302,7 +302,7 @@ NET_LUID WintunTun::get_interface_luid() const
 void WintunTun::release_read_packet(const uint8_t* pkt)
 {
 	if (!is_ready() || pkt == nullptr || m_fnReleaseReceivePacket == nullptr) {
-		LOG_ERROR("release_read_packet£º×´Ì¬Òì³£");
+		LOG_ERROR("release_read_packetï¼šçŠ¶æ€å¼‚å¸¸");
 		return;
 	}
 	m_fnReleaseReceivePacket(m_hsession, reinterpret_cast<const BYTE*>(pkt));

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "tunnel_protoco.h"
 #include "PacketQueue.h"
@@ -29,6 +29,9 @@ public:
     int auth_deny_reason() const { return m_auth_deny_reason.load(); }
     bool needs_reconnect() const { return m_need_reconnect.load(); }
     int64_t last_rx_ms() const { return m_last_rx_ms.load(); }
+    // 服务端分配的虚拟 IP（identity_ok 通告，0=未收到）；多用户服务端下需采用它配置网卡
+    uint32_t assigned_ip() const { return m_assigned_ip.load(); }
+    uint8_t assigned_prefix() const { return m_assigned_prefix; }
     void send_ip_packet(
         packet_buffer&& buf
     );
@@ -72,7 +75,7 @@ private:
     uint32_t m_client_isn = 0;    // 客户端随机初始序列号（模仿TCP ISN）
     uint32_t m_server_isn = 0;
 
-    // ============ 身份认证状态（Ed25519 + 临时 X25519 三阶段） ============
+    // 身份认证状态（Ed25519 + 临时 X25519 三阶段）
     std::shared_ptr<EVP_PKEY> m_ed25519_priv;      // 客户端身份私钥 SIG_CLI_PRI
     std::string m_server_sig_pub_pem;              // 内置服务器身份公钥 PEM（硬编码）
     std::string m_client_id;                       // 客户端标识
@@ -88,7 +91,11 @@ private:
     std::atomic<bool> m_auth_failed{ false };      // 认证失败（中间人 / 身份被拒）
     std::atomic<int> m_auth_deny_reason{ -1 };     // 服务器 identity_deny 原因码（0=未注册 1=令牌无效/已使用）
 
-    // ============ 加密状态（临时 X25519 + HKDF + AES-256-GCM） ============
+    // 服务端通告（identity_ok）
+    std::atomic<uint32_t> m_assigned_ip{ 0 };      // 服务端分配的虚拟 IP（主机序，0=未收到）
+    uint8_t m_assigned_prefix = 24;                // 服务端通告的网段前缀
+
+    // 加密状态（临时 X25519 + HKDF + AES-256-GCM）
     std::vector<std::uint8_t> m_key_c2s;        // key_tx 客户端→服务端（本端发送加密）
     std::vector<std::uint8_t> m_key_s2c;        // key_rx 服务端→客户端（本端接收解密）
     std::atomic<bool> m_enc_ready{ false };     // 密钥派生完成（阶段2 结束）

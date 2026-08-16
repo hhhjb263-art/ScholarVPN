@@ -1,4 +1,4 @@
-﻿#include "UDP.h"
+#include "UDP.h"
 #include "logger.h"
 #include <cstdio>
 #include <chrono>
@@ -10,7 +10,7 @@
 
 namespace {
 
-// ===================== 三阶段身份认证（Ed25519 + 临时X25519 + HKDF + AES-256-GCM） =====================
+// 三阶段身份认证（Ed25519 + 临时X25519 + HKDF + AES-256-GCM）
 //   阶段1（明文）：C→S [nonce_c]；S→C [nonce_s || DH_SRV_EPHEM_PUB || sig_srv]（SIG_SRV_PRI 签名）；
 //                  客户端用内置 SIG_SRV_PUB 验签，失败=中间人直接断开；C→S [DH_CLI_EPHEM_PUB]
 //   阶段2：X25519 ECDH → HKDF-Extract(salt=nonce_c||nonce_s) → Expand 出 key_tx/key_rx，加密隧道开启
@@ -112,7 +112,7 @@ bool UDP::init()
 		return false;
 	}
 
-	// ============ 三阶段认证状态复位（每次连接全新状态） ============
+	// 三阶段认证状态复位（每次连接全新状态）
 	m_handshaked.store(false);
 	m_authenticated.store(false);
 	m_auth_failed.store(false);
@@ -133,7 +133,7 @@ bool UDP::init()
 	m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 
-	// 解析内置的服务器身份公钥 SIG_SRV_PUB（硬编码进程序）
+	// 解析内置的服务器身份公钥 SIG_SRV_PUB（硬编码）
 	if (m_server_sig_pub != nullptr) {
 		EVP_PKEY_free(m_server_sig_pub);
 		m_server_sig_pub = nullptr;
@@ -391,7 +391,7 @@ void UDP::send_work()
 	auto last_retry = auth_start;
 	int retries = 0;
 
-	// ===================== 阶段1a：发送 nonce_c（明文），等待服务器带签名的响应 =====================
+	// 阶段1a：发送 nonce_c（明文），等待服务器带签名的响应
 	send_packet(static_cast<uint8_t>(m_auth_hello), m_nonce_c.data(), m_nonce_c.size(), sendbuf);
 	last_retry = clock_type::now();
 	while (m_running.load() && !m_server_hello_ok.load() && !m_auth_failed.load() && !m_need_reconnect.load())
@@ -420,7 +420,7 @@ void UDP::send_work()
 		return; // 超时/中间人/被拒：交由上层决定重连
 	}
 
-	// ===================== 阶段1b：生成本次临时 X25519 密钥对，发送公钥（明文） =====================
+	// 阶段1b：生成本次临时 X25519 密钥对，发送公钥（明文）
 	if (!generate_ephemeral_x25519(m_dh_cli_priv, m_dh_cli_pub)) {
 		LOG_ERR("[UDP] 生成临时 X25519 密钥对失败\n");
 		m_need_reconnect.store(true);
@@ -428,7 +428,7 @@ void UDP::send_work()
 	}
 	send_packet(static_cast<uint8_t>(m_auth_client_hello), m_dh_cli_pub.data(), m_dh_cli_pub.size(), sendbuf);
 
-	// ===================== 阶段2：X25519 ECDH + HKDF 派生 key_tx/key_rx，加密隧道开启 =====================
+	// 阶段2：X25519 ECDH + HKDF 派生 key_tx/key_rx，加密隧道开启
 	{
 		EVP_PKEY* srv_pub = make_x25519_public_key(m_dh_srv_pub.data(), m_dh_srv_pub.size());
 		if (srv_pub == nullptr) {
@@ -464,7 +464,7 @@ void UDP::send_work()
 		LOG_ERR("[UDP] 加密隧道已建立（阶段2完成）\n");
 	}
 
-	// ===================== 阶段3：加密隧道内身份认证 =====================
+	// 阶段3：加密隧道内身份认证
 	{
 		std::vector<uint8_t> identity_msg;
 		if (!build_identity_message(identity_msg)) {
@@ -516,7 +516,7 @@ void UDP::send_work()
 	m_handshaked.store(true);
 	m_hs_state = HS_SUCCESS;
 
-	// ===================== 数据面（心跳 + TUN 流量，全部 AES-GCM 加密） =====================
+	// 数据面（心跳 + TUN 流量，全部 AES-GCM 加密）
 	auto last_heart = clock_type::now();
 	while (m_running.load())
 	{
@@ -623,7 +623,7 @@ void UDP::recv_work()
 		m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 		const uint8_t* payload = recv_buf.data() + Ktunnel_header;
 
-		// ===== 密文类型：密钥就绪后 data/heart/identity 等均为 AES-GCM 密文，先解密再按内层类型分发 =====
+		// 密文类型：密钥就绪后 data/heart/identity 等均为 AES-GCM 密文，先解密再按内层类型分发
 		if (header.type == static_cast<uint8_t>(m_data) ||
 			header.type == static_cast<uint8_t>(m_heart) ||
 			header.type == static_cast<uint8_t>(m_heart_response) ||
@@ -677,6 +677,21 @@ void UDP::recv_work()
 			case m_identity_ok:
 				// 阶段3：身份验证通过
 				m_authenticated.store(true);
+				// 多用户服务端会在 identity_ok 里通告分配的虚拟 IP：
+				// payload = [virtual_ip(4, 网络序)] [prefix(1)]
+				// 客户端之后用 m_assigned_ip 覆盖 config.ini 的 VirtualIP 配置网卡
+				// （见 main.cpp 的 connected_callback），保证与服务端分配一致。
+				if (inner_payload.size() >= 5)
+				{
+					uint32_t ip_net = 0;
+					memcpy(&ip_net, inner_payload.data(), 4);
+					const uint32_t ip = ntohl(ip_net);
+					m_assigned_ip.store(ip);
+					m_assigned_prefix = inner_payload[4];
+					LOG_ERR("[UDP] 服务端分配虚拟 IP: %u.%u.%u.%u/%u\n",
+						(ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
+						static_cast<unsigned>(m_assigned_prefix));
+				}
 				break;
 			case m_identity_deny:
 				// 阶段3：身份验证被拒绝；内层首字节为原因码 0=未注册 1=令牌无效/已使用
@@ -689,7 +704,7 @@ void UDP::recv_work()
 			continue;
 		}
 
-		// ===== 明文类型（阶段1握手消息） =====
+		// 明文类型（阶段1握手消息）
 		switch (header.type)
 		{
 		case m_auth_server_hello:

@@ -71,7 +71,7 @@ bool parse_inner_packet(
     std::vector<std::uint8_t>& output_payload);
 
 
-// ===================== Ed25519 身份密钥（持久身份，公私钥验证） =====================
+// Ed25519 身份密钥（持久身份，公私钥验证）
 // 生成持久 Ed25519 身份密钥对：私钥写为 PKCS#8 PEM，公钥写为 SPKI PEM，
 // 同时把公钥 PEM 文本返回给调用方（用于展示 / 硬编码进对端程序）。
 // 服务器身份用 SIG_SRV_PRI/SIG_SRV_PUB，客户端身份用 SIG_CLI_PRI/SIG_CLI_PUB。
@@ -98,14 +98,14 @@ bool ed25519_verify(
     const std::uint8_t* signature,
     std::size_t signature_length);
 
-// ===================== 随机数与注册令牌 =====================
+// 随机数与注册令牌
 // 生成 length 字节安全随机数（默认 16 字节，用于 nonce_c / nonce_s）。
 std::vector<std::uint8_t> generate_nonce(std::size_t length = HANDSHAKE_NONCE_LEN);
 
 // 生成一次性注册令牌（REGISTER_TOKEN_LEN 字节随机数，返回 64 位十六进制字符串）。
 std::string generate_register_token();
 
-// ===================== 会话密钥派生（阶段2：HKDF-Extract + HKDF-Expand） =====================
+// 会话密钥派生（阶段2：HKDF-Extract + HKDF-Expand）
 // HKDF-Extract：prk = HKDF-Extract(salt, IKM)，返回 32 字节 PRK（SHA-256）。
 std::vector<std::uint8_t> hkdf_extract(
     const std::vector<std::uint8_t>& ikm,

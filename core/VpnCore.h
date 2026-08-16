@@ -53,7 +53,7 @@ public:
     bool is_running() const;
 
 private:
-    // ===== 转发层 =====
+    // 转发层
     void forward_tun_to_udp();     // 通读TUN: 读 IP 包 → udp.send_ip_packet()
     void forward_udp_to_tun();     // 通读UDP: udp.recv_ip_packet() → tun.write_buf()
 

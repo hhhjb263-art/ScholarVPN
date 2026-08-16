@@ -46,7 +46,7 @@ private:
     std::atomic<uint64_t> m_last_heartbeat_ms{0};   // 最近收到对端心跳的时间(ms)
     mutable std::mutex m_client_mutex;
 
-    // ===== 加密（X25519 + HKDF + AES-256-GCM）=====
+    // 加密（X25519 + HKDF + AES-256-GCM）
     std::shared_ptr<EVP_PKEY> m_priv_key;      // 服务端 X25519 私钥
     std::vector<uint8_t> m_key_c2s;            // 客户端→服务端 会话密钥（服务端接收解密用）
     std::vector<uint8_t> m_key_s2c;            // 服务端→客户端 会话密钥（服务端发送加密用）

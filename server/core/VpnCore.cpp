@@ -94,8 +94,9 @@ bool VpnCore::init(const Config &cfg)
         fprintf(stderr, "[VpnCore] 警告: 未配置服务器身份私钥，身份认证不可用\n");
     }
 
-    // 5) 启动 UDP 隧道（服务端绑定监听）
-    if(!m_udp.start(m_cfg.listen_ip, m_cfg.listen_port)){
+    // 5) 启动 UDP 隧道（服务端绑定监听，多用户：最大会话数 + 虚拟 IP 池）
+    if(!m_udp.start(m_cfg.listen_ip, m_cfg.listen_port,
+                    m_cfg.tun_ip, m_cfg.tun_prefix, m_cfg.max_clients)){
         fprintf(stderr, "[VpnCore] udp.start(%s:%u) failed\n",
                 m_cfg.listen_ip.c_str(), m_cfg.listen_port);
         stop();
@@ -155,24 +156,26 @@ bool VpnCore::is_running() const
     return m_running.load();
 }
 
-// ===== 转发层 =====
-
-// tun → UDP：读虚拟网卡上的 IP 包，推入 UDP 发送队列
+// 转发层 —— 两条数据通路（各一个线程）：
+//   forward_tun_to_udp  (下行): TUN 收包 → 按目的虚拟 IP 查会话 → 加密发给对应客户端
+//   forward_udp_to_tun  (上行): 会话解密后的包 → 写 TUN → 内核按路由/NAT 送出
+// 谁发给谁完全由"虚拟 IP → 会话"表决定，这就是多用户转发的核心。
+// tun → UDP：读虚拟网卡上的 IP 包，按目的虚拟 IP 查会话转发到对应客户端
 void VpnCore::forward_tun_to_udp()
 {
     packet_buffer buf;
     while(m_running.load()){
-        // 身份未验证通过前，禁止把 TUN 流量转发到隧道（防未注册客户端）
-        if(!m_udp.is_authenticated()){
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
         if(m_tun.read_buf(buf)){
             if(!buf.is_empty()){
                 if(g_packet_log){
                     fprintf(stderr, "[CORE][TUN→UDP] len=%zu\n", buf.data_size());
                 }
-                m_udp.send_ip_packet(std::move(buf));
+                // 无匹配会话（目的 IP 未分配 / 客户端不在线）则丢弃
+                if(!m_udp.forward_tun_packet(std::move(buf))){
+                    if(g_packet_log){
+                        fprintf(stderr, "[CORE][TUN→UDP] no session for dst, drop\n");
+                    }
+                }
             }
         } else {
             // TUN 无数据（非阻塞 EAGAIN），短暂休眠避免忙轮询

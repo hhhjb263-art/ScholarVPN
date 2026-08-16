@@ -1,8 +1,8 @@
-﻿#pragma once
+#pragma once
 #include <cstdio>
 #include <cassert>
 
-//==================== 编译模式区分 ====================
+// 编译模式区分
 #ifdef _DEBUG
 #define TUN_DEBUG_MODE 1
 #else
@@ -18,7 +18,7 @@
 #define TUN_VERBOSE_LOG 0
 #endif
 
-//==================== 断言宏 ====================
+// 断言宏
 #if TUN_DEBUG_MODE
 #define TUN_ASSERT(expr, msg) \
 do { \
@@ -34,7 +34,7 @@ do { \
 #define TUN_API_CHECK(expr, retVal) if(!(expr)) return retVal;
 #endif
 
-//==================== 日志分级 ====================
+// 日志分级
 #define LOG_FATAL(fmt, ...)  fprintf(stderr, "[FATAL] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...)  fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)   fprintf(stdout, "[WARN]  " fmt "\n", ##__VA_ARGS__)

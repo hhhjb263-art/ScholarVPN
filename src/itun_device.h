@@ -16,10 +16,10 @@ public:
 	virtual ~ITunDevice() = default;
 
 	virtual bool init_tun(const std::string& TunName, const std::string& tunnelType) = 0;
-	virtual uint8_t* read_packet(DWORD* outPackLen) = 0; // ¶ÁÈ¡ip°ü
-	virtual void release_read_packet(const uint8_t* pkt) = 0; //ÊÍ·Å¶ÁÈ¡»º´æÇø
-	virtual bool write_packet(const uint8_t* rawIPdata, DWORD len) = 0; //IP °üĞ´Èë Windows Ğ­ÒéÕ»
-	virtual NET_LUID get_interface_luid() const = 0; //»ñÈ¡Íø¿¨LUID£¬ÓÃÓÚÂ·ÓÉ/IPÅäÖÃ   ·µ»ØÊÊÅäÆ÷µÄ LUID¡£
+	virtual uint8_t* read_packet(DWORD* outPackLen) = 0; // è¯»å–ipåŒ…
+	virtual void release_read_packet(const uint8_t* pkt) = 0; //é‡Šæ”¾è¯»å–ç¼“å­˜åŒº
+	virtual bool write_packet(const uint8_t* rawIPdata, DWORD len) = 0; //IP åŒ…å†™å…¥ Windows åè®®æ ˆ
+	virtual NET_LUID get_interface_luid() const = 0; //è·å–ç½‘å¡LUIDï¼Œç”¨äºè·¯ç”±/IPé…ç½®   è¿”å›é€‚é…å™¨çš„ LUIDã€‚
 	virtual bool is_ready() const = 0;
 protected:
 	virtual void cleanup_resource() = 0;

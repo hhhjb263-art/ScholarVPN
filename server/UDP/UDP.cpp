@@ -1,498 +1,534 @@
 #include "UDP.h"
 #include "../Crypt/crypt.h"
 #include "../core/log.h"
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <system_error>
-#include <openssl/rand.h>
 #include <utility>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <iostream>
 #include <random>
 #include <chrono>
 #include <thread>
 
-// 数据包级日志开关：1=打印每个收发数据包（诊断用），0=只打关键事件
-/*
-虚拟网卡 IP 数据包 → send_ip_packet → 封装隧道协议头 → 
-推入 m_queue_send 发送队列 → send_thread 线程循环取出，通过 UDP socket 发给对端 VPN 服务 / 客户端
-*/
+#include <openssl/rand.h>
 
+// 数据包级日志开关：1=打印每个收发数据包（诊断用），0=只打关键事件（见 core/log.h）
 
+namespace {
 
-// ===================== 握手负载（模仿 TCP 的 ISN/ACK 语义） =====================
-// 三次握手（客户端视角）：
-//   1) SYN     : type = m_hand_request , payload = { isn = 本端ISN,   ack = 0           }
-//   2) SYN+ACK : type = m_hand_response, payload = { isn = 对端ISN,   ack = 本端ISN + 1 }
-//   3) ACK     : type = m_hand_response, payload = { isn = 0,         ack = 对端ISN + 1 }
-// 说明：
-//   - ack 是确认号，指向对方 ISN 的下一个序号（等价于 TCP 的 ACK Number）；
-//   - isn == 0 表示纯 ACK 包（不含 SYN 语义），用于区分 SYN+ACK 与 ACK；
-//   - 握手期间 header.sequence 仅作参考，以负载中的 isn/ack 为准。
-namespace{
-    // 心跳保活参数
-    constexpr auto kHeartbeatInterval = std::chrono::seconds(10);   // 每 10s 发一次心跳
-    constexpr auto kHeartbeatTimeout  = std::chrono::seconds(30);   // 30s 未收到对端响应判超时
+// 心跳保活参数
+constexpr auto kHeartbeatInterval = std::chrono::seconds(10);   // 每 10s 发一次心跳
+constexpr auto kHeartbeatTimeout  = std::chrono::seconds(30);   // 30s 未收到对端任何报文判失联
 
-    // 当前 steady_clock 毫秒时间戳
-    uint64_t now_ms()
-    {
-        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-    }
-
-    // ===== 密钥交换辅助（X25519 + HKDF + AES-256-GCM）=====
-
-    bool get_raw_pubkey(EVP_PKEY* pkey, std::vector<uint8_t>& out)
-    {
-        if (pkey == nullptr)
-            return false;
-        size_t len = 0;
-        if (EVP_PKEY_get_raw_public_key(pkey, nullptr, &len) != 1)
-            return false;
-        out.resize(len);
-        return EVP_PKEY_get_raw_public_key(pkey, out.data(), &len) == 1;
-    }
-
-    EVP_PKEY* make_x25519_public_key(const uint8_t* raw, size_t len)
-    {
-        return EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, raw, len);
-    }
-
-    EVP_PKEY* make_ed25519_public_key(const uint8_t* raw, size_t len)
-    {
-        return EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, raw, len);
-    }
-
-    // 生成一次性临时 X25519 密钥对（每次会话独立，前向安全）
-    bool generate_ephemeral_x25519(EVP_PKEY*& priv_out, std::vector<uint8_t>& pub_out)
-    {
-        EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_from_name(nullptr, "X25519", nullptr);
-        if (ctx == nullptr)
-            return false;
-        if (EVP_PKEY_keygen_init(ctx) <= 0) {
-            EVP_PKEY_CTX_free(ctx);
-            return false;
-        }
-        EVP_PKEY* key = nullptr;
-        if (EVP_PKEY_keygen(ctx, &key) <= 0) {
-            EVP_PKEY_CTX_free(ctx);
-            return false;
-        }
-        EVP_PKEY_CTX_free(ctx);
-        if (!get_raw_pubkey(key, pub_out)) {
-            EVP_PKEY_free(key);
-            return false;
-        }
-        priv_out = key;
-        return true;
-    }
+// 当前 steady_clock 毫秒时间戳
+uint64_t now_ms()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+
+// 密钥交换辅助（X25519 + HKDF + AES-256-GCM）
+
+bool get_raw_pubkey(EVP_PKEY* pkey, std::vector<uint8_t>& out)
+{
+    if (pkey == nullptr)
+        return false;
+    size_t len = 0;
+    if (EVP_PKEY_get_raw_public_key(pkey, nullptr, &len) != 1)
+        return false;
+    out.resize(len);
+    return EVP_PKEY_get_raw_public_key(pkey, out.data(), &len) == 1;
+}
+
+EVP_PKEY* make_x25519_public_key(const uint8_t* raw, size_t len)
+{
+    return EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, raw, len);
+}
+
+EVP_PKEY* make_ed25519_public_key(const uint8_t* raw, size_t len)
+{
+    return EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, raw, len);
+}
+
+// 生成一次性临时 X25519 密钥对（每次会话独立，前向安全）
+bool generate_ephemeral_x25519(EVP_PKEY*& priv_out, std::vector<uint8_t>& pub_out)
+{
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_from_name(nullptr, "X25519", nullptr);
+    if (ctx == nullptr)
+        return false;
+    if (EVP_PKEY_keygen_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return false;
+    }
+    EVP_PKEY* key = nullptr;
+    if (EVP_PKEY_keygen(ctx, &key) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return false;
+    }
+    EVP_PKEY_CTX_free(ctx);
+    if (!get_raw_pubkey(key, pub_out)) {
+        EVP_PKEY_free(key);
+        return false;
+    }
+    priv_out = key;
+    return true;
+}
+
+} // namespace
 
 UDP::~UDP()
 {
+    stop();
     close();
 }
 
-UDP::UDP(UDP&& other) noexcept
+// 会话管理
+std::shared_ptr<Session> UDP::get_or_create_session(const sockaddr_in& addr)
 {
-    std::scoped_lock lock(m_client_mutex, other.m_client_mutex);
-    m_sock = std::exchange(other.m_sock, -1);
-    m_dh_srv_priv = std::exchange(other.m_dh_srv_priv, nullptr);
-
-    // 客户端地址
-    clt_addr = other.clt_addr;
-    clt_len = other.clt_len;
-
-    // 移动线程&队列
-    send_thread = std::move(other.send_thread);
-    recv_thread = std::move(other.recv_thread);
-    heartbeat_thread = std::move(other.heartbeat_thread);
-    m_queue_send = std::move(other.m_queue_send);
-    m_queue_recv = std::move(other.m_queue_recv);
-
-    m_running.store(other.m_running.load());
-    m_has_client.store(other.m_has_client.load());
-    m_handshaked.store(other.m_handshaked.load());
-    m_need_connect.store(other.m_need_connect.load());
-    m_seq.store(other.m_seq.load());
-    m_last_heartbeat_ms.store(other.m_last_heartbeat_ms.load());
-    // 清空源对象
-    other.clt_addr = {};
-    other.clt_len = 0;
-    other.m_dh_srv_priv = nullptr;
-    other.m_running.store(false);
-    other.m_has_client.store(false);
-    other.m_handshaked.store(false);
-    other.m_need_connect.store(false);
-    other.m_seq.store(0);
-    other.m_last_heartbeat_ms.store(0);
-}
-UDP &UDP::operator=(UDP&& other) noexcept
-{
-    if(this != &other){
-        std::scoped_lock lock(m_client_mutex, other.m_client_mutex);
-
-        m_sock = other.m_sock;
-        clt_addr = other.clt_addr;
-        clt_len = other.clt_len;
-        if (m_dh_srv_priv != nullptr) {
-            EVP_PKEY_free(m_dh_srv_priv);
-        }
-        m_dh_srv_priv = std::exchange(other.m_dh_srv_priv, nullptr);
-        m_has_client.store(other.m_has_client.load());
-        m_handshaked.store(other.m_handshaked.load());
-        m_need_connect.store(other.m_need_connect.load());
-        m_seq.store(other.m_seq.load());
-        m_last_heartbeat_ms.store(other.m_last_heartbeat_ms.load());
-
-        ::close(other.m_sock);
-        other.m_sock = -1;
-        other.m_has_client = false;
-        other.clt_addr = {};
-        other.clt_len = 0;
-        other.m_handshaked.store(false);
-        other.m_need_connect.store(false);
-        other.m_seq.store(0);
-        other.m_last_heartbeat_ms.store(0);
+    const std::string key = Session::peer_addr_to_key(addr);
+    std::lock_guard<std::mutex> lock(m_sessions_mutex);
+    auto it = m_sessions.find(key);
+    if (it != m_sessions.end())
+        return it->second;
+    if (m_sessions.size() >= m_max_clients) {
+        fprintf(stderr, "[UDP] 会话数已达上限 %zu，丢弃新连接 %s\n", m_max_clients, key.c_str());
+        return nullptr;
     }
-    return *this;
+    auto s = std::make_shared<Session>(addr);
+    m_sessions.emplace(key, s);
+    fprintf(stderr, "[UDP] 新会话 %s（当前在线 %zu）\n", key.c_str(), m_sessions.size());
+    return s;
 }
 
-void UDP::stop()
+void UDP::release_session(const std::string& key)
 {
-    if(!m_running.exchange(false)){
-        // 未运行：仍回收可能残留的线程与 socket
-        stop_threads();
-        close();
+    std::shared_ptr<Session> victim;
+    {
+        std::lock_guard<std::mutex> lock(m_sessions_mutex);
+        auto it = m_sessions.find(key);
+        if (it == m_sessions.end())
+            return;
+        victim = it->second;
+        m_sessions.erase(it);
+    }
+    if (!victim)
         return;
+    if (victim->ip_assigned && victim->virtual_ip != 0) {
+        release_virtual_ip(victim->virtual_ip);
     }
-    // 先置位停止标志，再 shutdown 唤醒可能阻塞的系统调用
-    if(m_sock >= 0){
-        ::shutdown(m_sock, SHUT_RDWR);
-    }
-    stop_threads();
-    close();
-    // 清理认证状态与全部会话密钥
-    reset_auth_state();
+    victim->authenticated.store(false);
+    victim->handshaked.store(false);
+    fprintf(stderr, "[UDP] 会话 %s 已下线（剩余 %d）\n", key.c_str(), client_count());
 }
 
-void UDP::close()
+// 虚拟 IP
+uint32_t UDP::allocate_virtual_ip()
 {
-    if(m_sock< 0){
+    if (!m_ip_pool)
+        return 0;
+    return m_ip_pool->allocate();
+}
+
+void UDP::release_virtual_ip(uint32_t ip)
+{
+    if (ip == 0)
         return;
+    {
+        std::lock_guard<std::mutex> lock(m_vip_mutex);
+        m_vip_to_key.erase(ip);
     }
-    ::shutdown(m_sock,SHUT_RDWR);
-    ::close(m_sock);
-    m_sock = -1;
+    if (m_ip_pool)
+        m_ip_pool->release(ip);
 }
 
-bool UDP::is_running() const    
+// 生命周期
+bool UDP::start(const std::string& local_ip, uint16_t local_port,
+                const std::string& tun_ip, int tun_prefix,
+                size_t max_clients)
 {
-    return m_running.load() == true;
-}
+    if (is_running())
+        return true;   // 已在运行
+    m_max_clients = (max_clients > 0) ? max_clients : 64;
+    m_tun_prefix = static_cast<uint8_t>((tun_prefix > 0 && tun_prefix <= 32) ? tun_prefix : 24);
 
-bool UDP::is_handshaked() const
-{
-    return m_handshaked.load() == true;
-}
+    // 虚拟 IP 池：以服务端 TUN 地址为网关，在网段内分配
+    uint32_t gw_net = inet_addr("10.8.0.1");
+    if (!tun_ip.empty()) {
+        in_addr a{};
+        if (inet_pton(AF_INET, tun_ip.c_str(), &a) == 1)
+            gw_net = a.s_addr;
+    }
+    m_ip_pool = std::make_shared<VirtualIpPool>(gw_net, m_tun_prefix);
 
-bool UDP::set_peer(const std::string &ip, uint16_t port)
-{
-    m_sock = socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
-    if(m_sock < 0){
+    m_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_sock < 0) {
         fprintf(stderr, "[UDP] socket() failed: %s\n", strerror(errno));
         return false;
     }
     int reuse = 1;
-    if(setsockopt(m_sock,SOL_SOCKET,SO_REUSEADDR,&reuse,sizeof(reuse)) < 0){
+    if (setsockopt(m_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
         fprintf(stderr, "[UDP] setsockopt(SO_REUSEADDR) failed: %s\n", strerror(errno));
     }
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    
-    if(ip.empty() || ip == "0.0.0.0"){
+    server_addr.sin_port = htons(local_port);
+    if (local_ip.empty() || local_ip == "0.0.0.0") {
         server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    }else{
-        int ret = inet_pton(AF_INET,ip.c_str(),&server_addr.sin_addr);
-        if(ret != 1){
-            fprintf(stderr, "[UDP] inet_pton(%s) failed: %s\n", ip.c_str(),
-                    (ret == 0) ? "invalid address" : "unsupported family");
+    } else {
+        int ret = inet_pton(AF_INET, local_ip.c_str(), &server_addr.sin_addr);
+        if (ret != 1) {
+            fprintf(stderr, "[UDP] inet_pton(%s) failed\n", local_ip.c_str());
             close();
             return false;
         }
     }
-    if(bind(m_sock,(struct sockaddr*)&server_addr,sizeof(server_addr)) < 0){
-        fprintf(stderr, "[UDP] bind(%s:%u) failed: %s\n", ip.c_str(), port, strerror(errno));
+    if (bind(m_sock, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+        fprintf(stderr, "[UDP] bind(%s:%u) failed: %s\n", local_ip.c_str(), local_port, strerror(errno));
         close();
-        return false;
-    }
-    return true;
-}
-
-bool UDP::start(const std::string &local_ip, uint16_t local_port)
-{
-    if(is_running()){
-        return true;   // 已在运行
-    }
-    // 服务端：绑定本地端口监听
-    if(!set_peer(local_ip, local_port)){
-        fprintf(stderr, "[UDP] start: set_peer(%s:%u) failed\n", local_ip.c_str(), local_port);
         return false;
     }
     // 非阻塞：让 recv_work 的 EAGAIN 分支生效，stop() 可快速退出
     int flags = fcntl(m_sock, F_GETFL, 0);
-    if(flags != -1){
+    if (flags != -1) {
         fcntl(m_sock, F_SETFL, flags | O_NONBLOCK);
     }
+
     m_running.store(true);
-    m_handshaked.store(false);
-    m_need_connect.store(false);
-    m_has_client.store(false);
-    m_last_heartbeat_ms.store(0);
-    reset_auth_state();
-    if(!start_threads()){
+    if (!start_threads()) {
         fprintf(stderr, "[UDP] start: start_threads failed\n");
         m_running.store(false);
         close();
         return false;
     }
+    fprintf(stderr, "[UDP] 监听 %s:%u，虚拟 IP 池网关 %s/%d，上限 %zu 会话\n",
+            local_ip.c_str(), local_port, tun_ip.c_str(), m_tun_prefix, m_max_clients);
     return true;
 }
 
-bool UDP::send_ip_packet(packet_buffer &&buf)
+void UDP::stop()
 {
-    if(!is_running()){
-        return false;
+    if (!m_running.exchange(false)) {
+        stop_threads();
+        close();
+        return;
     }
-   return m_queue_send.push(std::move(buf));
+    // 先置位停止标志，再 shutdown 唤醒可能阻塞的系统调用
+    if (m_sock >= 0) {
+        ::shutdown(m_sock, SHUT_RDWR);
+    }
+    stop_threads();
+    close();
+    // 清理全部会话（线程已回收，无并发）
+    {
+        std::lock_guard<std::mutex> lock(m_sessions_mutex);
+        for (auto& kv : m_sessions) {
+            kv.second->authenticated.store(false);
+            kv.second->handshaked.store(false);
+        }
+        m_sessions.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_vip_mutex);
+        m_vip_to_key.clear();
+    }
 }
 
-bool UDP::send_packet(uint8_t type, const uint8_t *data, size_t len, std::vector<uint8_t> &tmp_buf)
+void UDP::close()
 {
-    if(len > VPN_MTU)
+    if (m_sock < 0)
+        return;
+    ::shutdown(m_sock, SHUT_RDWR);
+    ::close(m_sock);
+    m_sock = -1;
+}
+
+int UDP::client_count() const
+{
+    std::lock_guard<std::mutex> lock(m_sessions_mutex);
+    return static_cast<int>(m_sessions.size());
+}
+
+void UDP::set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir)
+{
+    m_sig_priv = std::move(sig_priv);
+    m_keys_dir = keys_dir;
+    if (m_keys_dir.empty())
+        m_keys_dir = "keys";
+}
+
+// 数据面 —— 下行数据流（服务器 → 客户端）：
+//   内核把发给 10.8.0.x 的 IP 包送进 TUN → VpnCore 读 TUN → 本函数
+//   解析 IPv4 目的地址 → 查"虚拟IP→会话"表 → 推入目标会话的发送队列
+//   → send_work 线程加密后发往该客户端的 UDP 地址。
+// 目的 IP 不在表里（未分配/客户端不在线）→ 丢弃。
+bool UDP::forward_tun_packet(packet_buffer&& buf)
+{
+    if (!is_running() || buf.is_empty())
         return false;
+    const uint8_t* d = buf.get_data();
+    const size_t n = buf.data_size();
+    if (n < 20)
+        return false;                       // 最短 IPv4 头 20 字节
+    if ((d[0] >> 4) != 4)
+        return false;                       // 仅支持 IPv4
+    const uint8_t ihl = d[0] & 0x0F;
+    if (ihl < 5 || static_cast<size_t>(ihl) * 4 > n)
+        return false;
+    uint32_t dst_net = 0;                   // 目的 IP（网络字节序）
+    memcpy(&dst_net, d + 16, 4);
+
+    std::string key;
+    {
+        std::lock_guard<std::mutex> lock(m_vip_mutex);
+        auto it = m_vip_to_key.find(dst_net);
+        if (it == m_vip_to_key.end())
+            return false;
+        key = it->second;
+    }
+    std::shared_ptr<Session> s;
+    {
+        std::lock_guard<std::mutex> lock(m_sessions_mutex);
+        auto it = m_sessions.find(key);
+        if (it != m_sessions.end())
+            s = it->second;
+    }
+    if (!s || !s->authenticated.load())
+        return false;
+    return s->send_queue.push(std::move(buf));
+}
+
+bool UDP::recv_ip_packet(packet_buffer& buf)
+{
+    if (!is_running())
+        return false;
+    return m_queue_recv.pop(buf);
+}
+
+// 发送
+// 通用发送；密钥/序号/目标地址取自 Session（多用户隔离）。
+bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
+                      std::vector<uint8_t>& tmp_buf)
+{
+    if (len > VPN_MTU)
+        return false;
+    if (!is_running())
+        return false;
+    std::lock_guard<std::mutex> lock(s.send_mutex);
+
     size_t total_len = Ktunnel_header + len;
     tmp_buf.resize(total_len);
     tunnel_header hdr{};
-    memset(&hdr,0,sizeof(hdr));
+    memset(&hdr, 0, sizeof(hdr));
     hdr.magic = Kmagic;
     hdr.version = Kversion;
     hdr.type = type;
     hdr.payload_len = htons(static_cast<uint16_t>(len));
-    uint32_t seq = m_seq.fetch_add(1);
+    uint32_t seq = s.seq.fetch_add(1);
     hdr.sequence = htonl(seq);
-    memcpy(tmp_buf.data(),&hdr,Ktunnel_header);
-    // 数据面加密：m_data / m_heart / m_heart_response / m_identity 等在密钥就绪后以密文发送（服务端用 k_s2c）
-    if((type == static_cast<uint8_t>(m_data) ||
+    memcpy(tmp_buf.data(), &hdr, Ktunnel_header);
+
+    // 数据面加密：m_data / m_heart / m_heart_response / m_identity 等在密钥就绪后以密文发送
+    if (type == static_cast<uint8_t>(m_data) ||
         type == static_cast<uint8_t>(m_heart) ||
         type == static_cast<uint8_t>(m_heart_response) ||
         type == static_cast<uint8_t>(m_identity) ||
         type == static_cast<uint8_t>(m_identity_ok) ||
-        type == static_cast<uint8_t>(m_identity_deny))){
-        // inner = [type][data]；AAD = 外层头（前 Ktunnel_header 字节）
-        if(!m_enc_ready.load()){
+        type == static_cast<uint8_t>(m_identity_deny)) {
+        if (!s.enc_ready.load()) {
             fprintf(stderr, "[UDP] 密钥未就绪，无法加密发送 type=%d\n", type);
             return false;
         }
         std::vector<uint8_t> inner;
         inner.reserve(1 + len);
         inner.push_back(type);
-        if(len)
+        if (len)
             inner.insert(inner.end(), data, data + len);
-        // AAD = the header actually sent: set payload_len to ciphertext length BEFORE encrypting
+        // AAD = 实际发出的头部：先按密文长度更新 payload_len 再加密
         hdr.payload_len = htons(static_cast<uint16_t>(len + 1 + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN));
-        memcpy(tmp_buf.data(),&hdr,Ktunnel_header);
+        memcpy(tmp_buf.data(), &hdr, Ktunnel_header);
         std::vector<uint8_t> enc;
         try {
-            enc = aes256_gcm_encrypt(m_key_s2c, inner.data(), inner.size(),
+            enc = aes256_gcm_encrypt(s.key_s2c, inner.data(), inner.size(),
                                      tmp_buf.data(), Ktunnel_header);
-        } catch(const std::exception &e){
+        } catch (const std::exception& e) {
             fprintf(stderr, "[UDP] 加密失败: %s\n", e.what());
             return false;
         }
-        if(Ktunnel_header + enc.size() > KMax_packet_size){
-            fprintf(stderr, "[UDP] 加密后包过大: %zu\n", enc.size());
+        if (Ktunnel_header + enc.size() > KMax_packet_size)
             return false;
-        }
-        // 更新 payload_len 为密文长度
-
         tmp_buf.resize(Ktunnel_header + enc.size());
         memcpy(tmp_buf.data() + Ktunnel_header, enc.data(), enc.size());
         total_len = Ktunnel_header + enc.size();
     } else {
-        if(len)
-            memcpy(tmp_buf.data() + Ktunnel_header,data,len);
+        if (len)
+            memcpy(tmp_buf.data() + Ktunnel_header, data, len);
     }
-    int ret = sendto(m_sock,tmp_buf.data(),total_len,0,(struct sockaddr*)&clt_addr,(socklen_t)clt_len);
-    if(ret == -1){
-        fprintf(stderr, "[UDP] sendto() failed: %s\n", strerror(errno));
-        m_need_connect.store(true);
+
+    int ret = sendto(m_sock, tmp_buf.data(), total_len, 0,
+                     reinterpret_cast<struct sockaddr*>(&s.peer_addr), sizeof(s.peer_addr));
+    if (ret == -1) {
+        fprintf(stderr, "[UDP] sendto() failed (%s): %s\n", s.peer_key.c_str(), strerror(errno));
         return false;
     }
-    if(static_cast<size_t>(ret) != total_len){
+    if (static_cast<size_t>(ret) != total_len) {
         fprintf(stderr, "[UDP] sendto() partial send: %d / %zu bytes\n", ret, total_len);
-        m_need_connect.store(true);
         return false;
     }
     return true;
 }
 
-bool UDP::recv_ip_packet(packet_buffer &buf)
+void UDP::reply_heartbeat(Session& s)
 {
-    if(!is_running()){
-        return false;
-    }
-    return m_queue_recv.pop(buf);
+    std::vector<uint8_t> sendbuf;
+    send_packet(s, static_cast<uint8_t>(m_heart_response), nullptr, 0, sendbuf);
 }
+
+// 发送线程：遍历各会话发送队列，把 TUN 下行的 IP 包加密发给对应客户端
 void UDP::send_work()
 {
     std::vector<uint8_t> sendbuf;
     sendbuf.reserve(KMax_packet_size);
     packet_buffer buf;
 
-    while(is_running()){
-        // data plane must be encrypted: wait for key exchange to finish
-        if(!is_handshaked() || !m_enc_ready.load()){
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
+    while (is_running()) {
+        // 拷贝会话列表（避免遍历时持锁；会话被销毁后 shared_ptr 仍安全）
+        std::vector<std::shared_ptr<Session>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(m_sessions_mutex);
+            sessions.reserve(m_sessions.size());
+            for (auto& kv : m_sessions)
+                sessions.push_back(kv.second);
         }
-        if(!m_queue_send.pop(buf)){
-            // 队列空：短暂休眠再取，避免忙轮询，线程保持运行
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        if(buf.is_empty()){
-            continue;
-        }
-        size_t pay_size = buf.data_size();
-        if(pay_size > Max_payload_len){
+        bool any = false;
+        for (auto& s : sessions) {
+            if (!s->handshaked.load() || !s->enc_ready.load())
+                continue;
+            if (!s->send_queue.pop(buf))
+                continue;
+            if (buf.is_empty())
+                continue;
+            const size_t pay_size = buf.data_size();
+            if (pay_size > VPN_MTU) {
+                buf.clear();
+                continue;
+            }
+            if (g_packet_log) {
+                fprintf(stderr, "[UDP][TX] 发送数据 len=%zu to %s\n", pay_size, s->peer_key.c_str());
+            }
+            if (!send_packet(*s, static_cast<uint8_t>(m_data), buf.get_data(), pay_size, sendbuf)) {
+                fprintf(stderr, "[UDP] 发送数据失败: %s\n", s->peer_key.c_str());
+            }
             buf.clear();
-            continue;
+            any = true;
         }
-if(g_packet_log){
-            fprintf(stderr, "[UDP][TX] 发送数据 len=%zu\n", pay_size);
-        }
-        if(!send_packet(m_data,buf.get_data(),pay_size,sendbuf)){
-            m_need_connect.store(true);
-            break;
-        }
-        buf.clear();
+        if (!any)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
+// 接收 —— 上行数据流 + 全部控制面（认证/心跳/断开）的唯一入口：
+//   1) recvfrom 收包，校验魔数/版本/长度；
+//   2) 按 (源IP,端口) 取/建 Session（新来源先建 pending 会话，达到 --max-clients 上限则丢弃）；
+//   3) 密文类型（data/heart/identity…）用该会话的 key_c2s 解密，按内层类型分发：
+//        data → 校验 authenticated 后推入全局接收队列（VpnCore 写入 TUN）
+//        heart → 回 heart_response
+//        identity → handle_identity()（阶段3 认证）
+//   4) 明文类型（阶段1 认证消息 / disconnect）直接分发。
+// 任何合法报文都会刷新 s.last_rx_ms（心跳超时判活的依据）。
 void UDP::recv_work()
 {
     std::vector<uint8_t> recvbuf;
     std::vector<uint8_t> sendbuf;
-    sendbuf.reserve(KMax_packet_size);
     recvbuf.reserve(KMax_packet_size + 64);
+    sendbuf.reserve(KMax_packet_size);
     sockaddr_in peer_addr{};
 
-    while(is_running()){
+    while (is_running()) {
         recvbuf.resize(KMax_packet_size);
         socklen_t peer_addr_size = sizeof(peer_addr);
 
         int ret = recvfrom(m_sock, recvbuf.data(), recvbuf.size(), 0,
-                           (struct sockaddr*)&peer_addr, &peer_addr_size);
-        if(ret <= 0){
-            if(errno == EAGAIN || errno == EWOULDBLOCK){
+                           reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_addr_size);
+        if (ret <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;   // 非阻塞下无数据，短暂休眠后重试
             }
             fprintf(stderr, "[UDP] recvfrom() failed: %s\n", strerror(errno));
-            m_need_connect.store(true);
             break;
         }
-        if(ret < static_cast<int>(Ktunnel_header)){
-            fprintf(stderr, "[UDP] packet too short: %d < %zu bytes\n", ret, Ktunnel_header);
+        if (ret < static_cast<int>(Ktunnel_header))
             continue;   // 包太短
-        }
 
-        // 解析隧道头
         tunnel_header hdr{};
         memcpy(&hdr, recvbuf.data(), Ktunnel_header);
-        if(hdr.magic != Kmagic || hdr.version != Kversion){
-            fprintf(stderr, "[UDP] bad header: magic=%#x version=%u (expected magic=%#x version=%u)\n",
-                    hdr.magic, hdr.version, Kmagic, Kversion);
+        if (hdr.magic != Kmagic || hdr.version != Kversion)
             continue;
-        }
-
         size_t pay_len = ntohs(hdr.payload_len);
-        if(pay_len > Max_payload_len || pay_len + Ktunnel_header > static_cast<size_t>(ret)){
-            fprintf(stderr, "[UDP] invalid payload_len=%zu (received %d bytes)\n", pay_len, ret);
+        if (pay_len > Max_payload_len || pay_len + Ktunnel_header > static_cast<size_t>(ret))
             continue;
-        }
-        // 记录对端地址: 后续 sendto 需要用它作为目标
-        clt_addr = peer_addr;
-        clt_len = peer_addr_size;
-if(g_packet_log){
-            {
-                char ipstr[INET_ADDRSTRLEN] = {0};
-                inet_ntop(AF_INET, &peer_addr.sin_addr, ipstr, sizeof(ipstr));
-                fprintf(stderr, "[UDP][RX] type=%d len=%zu from=%s:%u\n",
-                        hdr.type, pay_len, ipstr, ntohs(peer_addr.sin_port));
-            }
-        }
 
-        // ===== 加密类型：密钥就绪后 m_data / m_heart / m_identity 等均为密文 =====
-        if(hdr.type == static_cast<uint8_t>(m_data) ||
-           hdr.type == static_cast<uint8_t>(m_heart) ||
-           hdr.type == static_cast<uint8_t>(m_heart_response) ||
-           hdr.type == static_cast<uint8_t>(m_identity) ||
-           hdr.type == static_cast<uint8_t>(m_identity_ok) ||
-           hdr.type == static_cast<uint8_t>(m_identity_deny)){
-            if(!m_enc_ready.load()){
-                fprintf(stderr, "[UDP] 密钥未就绪，丢弃加密数据 type=%d len=%zu\n", hdr.type, pay_len);
-                continue;
+        // 按源地址取/建会话（新来源创建 pending 会话；达到上限则丢弃）
+        std::shared_ptr<Session> s = get_or_create_session(peer_addr);
+        if (!s)
+            continue;
+        s->last_rx_ms.store(static_cast<int64_t>(now_ms()));   // 任何合法报文都视为对端存活
+        if (g_packet_log) {
+            char ipstr[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &peer_addr.sin_addr, ipstr, sizeof(ipstr));
+            fprintf(stderr, "[UDP][RX] type=%d len=%zu from=%s:%u\n",
+                    hdr.type, pay_len, ipstr, ntohs(peer_addr.sin_port));
+        }
+        const uint8_t* payload = recvbuf.data() + Ktunnel_header;
+
+        // 加密类型：密钥就绪后 data/heart/identity 均为密文
+        if (hdr.type == static_cast<uint8_t>(m_data) ||
+            hdr.type == static_cast<uint8_t>(m_heart) ||
+            hdr.type == static_cast<uint8_t>(m_heart_response) ||
+            hdr.type == static_cast<uint8_t>(m_identity) ||
+            hdr.type == static_cast<uint8_t>(m_identity_ok) ||
+            hdr.type == static_cast<uint8_t>(m_identity_deny)) {
+            if (!s->enc_ready.load()) {
+                continue;   // 密钥未就绪，丢弃
             }
-            std::vector<uint8_t> enc(recvbuf.data() + Ktunnel_header,
-                                     recvbuf.data() + Ktunnel_header + pay_len);
+            std::vector<uint8_t> enc(payload, payload + pay_len);
             std::optional<std::vector<uint8_t>> plain;
             try {
-                plain = aes256_gcm_decrypt(m_key_c2s, enc, recvbuf.data(), Ktunnel_header);
-            } catch(const std::exception &e){
+                plain = aes256_gcm_decrypt(s->key_c2s, enc, recvbuf.data(), Ktunnel_header);
+            } catch (const std::exception& e) {
                 fprintf(stderr, "[UDP] 解密异常: %s\n", e.what());
                 continue;
             }
-            if(!plain){
-                fprintf(stderr, "[UDP] 解密认证失败，丢弃\n");
-                continue;
+            if (!plain) {
+                continue;   // 认证失败，静默丢弃
             }
             uint8_t inner_type = 0;
             std::vector<uint8_t> inner_payload;
-            if(!parse_inner_packet(*plain, inner_type, inner_payload)){
+            if (!parse_inner_packet(*plain, inner_type, inner_payload))
                 continue;
-            }
-            switch(inner_type){
+            switch (inner_type) {
             case m_data:
-                if(inner_payload.empty())
+                if (inner_payload.empty())
                     break;
-                m_last_heartbeat_ms.store(now_ms());   // 数据包也算对端存活
-if(g_packet_log){
-                    fprintf(stderr, "[UDP][RX] 数据包入队 len=%zu\n", inner_payload.size());
-                }
+                if (!s->authenticated.load())
+                    break;   // 身份未验证通过前禁止把数据转发进 TUN
                 m_queue_recv.push(packet_buffer(std::move(inner_payload)));
                 break;
             case m_heart:
-                m_last_heartbeat_ms.store(now_ms());
-                fprintf(stderr, "[UDP] 收到心跳\n");
-                send_packet(static_cast<uint8_t>(m_heart_response), nullptr, 0, sendbuf);
+                reply_heartbeat(*s);
                 break;
             case m_heart_response:
-                m_last_heartbeat_ms.store(now_ms());
-                fprintf(stderr, "[UDP] 收到心跳确认\n");
                 break;
             case m_identity:
                 // 阶段3：身份报文（验签 + 注册/登录）
-                handle_identity(inner_payload);
+                handle_identity(*s, inner_payload);
                 break;
             case m_identity_ok:
             case m_identity_deny:
@@ -504,48 +540,30 @@ if(g_packet_log){
             continue;
         }
 
-        // ===== 明文类型：三阶段认证（阶段1）/ 断开 =====
-        switch(hdr.type)
-        {
+        // 明文类型：阶段1 认证 / 断开
+        switch (hdr.type) {
         case m_auth_hello:
-            // 阶段1a：客户端 nonce_c → 生成 nonce_s + 临时DH + 签名响应
-            fprintf(stderr, "[UDP][AUTH] 收到 nonce_c，回复签名 ServerHello\n");
-            handle_auth_hello(recvbuf.data() + Ktunnel_header, pay_len);
+            handle_auth_hello(*s, payload, pay_len);
             break;
         case m_auth_client_hello:
-            // 阶段1b+2：客户端临时DH公钥 → ECDH + HKDF 派生会话密钥
-            fprintf(stderr, "[UDP][AUTH] 收到客户端临时DH公钥，派生会话密钥\n");
-            handle_auth_client_hello(recvbuf.data() + Ktunnel_header, pay_len);
+            handle_auth_client_hello(*s, payload, pay_len);
             break;
-        case m_data:
-            {
-                if(!is_handshaked()){
-                    break;
-                }
-                m_last_heartbeat_ms.store(now_ms());   // 数据包也算对端存活
-if(g_packet_log){
-                    fprintf(stderr, "[UDP][RX] 数据包入队 len=%zu\n", pay_len);
-                }
-                // 将 IP 数据包推入接收队列
-                std::vector<uint8_t> tmp_buf(recvbuf.data() + Ktunnel_header ,recvbuf.data() + Ktunnel_header + pay_len);
-                packet_buffer buf(std::move(tmp_buf));
-                m_queue_recv.push(std::move(buf));
+        case m_data: {
+            // 密钥未就绪前的明文数据包（兼容/降级路径）
+            if (!s->handshaked.load())
                 break;
-            }
+            std::vector<uint8_t> tmp(payload, payload + pay_len);
+            m_queue_recv.push(packet_buffer(std::move(tmp)));
+            break;
+        }
         case m_heart:
-            m_last_heartbeat_ms.store(now_ms());   // 收到对端心跳 → 存活
-            fprintf(stderr, "[UDP] 收到心跳\n");
-            handle_heartbeat();
+            reply_heartbeat(*s);
             break;
         case m_heart_response:
-            m_last_heartbeat_ms.store(now_ms());   // 心跳确认 → 更新存活时间
-            fprintf(stderr, "[UDP] 收到心跳确认\n");
             break;
         case disconnect:
-            m_need_connect.store(true);
-            m_handshaked.store(false);
-            m_authenticated.store(false);
-            fprintf(stderr, "[UDP] 收到断开消息\n");
+            fprintf(stderr, "[UDP] 收到断开消息: %s\n", s->peer_key.c_str());
+            release_session(s->peer_key);
             break;
         default:
             break;
@@ -553,18 +571,17 @@ if(g_packet_log){
     }
 }
 
-// ===================== 三阶段身份认证（Ed25519 + 临时X25519 + HKDF + AES-256-GCM） =====================
-//   阶段1（明文）：C→S [nonce_c]；S→C [nonce_s || DH_SRV_EPHEM_PUB || sig_srv]（SIG_SRV_PRI 签名）；
-//                  客户端验签失败即断开（防中间人）；C→S [DH_CLI_EPHEM_PUB]
-//   阶段2：X25519 ECDH → HKDF-Extract(salt=nonce_c||nonce_s) → Expand 出 key_tx/key_rx
-//   阶段3（密文）：客户端身份报文 → 验签 → 注册（令牌）/登录（比对公钥）→ 通过才放行 TUN 流量
-void UDP::handle_auth_hello(const uint8_t* payload, size_t len)
+// 三阶段身份认证（Ed25519 + 临时X25519 + HKDF + AES-256-GCM）
+// 阶段1 明文交换 nonce/临时DH 公钥并验签防中间人；阶段2 ECDH+HKDF 派生 key_tx/key_rx；
+// 阶段3 密文身份报文验签后按注册（令牌）/登录（公钥比对）放行 TUN 流量。
+
+void UDP::handle_auth_hello(Session& s, const uint8_t* payload, size_t len)
 {
-    if(len != KAuthNonceLen){
+    if (len != KAuthNonceLen) {
         fprintf(stderr, "[UDP][AUTH] auth_hello 长度错误: %zu != %zu\n", len, KAuthNonceLen);
         return;
     }
-    if(!m_sig_priv){
+    if (!m_sig_priv) {
         fprintf(stderr, "[UDP][AUTH] 未配置服务器身份私钥 SIG_SRV_PRI\n");
         return;
     }
@@ -574,78 +591,80 @@ void UDP::handle_auth_hello(const uint8_t* payload, size_t len)
         // sig_payload = nonce_c || nonce_s || DH_SRV_EPHEM_PUB，用 SIG_SRV_PRI 签名
         std::vector<uint8_t> sig_payload;
         sig_payload.reserve(KAuthNonceLen * 2 + KAuthDhPubLen);
-        sig_payload.insert(sig_payload.end(), m_nonce_c.begin(), m_nonce_c.end());
-        sig_payload.insert(sig_payload.end(), m_nonce_s.begin(), m_nonce_s.end());
-        sig_payload.insert(sig_payload.end(), m_dh_srv_pub.begin(), m_dh_srv_pub.end());
+        sig_payload.insert(sig_payload.end(), s.nonce_c.begin(), s.nonce_c.end());
+        sig_payload.insert(sig_payload.end(), s.nonce_s.begin(), s.nonce_s.end());
+        sig_payload.insert(sig_payload.end(), s.dh_srv_pub.begin(), s.dh_srv_pub.end());
         std::vector<uint8_t> sig;
         try {
             sig = ed25519_sign(m_sig_priv.get(), sig_payload.data(), sig_payload.size());
-        } catch(const std::exception &e){
+        } catch (const std::exception& e) {
             fprintf(stderr, "[UDP][AUTH] 服务器签名失败: %s\n", e.what());
             return false;
         }
-        if(sig.size() != KAuthSigLen){
-            fprintf(stderr, "[UDP][AUTH] 签名长度异常: %zu\n", sig.size());
+        if (sig.size() != KAuthSigLen)
             return false;
-        }
-        // 响应：nonce_s || DH_SRV_EPHEM_PUB || sig_srv
         std::vector<uint8_t> reply;
         reply.reserve(KAuthServerHelloLen);
-        reply.insert(reply.end(), m_nonce_s.begin(), m_nonce_s.end());
-        reply.insert(reply.end(), m_dh_srv_pub.begin(), m_dh_srv_pub.end());
+        reply.insert(reply.end(), s.nonce_s.begin(), s.nonce_s.end());
+        reply.insert(reply.end(), s.dh_srv_pub.begin(), s.dh_srv_pub.end());
         reply.insert(reply.end(), sig.begin(), sig.end());
         std::vector<uint8_t> sendbuf;
-        return send_packet(static_cast<uint8_t>(m_auth_server_hello), reply.data(), reply.size(), sendbuf);
+        return send_packet(s, static_cast<uint8_t>(m_auth_server_hello), reply.data(), reply.size(), sendbuf);
     };
 
     // 同一会话的 auth_hello 重传（nonce_c 相同且会话已建立）：不重置状态，幂等重发同一 ServerHello。
-    // 否则每次重传都会重新生成 nonce_s/临时DH，导致与客户端已采用的会话状态错位。
-    if(!m_nonce_c.empty() && m_nonce_c.size() == KAuthNonceLen &&
-       std::memcmp(m_nonce_c.data(), payload, KAuthNonceLen) == 0 &&
-       m_dh_srv_priv != nullptr && !m_nonce_s.empty() && !m_dh_srv_pub.empty()){
-        if(send_server_hello()){
+    if (!s.nonce_c.empty() && s.nonce_c.size() == KAuthNonceLen &&
+        std::memcmp(s.nonce_c.data(), payload, KAuthNonceLen) == 0 &&
+        s.dh_srv_priv != nullptr && !s.nonce_s.empty() && !s.dh_srv_pub.empty()) {
+        if (send_server_hello())
             fprintf(stderr, "[UDP][AUTH] auth_hello 重传：幂等重发 ServerHello\n");
-        }
         return;
     }
 
     // 新会话：重置上一会话的认证/密钥状态（客户端重连时不复用旧密钥）
-    reset_auth_state();
-    m_nonce_c.assign(payload, payload + KAuthNonceLen);
-    m_nonce_s = generate_nonce(KAuthNonceLen);
-    if(!generate_ephemeral_x25519(m_dh_srv_priv, m_dh_srv_pub)){
+    if (s.dh_srv_priv != nullptr) {
+        EVP_PKEY_free(s.dh_srv_priv);
+        s.dh_srv_priv = nullptr;
+    }
+    secure_wipe(s.key_c2s);
+    secure_wipe(s.key_s2c);
+    s.enc_ready.store(false);
+    s.authenticated.store(false);
+    s.handshaked.store(false);
+    s.nonce_c.assign(payload, payload + KAuthNonceLen);
+    s.nonce_s = generate_nonce(KAuthNonceLen);
+    if (!generate_ephemeral_x25519(s.dh_srv_priv, s.dh_srv_pub)) {
         fprintf(stderr, "[UDP][AUTH] 生成临时 X25519 密钥对失败\n");
         return;
     }
-    if(!send_server_hello()){
+    if (!send_server_hello())
         fprintf(stderr, "[UDP][AUTH] 发送 ServerHello 失败\n");
-        return;
-    }
-    fprintf(stderr, "[UDP][AUTH] 已回复签名 ServerHello\n");
+    else
+        fprintf(stderr, "[UDP][AUTH] 已回复签名 ServerHello (%s)\n", s.peer_key.c_str());
 }
 
-void UDP::handle_auth_client_hello(const uint8_t* payload, size_t len)
+void UDP::handle_auth_client_hello(Session& s, const uint8_t* payload, size_t len)
 {
-    if(len != KAuthDhPubLen){
+    if (len != KAuthDhPubLen) {
         fprintf(stderr, "[UDP][AUTH] auth_client_hello 长度错误: %zu != %zu\n", len, KAuthDhPubLen);
         return;
     }
-    if(m_dh_srv_priv == nullptr || m_nonce_c.empty() || m_nonce_s.empty()){
+    if (s.dh_srv_priv == nullptr || s.nonce_c.empty() || s.nonce_s.empty()) {
         fprintf(stderr, "[UDP][AUTH] 会话状态不完整（未先收到 auth_hello）\n");
         return;
     }
-    m_dh_cli_pub.assign(payload, payload + KAuthDhPubLen);
+    s.dh_cli_pub.assign(payload, payload + KAuthDhPubLen);
 
     // 阶段2：X25519 ECDH 计算共享秘密
-    EVP_PKEY* cli_pub = make_x25519_public_key(m_dh_cli_pub.data(), m_dh_cli_pub.size());
-    if(cli_pub == nullptr){
+    EVP_PKEY* cli_pub = make_x25519_public_key(s.dh_cli_pub.data(), s.dh_cli_pub.size());
+    if (cli_pub == nullptr) {
         fprintf(stderr, "[UDP][AUTH] 构造客户端临时公钥失败\n");
         return;
     }
     std::vector<uint8_t> ss;
     try {
-        ss = ecdh_derive_shared_secret(m_dh_srv_priv, cli_pub);
-    } catch(const std::exception &e){
+        ss = ecdh_derive_shared_secret(s.dh_srv_priv, cli_pub);
+    } catch (const std::exception& e) {
         EVP_PKEY_free(cli_pub);
         fprintf(stderr, "[UDP][AUTH] ECDH 失败: %s\n", e.what());
         return;
@@ -653,52 +672,56 @@ void UDP::handle_auth_client_hello(const uint8_t* payload, size_t len)
     EVP_PKEY_free(cli_pub);
 
     // HKDF：Extract(salt=nonce_c||nonce_s, IKM=ss) → prk → Expand 出 key_tx/key_rx
-    DirectionalSessionKeys keys;
     try {
-        keys = derive_directional_session_keys(ss, m_nonce_c, m_nonce_s);
-    } catch(const std::exception &e){
+        DirectionalSessionKeys keys = derive_directional_session_keys(ss, s.nonce_c, s.nonce_s);
+        secure_wipe(ss);
+        s.key_c2s = std::move(keys.key_tx);   // 客户端→服务端（接收解密）
+        s.key_s2c = std::move(keys.key_rx);   // 服务端→客户端（发送加密）
+    } catch (const std::exception& e) {
         secure_wipe(ss);
         fprintf(stderr, "[UDP][AUTH] 会话密钥派生失败: %s\n", e.what());
         return;
     }
-    secure_wipe(ss);
-    m_key_c2s = std::move(keys.key_tx); // 客户端→服务端（接收解密）
-    m_key_s2c = std::move(keys.key_rx); // 服务端→客户端（发送加密）
-    m_enc_ready.store(true);
-    fprintf(stderr, "[UDP][AUTH] 加密隧道已建立（阶段2完成，等待身份报文）\n");
+    s.enc_ready.store(true);
+    fprintf(stderr, "[UDP][AUTH] 加密隧道已建立（阶段2完成，等待身份报文）%s\n", s.peer_key.c_str());
 }
 
-// 阶段3：身份报文（AES-GCM 密文内层）
+// 阶段3：身份报文（AES-GCM 密文内层，已解密）
 // body = [flags(1: 0=登录 1=注册)] [token_len(1)] [token?] [identity_payload] [sig_cli(64)]
 // identity_payload = nonce_c(16) || nonce_s(16) || dh_cli_pub(32) || dh_srv_pub(32)
 //                    || sig_cli_pub(32) || id_len(1) || client_id
-void UDP::handle_identity(const std::vector<uint8_t>& inner)
+// 校验流程（顺序执行，任一失败即 deny 断开）：
+//   1) 长度/字段完整性检查
+//   2) 会话绑定检查：报文里的 nonce/DH 公钥必须与本会话一致（防跨会话重放）
+//   3) 用报文携带的 cli_pub 验证 sig_cli 签名（证明持有对应私钥）
+//   4) 注册分支：校验 register_token（一次性，用后从 register_tokens.txt 移除），
+//      把客户端公钥写入 registered_clients.txt；
+//      登录分支：在 registered_clients.txt 里比对公钥
+//   5) 通过 → 分配虚拟 IP → 回 identity_ok（携带 [ip(4)][prefix(1)]）→ 放行
+void UDP::handle_identity(Session& s, const std::vector<uint8_t>& inner)
 {
     // 已认证会话再次收到身份报文 = 客户端在首次成功确认前发出的重传，直接忽略。
-    // 否则令牌已被消费后重传会被误判为"无效/已使用"，把正常会话断开。
-    if (m_authenticated.load()) {
+    if (s.authenticated.load()) {
         return;
     }
     // identity_deny 携带 1 字节原因码（密文内层）：
     //   0 = 身份未注册 / 签名失败等（登录类失败）
     //   1 = 注册令牌无效或已使用（注册类失败）
-    // 客户端据此区分，并可在原因=1 时自动清除 RegisterToken 切换登录模式
     auto deny = [&](uint8_t reason) {
         std::vector<uint8_t> r{ reason };
         std::vector<uint8_t> sendbuf;
-        send_packet(static_cast<uint8_t>(m_identity_deny), r.data(), r.size(), sendbuf);
-        m_authenticated.store(false);
-        m_handshaked.store(false);
-        m_need_connect.store(true);
+        send_packet(s, static_cast<uint8_t>(m_identity_deny), r.data(), r.size(), sendbuf);
+        s.authenticated.store(false);
+        s.handshaked.store(false);
     };
-    if(inner.size() < 2 + KAuthIdentityFixed + KAuthSigLen){
+    if (inner.size() < 2 + KAuthIdentityFixed + KAuthSigLen) {
         fprintf(stderr, "[UDP][AUTH] 身份报文过短: %zu\n", inner.size());
         deny(0);
         return;
     }
     const uint8_t flags = inner[0];
     const size_t token_len = inner[1];
-    if(inner.size() < 2 + token_len + KAuthIdentityFixed + KAuthSigLen){
+    if (inner.size() < 2 + token_len + KAuthIdentityFixed + KAuthSigLen) {
         fprintf(stderr, "[UDP][AUTH] 身份报文长度不匹配\n");
         deny(0);
         return;
@@ -710,7 +733,7 @@ void UDP::handle_identity(const std::vector<uint8_t>& inner)
     // 重建 identity_payload（与客户端组装规则完全一致）
     const std::vector<uint8_t> payload(inner.begin() + pos, inner.end() - KAuthSigLen);
     const uint8_t* sig = inner.data() + inner.size() - KAuthSigLen;
-    if(payload.size() < KAuthIdentityFixed){
+    if (payload.size() < KAuthIdentityFixed) {
         deny(0);
         return;
     }
@@ -721,7 +744,7 @@ void UDP::handle_identity(const std::vector<uint8_t>& inner)
     const std::vector<uint8_t> ds(p, p + KAuthDhPubLen);             p += KAuthDhPubLen;
     const std::vector<uint8_t> cli_pub(p, p + KAuthDhPubLen);        p += KAuthDhPubLen;
     const size_t id_len = *p;                                        ++p;
-    if(payload.size() != KAuthIdentityFixed + id_len){
+    if (payload.size() != KAuthIdentityFixed + id_len) {
         fprintf(stderr, "[UDP][AUTH] identity_payload 长度不匹配\n");
         deny(0);
         return;
@@ -729,7 +752,7 @@ void UDP::handle_identity(const std::vector<uint8_t>& inner)
     const std::string client_id(reinterpret_cast<const char*>(p), id_len);
 
     // 会话绑定检查：全部会话上下文必须与本会话一致
-    if(nc != m_nonce_c || ns != m_nonce_s || dc != m_dh_cli_pub || ds != m_dh_srv_pub){
+    if (nc != s.nonce_c || ns != s.nonce_s || dc != s.dh_cli_pub || ds != s.dh_srv_pub) {
         fprintf(stderr, "[UDP][AUTH] 身份报文会话上下文不匹配，拒绝\n");
         deny(0);
         return;
@@ -737,7 +760,7 @@ void UDP::handle_identity(const std::vector<uint8_t>& inner)
 
     // 校验 sig_cli
     EVP_PKEY* cli_key = make_ed25519_public_key(cli_pub.data(), cli_pub.size());
-    if(cli_key == nullptr){
+    if (cli_key == nullptr) {
         fprintf(stderr, "[UDP][AUTH] 构造客户端身份公钥失败\n");
         deny(0);
         return;
@@ -745,11 +768,11 @@ void UDP::handle_identity(const std::vector<uint8_t>& inner)
     bool sig_ok = false;
     try {
         sig_ok = ed25519_verify(cli_key, payload.data(), payload.size(), sig, KAuthSigLen);
-    } catch(const std::exception &){
+    } catch (const std::exception&) {
         sig_ok = false;
     }
     EVP_PKEY_free(cli_key);
-    if(!sig_ok){
+    if (!sig_ok) {
         fprintf(stderr, "[UDP][AUTH] 客户端身份签名校验失败，拒绝\n");
         deny(0);
         return;
@@ -759,82 +782,129 @@ void UDP::handle_identity(const std::vector<uint8_t>& inner)
     const std::string cli_pub_hex = to_hex(cli_pub.data(), cli_pub.size());
     const std::string clients_path = m_keys_dir + "/registered_clients.txt";
     const std::string tokens_path  = m_keys_dir + "/register_tokens.txt";
-    if(flags == 1){
+    if (flags == 1) {
         // 注册分支：校验一次性令牌，写入数据库，令牌作废
-        if(token.empty()){
+        if (token.empty()) {
             fprintf(stderr, "[UDP][AUTH] 注册模式缺少 register_token\n");
             deny(1);
             return;
         }
-        if(!file_remove_line(tokens_path, token)){
+        if (!file_remove_line(tokens_path, token)) {
             fprintf(stderr, "[UDP][AUTH] 注册令牌无效或已使用\n");
             deny(1);
             return;
         }
-        if(!file_append_line(clients_path, cli_pub_hex)){
+        if (!file_append_line(clients_path, cli_pub_hex)) {
             fprintf(stderr, "[UDP][AUTH] 写入已注册客户端失败\n");
             deny(1);
             return;
         }
-        fprintf(stderr, "[UDP][AUTH] 客户端注册成功 id=%s\n", client_id.c_str());
+        fprintf(stderr, "[UDP][AUTH] 客户端注册成功 id=%s (%s)\n", client_id.c_str(), s.peer_key.c_str());
     } else {
         // 登录分支：数据库比对 SIG_CLI_PUB
-        if(!file_contains_line(clients_path, cli_pub_hex)){
+        if (!file_contains_line(clients_path, cli_pub_hex)) {
             fprintf(stderr, "[UDP][AUTH] 未注册的客户端身份，拒绝登录\n");
             deny(0);
             return;
         }
-        fprintf(stderr, "[UDP][AUTH] 客户端登录成功 id=%s\n", client_id.c_str());
+        fprintf(stderr, "[UDP][AUTH] 客户端登录成功 id=%s (%s)\n", client_id.c_str(), s.peer_key.c_str());
+    }
+    s.client_id = client_id;
+    s.cli_pub_hex = cli_pub_hex;
+
+    // 同身份重复登录：踢掉旧的在线会话（同一 client_id 只保留最新）
+    {
+        std::vector<std::string> to_kill;
+        {
+            std::lock_guard<std::mutex> lock(m_sessions_mutex);
+            for (auto& kv : m_sessions) {
+                if (kv.second.get() != &s && kv.second->client_id == s.client_id)
+                    to_kill.push_back(kv.first);
+            }
+        }
+        for (auto& k : to_kill)
+            release_session(k);
     }
 
-    // 全部校验通过 → 放行 TUN 业务流量
-    m_authenticated.store(true);
-    m_handshaked.store(true);
-    m_last_heartbeat_ms.store(now_ms());
-    std::vector<uint8_t> sendbuf;
-    send_packet(static_cast<uint8_t>(m_identity_ok), nullptr, 0, sendbuf);
-    fprintf(stderr, "[UDP][AUTH] 身份认证通过，放行 TUN 流量\n");
-}
-
-void UDP::reset_auth_state()
-{
-    m_authenticated.store(false);
-    m_handshaked.store(false);
-    m_enc_ready.store(false);
-    m_nonce_c.clear();
-    m_nonce_s.clear();
-    m_dh_srv_pub.clear();
-    m_dh_cli_pub.clear();
-    if(m_dh_srv_priv != nullptr){
-        EVP_PKEY_free(m_dh_srv_priv);   // 销毁临时私钥（前向安全）
-        m_dh_srv_priv = nullptr;
+    // 分配虚拟 IP（多用户唯一地址；认证通过后才分配）
+    if (!s.ip_assigned) {
+        s.virtual_ip = allocate_virtual_ip();
+        if (s.virtual_ip == 0) {
+            fprintf(stderr, "[UDP][AUTH] 虚拟 IP 池已满，拒绝 %s\n", client_id.c_str());
+            deny(0);
+            return;
+        }
+        s.ip_assigned = true;
+        {
+            std::lock_guard<std::mutex> lock(m_vip_mutex);
+            m_vip_to_key[s.virtual_ip] = s.peer_key;
+        }
     }
-    secure_wipe(m_key_c2s);
-    secure_wipe(m_key_s2c);
-}
 
-
-bool UDP::handle_heartbeat()
-{
+    // 全部校验通过 → 放行 TUN 业务流量，并通告分配的虚拟 IP
+    s.authenticated.store(true);
+    s.handshaked.store(true);
+    s.last_rx_ms.store(static_cast<int64_t>(now_ms()));
+    // identity_ok payload: [virtual_ip(4, 网络序)] [prefix(1)]
+    uint8_t ok_payload[5] = {0};
+    memcpy(ok_payload, &s.virtual_ip, 4);
+    ok_payload[4] = static_cast<uint8_t>(m_tun_prefix);
     std::vector<uint8_t> sendbuf;
-    return send_packet(m_heart_response, nullptr, 0, sendbuf);
+    if (!send_packet(s, static_cast<uint8_t>(m_identity_ok), ok_payload, sizeof(ok_payload), sendbuf)) {
+        fprintf(stderr, "[UDP][AUTH] 发送 identity_ok 失败\n");
+        return;
+    }
+    {
+        char ipstr[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &s.virtual_ip, ipstr, sizeof(ipstr));
+        fprintf(stderr, "[UDP][AUTH] 身份认证通过，放行 TUN 流量：id=%s vip=%s/%d (%s)\n",
+                client_id.c_str(), ipstr, m_tun_prefix, s.peer_key.c_str());
+    }
 }
 
-void UDP::set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir)
+// 心跳保活
+void UDP::heartbeat_work()
 {
-    m_sig_priv = std::move(sig_priv);
-    m_keys_dir = keys_dir;
-    if (m_keys_dir.empty())
-        m_keys_dir = "keys";
+    const uint64_t timeout_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(kHeartbeatTimeout).count());
+    while (is_running()) {
+        std::this_thread::sleep_for(kHeartbeatInterval);
+        if (!is_running())
+            break;
+        const uint64_t now = now_ms();
+        std::vector<std::shared_ptr<Session>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(m_sessions_mutex);
+            sessions.reserve(m_sessions.size());
+            for (auto& kv : m_sessions)
+                sessions.push_back(kv.second);
+        }
+        for (auto& s : sessions) {
+            // 未认证会话：握手超时清理（防 DoS 占满会话表）
+            if (!s->handshaked.load()) {
+                if (now - static_cast<uint64_t>(s->created_at_ms.load()) > timeout_ms) {
+                    fprintf(stderr, "[UDP] 握手超时，销毁未认证会话 %s\n", s->peer_key.c_str());
+                    release_session(s->peer_key);
+                }
+                continue;
+            }
+            // 认证会话：心跳超时 → 判失联销毁
+            const int64_t last = s->last_rx_ms.load();
+            if (last != 0 && (now - static_cast<uint64_t>(last)) > timeout_ms) {
+                fprintf(stderr, "[UDP] heartbeat timeout, destroy session %s\n", s->peer_key.c_str());
+                release_session(s->peer_key);
+                continue;
+            }
+            // 主动发送心跳
+            std::vector<uint8_t> sendbuf;
+            if (!send_packet(*s, static_cast<uint8_t>(m_heart), nullptr, 0, sendbuf)) {
+                fprintf(stderr, "[UDP] send heartbeat failed: %s\n", s->peer_key.c_str());
+            }
+        }
+    }
 }
 
-bool UDP::is_encrypted() const
-{
-    return m_enc_ready.load();
-}
-
-// ===================== 注册/登录数据库（简单文本文件） =====================
-
+// 注册/登录数据库（文本文件）
 std::string UDP::to_hex(const uint8_t* data, size_t len)
 {
     static const char hex[] = "0123456789abcdef";
@@ -908,13 +978,14 @@ bool UDP::file_remove_line(const std::string& path, const std::string& line)
     return removed;
 }
 
+// 线程管理
 bool UDP::start_threads()
 {
-    try{
+    try {
         send_thread = std::thread(&UDP::send_work, this);
         recv_thread = std::thread(&UDP::recv_work, this);
         heartbeat_thread = std::thread(&UDP::heartbeat_work, this);
-    }catch(const std::system_error &e){
+    } catch (const std::system_error& e) {
         fprintf(stderr, "[UDP] start_threads failed: %s\n", e.what());
         stop_threads();
         return false;
@@ -924,51 +995,10 @@ bool UDP::start_threads()
 
 void UDP::stop_threads()
 {
-    if(send_thread.joinable()){
+    if (send_thread.joinable())
         send_thread.join();
-    }
-    if(recv_thread.joinable()){
+    if (recv_thread.joinable())
         recv_thread.join();
-    }
-    if(heartbeat_thread.joinable()){
+    if (heartbeat_thread.joinable())
         heartbeat_thread.join();
-    }
-}
-
-void UDP::heartbeat_work()
-{
-    while(is_running()){
-        std::this_thread::sleep_for(kHeartbeatInterval);
-        if(!is_running()){
-            break;
-        }
-        if(!is_handshaked()){
-            continue;   // 尚未握手，无需保活
-        }
-        // 超时检测：超过 kHeartbeatTimeout 未收到对端任何包 → 判定失联
-        uint64_t last = m_last_heartbeat_ms.load();
-        uint64_t timeout_ms = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(kHeartbeatTimeout).count());
-        if(last != 0 && (now_ms() - last) > timeout_ms){
-            fprintf(stderr, "[UDP] heartbeat timeout, peer considered dead\n");
-            m_handshaked.store(false);
-            m_need_connect.store(true);
-            continue;
-        }
-        // 主动发送心跳
-        std::vector<uint8_t> sendbuf;
-        fprintf(stderr, "[UDP] 发送心跳\n");
-        if(!send_packet(m_heart, nullptr, 0, sendbuf)){
-            fprintf(stderr, "[UDP] send heartbeat failed\n");
-            m_need_connect.store(true);
-        }
-    }
-}
-
-uint32_t UDP::GenerateISN()
-{
-	static std::random_device rd;
-	static std::mt19937 generator(rd());
-	static std::uniform_int_distribution<uint32_t> dist;
-	return dist(generator);
 }

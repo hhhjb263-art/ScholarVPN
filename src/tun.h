@@ -3,8 +3,8 @@
 #include<atomic>
 #include "wintun.h"
 /*
-*	Ê¹ÓÃ wintun.h ¹Ù·½ÉùÃ÷µÄº¯ÊıÀàĞÍ¡£
-	Ïê¼ûthird_party/wintun-0.14.1/wintun/include/wintun.hÔ´Âë
+*	ä½¿ç”¨ wintun.h å®˜æ–¹å£°æ˜çš„å‡½æ•°ç±»å‹ã€‚
+	è¯¦è§third_party/wintun-0.14.1/wintun/include/wintun.hæºç 
 */
 class WintunTun : public ITunDevice{
 public:
@@ -27,7 +27,7 @@ private:
 	bool load_wintun_api();
 	bool open_or_create_adapter(const std::wstring &TunName, const std::wstring &tunnelType);
 	bool fetch_adapter_luid();
-	void reset_api_pointers() noexcept; // ÎŞĞèÅ×³öÒì³£
+	void reset_api_pointers() noexcept; // æ— éœ€æŠ›å‡ºå¼‚å¸¸
 private:
 	HMODULE m_hDll = nullptr;
 	WINTUN_ADAPTER_HANDLE m_hAdapter = nullptr;

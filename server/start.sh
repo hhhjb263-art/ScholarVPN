@@ -31,7 +31,8 @@ TUN_MTU="${TUN_MTU:-1400}"
 TUN_NET="${TUN_NET:-10.8.0.0/24}"
 VPN_PORT="${VPN_PORT:-51820}"
 LISTEN_IP="${LISTEN_IP:-0.0.0.0}"
-KEY_PATH="${KEY_PATH:-$SCRIPT_DIR/keys/server.key}"
+KEY_PATH="${KEY_PATH:-$SCRIPT_DIR/keys/server_sig.key}"
+MAX_CLIENTS="${MAX_CLIENTS:-0}"     # 最大并发客户端数，0=服务端默认(64)；多用户自动分配虚拟 IP
 ENABLE_IPV6="${ENABLE_IPV6:-0}"        # 1=同时开启 IPv6 转发
 # ---- 运行 / 日志 ----
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"        # 重点日志保存目录（按天轮转）
@@ -183,6 +184,12 @@ do_doctor() {
     else
         echo "    未安装! → sudo ./start.sh install"
     fi
+    if [ -f /etc/default/vpn-server ]; then
+        echo "    环境文件: /etc/default/vpn-server (存在；编辑后 systemctl restart vpn-server 生效)"
+        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|MAX_CLIENTS|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
+    else
+        echo "    环境文件: 无 (/etc/default/vpn-server 缺失，使用 start.sh 默认参数)"
+    fi
     echo
     # 4) 当前进程
     echo "[4] 后台进程"
@@ -236,6 +243,27 @@ do_install() {
     sed -e "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" \
         -e "s|__LOGS_DIR__|$LOGS_DIR|g" \
         "$TEMPLATE" > "$SERVICE"
+    # 生成环境文件：把 install 时的配置固化为 systemd EnvironmentFile（可手动编辑）
+    ENV_FILE="/etc/default/vpn-server"
+    {
+        echo "# 由 start.sh install 生成（$(date '+%F %T')）。可手动修改后执行：systemctl restart vpn-server"
+        echo "VPN_BIN=\"$VPN_BIN\""
+        echo "TUN_NAME=\"$TUN_NAME\""
+        echo "TUN_IP=\"$TUN_IP\""
+        echo "TUN_PREFIX=\"$TUN_PREFIX\""
+        echo "TUN_MTU=\"$TUN_MTU\""
+        echo "TUN_NET=\"$TUN_NET\""
+        echo "VPN_PORT=\"$VPN_PORT\""
+        echo "LISTEN_IP=\"$LISTEN_IP\""
+        echo "KEY_PATH=\"$KEY_PATH\""
+        echo "MAX_CLIENTS=\"$MAX_CLIENTS\""
+        echo "ENABLE_IPV6=\"$ENABLE_IPV6\""
+        echo "QUIET=\"$QUIET\""
+        echo "MAX_RESTARTS=\"$MAX_RESTARTS\""
+        echo "LOGS_DIR=\"$LOGS_DIR\""
+        echo "RUN_DIR=\"$RUN_DIR\""
+    } > "$ENV_FILE"
+    echo "[*] 已生成环境文件: $ENV_FILE（可编辑后 systemctl restart vpn-server 生效）"
     systemctl daemon-reload
     systemctl enable vpn-server >/dev/null 2>&1 || true
     systemctl restart vpn-server
@@ -259,6 +287,10 @@ do_uninstall() {
         echo "[*] 已卸载 vpn-server 系统服务"
     else
         echo "[*] 未安装 vpn-server 系统服务"
+    fi
+    if [ -f /etc/default/vpn-server ]; then
+        rm -f /etc/default/vpn-server
+        echo "[*] 已删除环境文件 /etc/default/vpn-server"
     fi
 }
 
@@ -369,6 +401,9 @@ fi
 # ===== 5. 启动 vpn_server =====
 ARGS=(-l "$LISTEN_IP" -p "$VPN_PORT" -n "$TUN_NAME" -a "$TUN_IP"
       --prefix "$TUN_PREFIX" --mtu "$TUN_MTU" -k "$KEY_PATH")
+if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
+    ARGS+=(--max-clients "$MAX_CLIENTS")
+fi
 if [ "$QUIET" = "1" ]; then
     ARGS+=(--quiet)
     LOG_DESC="精简（仅重点日志）"
@@ -384,6 +419,9 @@ if [ "$DAEMON" = "1" ]; then
     fi
     rm -f "$STOP_FLAG" "$VPID_FILE"
     ARGS_STR="-l $LISTEN_IP -p $VPN_PORT -n $TUN_NAME -a $TUN_IP --prefix $TUN_PREFIX --mtu $TUN_MTU -k $KEY_PATH"
+    if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
+        ARGS_STR="$ARGS_STR --max-clients $MAX_CLIENTS"
+    fi
     [ "$QUIET" = "1" ] && ARGS_STR="$ARGS_STR --quiet"
     # 生成 watchdog 守护脚本：vpn_server 异常退出时自动重启
     cat > "$RUN_DIR/watchdog.sh" <<WDE

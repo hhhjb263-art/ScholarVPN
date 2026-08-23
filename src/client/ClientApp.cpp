@@ -1,74 +1,8 @@
 
 #include "ClientApp.h"
 #include <cstdarg>
-#include"../src/util/utf.h"
+#include"../src/util/utf.h"   // narrow/to_wstring/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
 namespace {
-
-std::wstring to_wstring(const std::string& str)
-{
-    return std::wstring(str.begin(), str.end());
-}
-
-std::string narrow(const std::wstring& str)
-{
-    if (str.empty())
-    {
-        return std::string();
-    }
-    const int len = ::WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0, nullptr, nullptr);
-    std::string out(static_cast<size_t>(len), 0);
-    ::WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &out[0], len, nullptr, nullptr);
-    return out;
-}
-
-bool is_valid_ipv4(const std::string& ip)
-{
-    IN_ADDR addr{};
-    std::wstring w(ip.begin(), ip.end());
-    return ::InetPtonW(AF_INET, w.c_str(), &addr) == 1;
-}
-
-// Resolve key files relative to the exe directory (admin runs may change cwd).
-std::string get_exe_dir()
-{
-    wchar_t buffer[MAX_PATH]{};
-    const DWORD n = ::GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
-    {
-        return "";
-    }
-    const std::wstring path(buffer, n);
-    const std::size_t slash = path.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-    {
-        return "";
-    }
-    std::string result;
-    result.reserve(slash + 1);
-    for (std::size_t i = 0; i <= slash; ++i)
-    {
-        result.push_back(static_cast<char>(path[i]));
-    }
-    return result;
-}
-
-// Look for the key file in the AppData keys directory first, then next to the exe.
-std::string find_key_file(const std::string& appdata_keys_dir, const std::string& exe_dir, const std::string& filename)
-{
-    const std::string candidates[] = {
-        appdata_keys_dir + filename,
-        exe_dir + filename,
-        exe_dir + "keys\\" + filename
-    };
-    for (const auto& candidate : candidates)
-    {
-        if (std::ifstream probe{ candidate, std::ios::binary })
-        {
-            return candidate;
-        }
-    }
-    return appdata_keys_dir + filename;
-}
 
 //客户端身份私钥本地加密存储
 bool dpapi_protect(const std::vector<uint8_t>& plain, std::vector<uint8_t>& out)
@@ -365,6 +299,12 @@ bool ClientApp::init()
         return false;
     }
 
+    // 防 DNS 泄漏：备份并清空物理网卡等非 TUN 接口的 DNS
+    if (!m_dnsGuard.protect(m_tun->get_interface_luid()))
+    {
+        LOG_ERR("[Warn] DNS leak guard: no physical interface DNS found to clear");
+    }
+
     emit_log("ClientApp initialized, server=%s:%u", m_remote.c_str(), static_cast<int>(m_port));
     return true;
 }
@@ -546,6 +486,8 @@ void ClientApp::stop()
         m_threadUdpToTun.join();
     }
     m_mgr.reset();
+    // 断线/停止：恢复物理网卡 DNS（防 DNS 泄漏守卫的恢复步骤）
+    m_dnsGuard.restore();
     m_state.store(ConnState::Stopped);
     if (wasRunning)
     {

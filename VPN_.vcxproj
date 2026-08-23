@@ -118,6 +118,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindows.dll" "$(OutDir)p
     <ClInclude Include="src\client\ClientApp.h" />
     <ClInclude Include="src\gui\AppBridge.h" />
     <ClInclude Include="src\gui\QtWidgetsClass.h" />
+    <ClInclude Include="src\DnsLeakGuard.h" />
     <ClInclude Include="src\itun_device.h" />
     <ClInclude Include="src\logger.h" />
     <ClInclude Include="src\PacketQueue.h" />
@@ -134,6 +135,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindows.dll" "$(OutDir)p
     <ClCompile Include="Crypt.cpp" />
     <ClCompile Include="src\AdapterConfig.cpp" />
     <ClCompile Include="src\client\ClientApp.cpp" />
+    <ClCompile Include="src\DnsLeakGuard.cpp" />
     <ClCompile Include="src\gui\AppBridge.cpp" />
     <ClCompile Include="src\gui\moc_AppBridge.cpp" />
     <ClCompile Include="src\gui\moc_QtWidgetsClass.cpp" />

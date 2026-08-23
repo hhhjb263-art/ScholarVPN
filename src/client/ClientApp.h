@@ -26,6 +26,7 @@
 #include "../AdapterConfig.h"
 #include "../route_manager.h"
 #include "../reconnect_manager.h"
+#include "../DnsLeakGuard.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Crypt32.lib")
@@ -87,6 +88,7 @@ private:
 	std::unique_ptr<AdapterConfig> m_adapter;
 	std::unique_ptr<RouteManager> m_route;
 	std::unique_ptr<ReconnectManager> m_mgr;
+	DnsLeakGuard m_dnsGuard;              // 防 DNS 泄漏（清物理网卡 DNS + 断线恢复）
 	// 桥接线程
 	std::thread m_threadTunToUdp;
 	std::thread m_threadUdpToTun;

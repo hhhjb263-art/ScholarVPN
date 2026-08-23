@@ -3,6 +3,8 @@
 #include <fstream>
 #include <sstream>
 
+#pragma comment(lib, "shell32.lib")   // SHGetFolderPathW（Config::GetAppDataRoaming）
+
 Config::Config(std::wstring path, std::wstring dirPath)
     : ini_path(std::move(path)), dir_path(std::move(dirPath))
 {
@@ -130,9 +132,46 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     outCfg.ServerPort = static_cast<int>(
         GetPrivateProfileIntW(L"Server", L"ServerPort", outCfg.ServerPort, ini_path.c_str()));
 
-    outCfg.Timeout = static_cast<int>(
-        GetPrivateProfileIntW(L"General", L"Timeout", outCfg.Timeout, ini_path.c_str()));
-    outCfg.KeyFile = ReadIniString(L"General", L"KeyFile", outCfg.KeyFile, ini_path);
+    // ---- 多服务器列表：[Server] Count=N + [Server1..N] Name/IP/Port/ClientID/RegisterToken ----
+    outCfg.servers.clear();
+    const int count = static_cast<int>(
+        GetPrivateProfileIntW(L"Server", L"Count", 0, ini_path.c_str()));
+    for (int i = 1; i <= count; ++i)
+    {
+        const std::wstring sec = L"Server" + std::to_wstring(i);
+        ServerEntry e;
+        e.Name = ReadIniString(sec.c_str(), L"Name", L"", ini_path);
+        e.ServerIP = ReadIniString(sec.c_str(), L"ServerIP", L"", ini_path);
+        e.ServerPort = static_cast<int>(
+            GetPrivateProfileIntW(sec.c_str(), L"ServerPort", 51820, ini_path.c_str()));
+        // 每台服务器的身份；未配置时回退全局 [Identity]（兼容旧配置）
+        e.ClientID = ReadIniString(sec.c_str(), L"ClientID", outCfg.ClientID, ini_path);
+        e.RegisterToken = ReadIniString(sec.c_str(), L"RegisterToken", outCfg.RegisterToken, ini_path);
+        // 该服务器身份公钥（base64 单行；空=用内置硬编码）
+        e.ServerPubKey = ReadIniString(sec.c_str(), L"ServerPubKey", L"", ini_path);
+        if (!e.ServerIP.empty())
+        {
+            outCfg.servers.push_back(std::move(e));
+        }
+    }
+    // 向后兼容：没有 [ServerN] 节、但 [Server] 有真实主 IP 时，把它作为默认服务器
+    if (outCfg.servers.empty() && !outCfg.ServerIP.empty())
+    {
+        ServerEntry e;
+        int idx = 0;
+        e.Name = L"computer" + std::to_wstring(idx++);
+        e.ServerIP = outCfg.ServerIP;
+        e.ServerPort = outCfg.ServerPort;
+        e.ClientID = outCfg.ClientID;
+        e.RegisterToken = outCfg.RegisterToken;
+        outCfg.servers.push_back(std::move(e));
+    }
+    // 主字段与 servers[0] 同步（默认/活动服务器）
+    if (!outCfg.servers.empty())
+    {
+        outCfg.ServerIP = outCfg.servers[0].ServerIP;
+        outCfg.ServerPort = outCfg.servers[0].ServerPort;
+    }
 
     outCfg.VirtualIP = ReadIniString(L"Network", L"VirtualIP", outCfg.VirtualIP, ini_path);
     outCfg.VirtualPrefix = static_cast<int>(
@@ -161,21 +200,35 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
     }
 
     bool ok = true;
-    ok &= WritePrivateProfileStringW(L"Server", L"ServerIP", cfg.ServerIP.c_str(), ini_path.c_str()) != 0;
-    ok &= WritePrivateProfileStringW(L"Server", L"DebugServerIP", cfg.DebugServerIP.c_str(), ini_path.c_str()) != 0;
-    ok &= WriteIniInt(L"Server", L"ServerPort", cfg.ServerPort, ini_path);
 
-    ok &= WriteIniInt(L"General", L"Timeout", cfg.Timeout, ini_path);
-    ok &= WritePrivateProfileStringW(L"General", L"KeyFile", cfg.KeyFile.c_str(), ini_path.c_str()) != 0;
+    // ---- 多服务器列表：[Server] Count + [ServerN] 节（每台含各自身份）----
+    ok &= WriteIniInt(L"Server", L"Count", static_cast<int>(cfg.servers.size()), ini_path);
+    for (size_t i = 0; i < cfg.servers.size(); ++i)
+    {
+        const std::wstring sec = L"Server" + std::to_wstring(i + 1);
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"Name", cfg.servers[i].Name.c_str(), ini_path.c_str()) != 0;
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerIP", cfg.servers[i].ServerIP.c_str(), ini_path.c_str()) != 0;
+        ok &= WriteIniInt(sec.c_str(), L"ServerPort", cfg.servers[i].ServerPort, ini_path);
+        // 每台服务器各自的认证身份 + 服务器公钥
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"ClientID", cfg.servers[i].ClientID.c_str(), ini_path.c_str()) != 0;
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"RegisterToken", cfg.servers[i].RegisterToken.c_str(), ini_path.c_str()) != 0;
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerPubKey", cfg.servers[i].ServerPubKey.c_str(), ini_path.c_str()) != 0;
+    }
 
+    // ---- [Network] 全局网络设置 ----
     ok &= WritePrivateProfileStringW(L"Network", L"VirtualIP", cfg.VirtualIP.c_str(), ini_path.c_str()) != 0;
     ok &= WriteIniInt(L"Network", L"VirtualPrefix", cfg.VirtualPrefix, ini_path);
     ok &= WritePrivateProfileStringW(L"Network", L"DNS", cfg.DNS.c_str(), ini_path.c_str()) != 0;
     ok &= WriteIniInt(L"Network", L"MTU", static_cast<int>(cfg.MTU), ini_path);
     ok &= WriteIniInt(L"Network", L"Metric", cfg.Metric, ini_path);
 
-    ok &= WritePrivateProfileStringW(L"Identity", L"ClientID", cfg.ClientID.c_str(), ini_path.c_str()) != 0;
-    ok &= WritePrivateProfileStringW(L"Identity", L"RegisterToken", cfg.RegisterToken.c_str(), ini_path.c_str()) != 0;
+    // ---- 删除旧版单服务器冗余键（多服务器模式下信息已由 [ServerN] 承载）----
+    // WritePrivateProfileStringW 传 nullptr 值 = 删除该键
+    WritePrivateProfileStringW(L"Server", L"ServerIP", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Server", L"DebugServerIP", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Server", L"ServerPort", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Identity", L"ClientID", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Identity", L"RegisterToken", nullptr, ini_path.c_str());
 
     return ok;
 }

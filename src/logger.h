@@ -1,34 +1,25 @@
-﻿#pragma once
+#pragma once
+
+#include <cstdio>
+#include <functional>
+#include <string>
 
 // 日志模块：
-//   Release（NDEBUG）：只保留关键日志，写入 exe 同目录 log\ScholarVPN_<时间戳>.log，
-//                     每行格式：[时间] 事件
-//   Debug：保持原有控制台输出不变，本模块为空操作。
+//   - Release（NDEBUG）：关键日志写入 exe 同目录 log\ScholarVPN_<时间戳>.log
+//   - Debug：日志输出到控制台（stdout）
+//   - 两种模式下日志都会转发给 SetSink 注册的回调（供 UI 日志窗口订阅）；
+//     回调在产生日志的线程被调用，订阅方需自行切换到 UI 线程。
 
-#include <iostream>
-#include <cstdio>
-
-#ifdef NDEBUG
-
-#define LOG_DBG(msg)  ((void)0)                        // 调试明细：Release 不输出
-#define LOG_KEY(...)  ::Logger::Log(__VA_ARGS__)       // 关键事件：写入日志文件
-#define LOG_ERR(...)  ::Logger::Log(__VA_ARGS__)       // 错误/警告：写入日志文件
+// 日志转发回调（UI 订阅用）
+using LogSink = std::function<void(const std::string&)>;
 
 namespace Logger {
-    void Init();                       // 创建 log 目录并打开日志文件
-    void Log(const char* fmt, ...);    // 以 "[时间] 事件" 格式写入
-    void Shutdown();                   // 关闭日志文件
+    void Init();                          // 打开日志文件（Debug 为 no-op）
+    void Log(const char* fmt, ...);       // 格式化 → 输出（Debug: stdout / Release: 文件）+ 转发 sink
+    void SetSink(LogSink sink);           // 设置日志转发回调（覆盖式）
+    void Shutdown();                      // 关闭日志文件
 }
 
-#else
-
-#define LOG_DBG(msg)  do { std::cout << msg; } while (0)
-#define LOG_KEY(...)  do { std::printf(__VA_ARGS__); } while (0)
-#define LOG_ERR(...)  do { std::fprintf(stderr, __VA_ARGS__); } while (0)
-
-namespace Logger {
-    inline void Init() {}
-    inline void Shutdown() {}
-}
-
-#endif
+#define LOG_DBG(...) do { ::Logger::Log(__VA_ARGS__); } while (0)   // 调试明细
+#define LOG_KEY(...)  do { ::Logger::Log(__VA_ARGS__); } while (0)   // 关键事件
+#define LOG_ERR(...)  do { ::Logger::Log(__VA_ARGS__); } while (0)   // 错误/警告

@@ -3,6 +3,21 @@
 #include <shlobj.h>
 #include <cstdint>
 #include <string>
+#include <vector>
+
+// 一台服务器的配置（多服务器支持）
+struct ServerEntry
+{
+    std::wstring Name;          // 显示名，如 "服务器A"
+    std::wstring ServerIP;      // 服务器 IP
+    int ServerPort = 51820;
+    // 每台服务器各自的认证身份（各服务器独立注册）
+    std::wstring ClientID;      // 该服务器的客户端标识
+    std::wstring RegisterToken; // 该服务器的一次性注册令牌（空=登录模式）
+    // 该服务器的身份公钥（Ed25519 SPKI base64，44 字符单行）。
+    // 每台服务器密钥独立，客户端用它验证该服务器签名（防中间人）；留空=用内置硬编码公钥。
+    std::wstring ServerPubKey;
+};
 
 // Client runtime settings, loaded from / saved to an INI file.
 struct ClientConfig
@@ -10,8 +25,8 @@ struct ClientConfig
 #ifdef _DEBUG
     std::wstring ServerIP = L"192.168.1.12";
 #else
-    // Release builds: no hardcoded server; the user fills it in the generated config.ini
-    std::wstring ServerIP = L"\u8BF7\u81EA\u884C\u586B\u5199"; // "please fill in"
+    // Release builds: no hardcoded server; user fills it in config.ini (empty default avoids mojibake)
+    std::wstring ServerIP = L"";
 #endif
     // Debug-only server override: DEBUG builds prefer this key, RELEASE builds ignore it.
     // Debug default = local test server; Release default = empty (never used).
@@ -21,11 +36,16 @@ struct ClientConfig
     std::wstring DebugServerIP = L"";
 #endif
     int ServerPort = 51820;
-    int Timeout = 5000;
-    std::wstring KeyFile = L"client.key";
+
+    // 多服务器列表（INI 格式：[Server] Count=N + [ServerN] Name/IP/Port）。
+    // servers[0] 即默认/活动服务器，读写时与上面的 ServerIP/ServerPort 保持同步。
+    std::vector<ServerEntry> servers;
 
     // Virtual adapter (TUN) settings
-    std::wstring VirtualIP = L"10.8.0.2";
+    // VirtualIP: optional. Empty = adopt the server-assigned virtual IP after
+    // authentication (multi-user servers always assign one); non-empty = fallback
+    // for old servers that do not advertise an address.
+    std::wstring VirtualIP = L"";
     int VirtualPrefix = 24;
     std::wstring DNS = L"8.8.8.8,1.1.1.1";
     uint32_t MTU = 1400;

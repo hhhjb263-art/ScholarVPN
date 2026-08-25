@@ -1,4 +1,4 @@
-﻿#include "reconnect_manager.h"
+#include "reconnect_manager.h"
 
 #include <algorithm>
 #include <chrono>
@@ -112,6 +112,11 @@ const char* ReconnectManager::state_name(ConnState s)
 
 void ReconnectManager::worker_loop()
 {
+    // 整个状态机包在 try/catch 里：任何异常（回调抛出的、UDP 内部的、
+    // 内存分配失败的）都不能穿过 std::thread 边界——否则 std::terminate
+    // 直接崩溃进程（崩溃后 stop() 跑不到，路由/DNS 黑洞残留，电脑没网）。
+    try
+    {
     auto backoff = kMinBackoff;
     bool firstAttempt = true;
 
@@ -182,6 +187,27 @@ void ReconnectManager::worker_loop()
         teardown_current_locked();
     }
     set_state(ConnState::Stopped);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_ERROR("[Reconnect] worker 异常（%s），状态机停止", e.what());
+        m_running.store(false);
+        try { set_state(ConnState::Error); } catch (...) {}
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            teardown_current_locked();
+        }
+    }
+    catch (...)
+    {
+        LOG_ERROR("[Reconnect] worker 未知异常，状态机停止");
+        m_running.store(false);
+        try { set_state(ConnState::Error); } catch (...) {}
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            teardown_current_locked();
+        }
+    }
 }
 
 bool ReconnectManager::connect_once()

@@ -111,11 +111,8 @@ ServerIP= 请自行填写          # Release 构建使用（必填）
 DebugServerIP=192.168.1.12   # 仅 Debug 构建使用：本地测试服务器，Release 构建忽略
 ServerPort=51820
 
-[General]
-Timeout=5000
-
 [Network]
-VirtualIP=10.8.0.2           # 多用户服务端下会被服务端分配的虚拟 IP 覆盖
+VirtualIP=                   # 可选：留空 = 自动采用服务端分配的虚拟 IP（推荐）
 VirtualPrefix=24
 DNS=8.8.8.8,1.1.1.1
 MTU=1400

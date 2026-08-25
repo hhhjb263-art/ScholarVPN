@@ -382,6 +382,9 @@ bool UDP::build_identity_message(std::vector<uint8_t>& out)
 
 void UDP::send_work()
 {
+	// send_thread 是 std::thread，任何异常穿过线程边界都会 std::terminate 崩溃。
+	// 整体 try/catch：异常只记日志、标记重连，绝不崩溃进程。
+	try {
 	std::vector<uint8_t> sendbuf;
 	sendbuf.reserve(KMax_packet_size);
 	packet_buffer buf;
@@ -565,6 +568,17 @@ void UDP::send_work()
 		send_packet(static_cast<uint8_t>(disconnect), nullptr, 0, sendbuf);
 		m_hs_state = HS_IDLE;
 	}
+	}
+	catch (const std::exception& e)
+	{
+		LOG_ERR("[UDP] send_work 异常: %s，标记重连\n", e.what());
+		m_need_reconnect.store(true);
+	}
+	catch (...)
+	{
+		LOG_ERR("[UDP] send_work 未知异常，标记重连\n");
+		m_need_reconnect.store(true);
+	}
 }
 
 /*
@@ -579,6 +593,9 @@ void UDP::send_work()
 */
 void UDP::recv_work()
 {
+	// recv_thread 是 std::thread，异常穿过边界会 std::terminate 崩溃。
+	// 整体 try/catch：异常只记日志、标记重连，绝不崩溃进程。
+	try {
 	std::vector<uint8_t> recv_buf;
 	std::vector<uint8_t> sendbuf;
 	packet_buffer buf;
@@ -767,6 +784,17 @@ void UDP::recv_work()
 		default:
 			break;
 		}
+	}
+	}
+	catch (const std::exception& e)
+	{
+		LOG_ERR("[UDP] recv_work 异常: %s，标记重连\n", e.what());
+		m_need_reconnect.store(true);
+	}
+	catch (...)
+	{
+		LOG_ERR("[UDP] recv_work 未知异常，标记重连\n");
+		m_need_reconnect.store(true);
 	}
 }
 

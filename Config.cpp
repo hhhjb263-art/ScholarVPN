@@ -1,7 +1,13 @@
 #include "Config.h"
 
+#include <algorithm>   // std::sort（多服务器节按编号排序）
+#include <cstdlib>     // _wtoi
+#include <cwchar>      // wcslen
 #include <fstream>
 #include <sstream>
+#include <utility>     // std::pair
+
+#pragma comment(lib, "shell32.lib")   // SHGetFolderPathW（Config::GetAppDataRoaming）
 
 Config::Config(std::wstring path, std::wstring dirPath)
     : ini_path(std::move(path)), dir_path(std::move(dirPath))
@@ -130,9 +136,122 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     outCfg.ServerPort = static_cast<int>(
         GetPrivateProfileIntW(L"Server", L"ServerPort", outCfg.ServerPort, ini_path.c_str()));
 
-    outCfg.Timeout = static_cast<int>(
-        GetPrivateProfileIntW(L"General", L"Timeout", outCfg.Timeout, ini_path.c_str()));
-    outCfg.KeyFile = ReadIniString(L"General", L"KeyFile", outCfg.KeyFile, ini_path);
+    // [Server] Count=N + [ServerN] Name/IP/Port/ClientID/RegisterToken
+    // 读取方式：扫描 INI 全部节名，把所有 [ServerN] 节按编号收集
+    // 支持手动编辑造成的影响：删掉中间一节、或编号有空洞（如 Server1+Server3 缺 Server2）
+    // 时，都能正确读到；然后检测到"数量/编号与 Count 不符"就自动重排为连续编号
+    // Server1..M 并回写 Count
+    outCfg.servers.clear();
+    std::vector<std::pair<int, ServerEntry>> found;   // (节编号, 内容)，按编号排序
+
+    wchar_t names[16384] = { 0 };   // 全部节名（双 NULL 结尾）
+    const UINT namesLen = GetPrivateProfileSectionNamesW(names, _countof(names), ini_path.c_str());
+
+    {
+        if (namesLen > 0)
+        {
+            for (wchar_t* p = names; *p; p += wcslen(p) + 1)
+            {
+                const std::wstring sec(p);
+                if (sec.rfind(L"Server", 0) != 0)
+                    continue;                       // 只要 [ServerN]
+                const std::wstring num = sec.substr(6);
+                if (num.empty() || num.find_first_not_of(L"0123456789") != std::wstring::npos)
+                    continue;                       // 跳过 [Server] 主节等
+                const int idx = _wtoi(num.c_str());
+                if (idx <= 0)
+                    continue;
+
+                ServerEntry e;
+                e.Name = ReadIniString(sec.c_str(), L"Name", L"", ini_path);
+                e.ServerIP = ReadIniString(sec.c_str(), L"ServerIP", L"", ini_path);
+                e.ServerPort = static_cast<int>(
+                    GetPrivateProfileIntW(sec.c_str(), L"ServerPort", 51820, ini_path.c_str()));
+                e.ClientID = ReadIniString(sec.c_str(), L"ClientID", outCfg.ClientID, ini_path);
+                e.RegisterToken = ReadIniString(sec.c_str(), L"RegisterToken", outCfg.RegisterToken, ini_path);
+                e.ServerPubKey = ReadIniString(sec.c_str(), L"ServerPubKey", L"", ini_path);
+                if (!e.ServerIP.empty())
+                    found.emplace_back(idx, std::move(e));
+            }
+        }
+    }
+
+    // 按节编号升序排列（保持 config.ini 里的原始顺序）
+    std::sort(found.begin(), found.end(),
+              [](const std::pair<int, ServerEntry>& a, const std::pair<int, ServerEntry>& b)
+              { return a.first < b.first; });
+
+    // 检测是否需要"连续重排"
+    bool needRebuild = false;
+    const int count = static_cast<int>(
+        GetPrivateProfileIntW(L"Server", L"Count", 0, ini_path.c_str()));
+    if (static_cast<int>(found.size()) != count)
+    {
+        needRebuild = true;
+    }
+    else
+    {
+        for (size_t i = 0; i < found.size(); ++i)
+        {
+            if (found[i].first != static_cast<int>(i + 1))   // 期望 Server1..N 连续
+            {
+                needRebuild = true;
+                break;
+            }
+        }
+    }
+
+    // 需要重排：把有效 [ServerN] 连续重写为 Server1..M，并删除多余旧节
+    if (needRebuild)
+    {
+        // 先删掉所有现有 [ServerN] 节，避免旧节编号冲突
+        if (namesLen > 0)
+        {
+            for (wchar_t* p = names; *p; p += wcslen(p) + 1)
+            {
+                const std::wstring sec(p);
+                if (sec.rfind(L"Server", 0) != 0)
+                    continue;
+                const std::wstring num = sec.substr(6);
+                if (num.empty() || num.find_first_not_of(L"0123456789") != std::wstring::npos)
+                    continue;
+                WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, ini_path.c_str());  // 删整节
+            }
+        }
+        // 连续写回 Server1..M
+        for (size_t i = 0; i < found.size(); ++i)
+        {
+            const std::wstring sec = L"Server" + std::to_wstring(i + 1);
+            WritePrivateProfileStringW(sec.c_str(), L"Name", found[i].second.Name.c_str(), ini_path.c_str());
+            WritePrivateProfileStringW(sec.c_str(), L"ServerIP", found[i].second.ServerIP.c_str(), ini_path.c_str());
+            WriteIniInt(sec.c_str(), L"ServerPort", found[i].second.ServerPort, ini_path);
+            WritePrivateProfileStringW(sec.c_str(), L"ClientID", found[i].second.ClientID.c_str(), ini_path.c_str());
+            WritePrivateProfileStringW(sec.c_str(), L"RegisterToken", found[i].second.RegisterToken.c_str(), ini_path.c_str());
+            WritePrivateProfileStringW(sec.c_str(), L"ServerPubKey", found[i].second.ServerPubKey.c_str(), ini_path.c_str());
+        }
+        WriteIniInt(L"Server", L"Count", static_cast<int>(found.size()), ini_path);
+    }
+
+    for (auto& f : found)
+        outCfg.servers.push_back(std::move(f.second));
+    // 向后兼容：没有 [ServerN] 节、但 [Server] 有真实主 IP 时，把它作为默认服务器
+    if (outCfg.servers.empty() && !outCfg.ServerIP.empty())
+    {
+        ServerEntry e;
+        int idx = 0;
+        e.Name = L"computer" + std::to_wstring(idx++);
+        e.ServerIP = outCfg.ServerIP;
+        e.ServerPort = outCfg.ServerPort;
+        e.ClientID = outCfg.ClientID;
+        e.RegisterToken = outCfg.RegisterToken;
+        outCfg.servers.push_back(std::move(e));
+    }
+    // 主字段与 servers[0] 同步（默认/活动服务器）
+    if (!outCfg.servers.empty())
+    {
+        outCfg.ServerIP = outCfg.servers[0].ServerIP;
+        outCfg.ServerPort = outCfg.servers[0].ServerPort;
+    }
 
     outCfg.VirtualIP = ReadIniString(L"Network", L"VirtualIP", outCfg.VirtualIP, ini_path);
     outCfg.VirtualPrefix = static_cast<int>(
@@ -161,21 +280,61 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
     }
 
     bool ok = true;
-    ok &= WritePrivateProfileStringW(L"Server", L"ServerIP", cfg.ServerIP.c_str(), ini_path.c_str()) != 0;
-    ok &= WritePrivateProfileStringW(L"Server", L"DebugServerIP", cfg.DebugServerIP.c_str(), ini_path.c_str()) != 0;
-    ok &= WriteIniInt(L"Server", L"ServerPort", cfg.ServerPort, ini_path);
 
-    ok &= WriteIniInt(L"General", L"Timeout", cfg.Timeout, ini_path);
-    ok &= WritePrivateProfileStringW(L"General", L"KeyFile", cfg.KeyFile.c_str(), ini_path.c_str()) != 0;
+    //多服务器列表：[Server] Count + [ServerN] 节（每台含各自身份）
+    ok &= WriteIniInt(L"Server", L"Count", static_cast<int>(cfg.servers.size()), ini_path);
+    for (size_t i = 0; i < cfg.servers.size(); ++i)
+    {
+        const std::wstring sec = L"Server" + std::to_wstring(i + 1);
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"Name", cfg.servers[i].Name.c_str(), ini_path.c_str()) != 0;
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerIP", cfg.servers[i].ServerIP.c_str(), ini_path.c_str()) != 0;
+        ok &= WriteIniInt(sec.c_str(), L"ServerPort", cfg.servers[i].ServerPort, ini_path);
+        // 每台服务器各自的认证身份 + 服务器公钥
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"ClientID", cfg.servers[i].ClientID.c_str(), ini_path.c_str()) != 0;
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"RegisterToken", cfg.servers[i].RegisterToken.c_str(), ini_path.c_str()) != 0;
+        ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerPubKey", cfg.servers[i].ServerPubKey.c_str(), ini_path.c_str()) != 0;
+    }
 
+    //[Network]
     ok &= WritePrivateProfileStringW(L"Network", L"VirtualIP", cfg.VirtualIP.c_str(), ini_path.c_str()) != 0;
     ok &= WriteIniInt(L"Network", L"VirtualPrefix", cfg.VirtualPrefix, ini_path);
     ok &= WritePrivateProfileStringW(L"Network", L"DNS", cfg.DNS.c_str(), ini_path.c_str()) != 0;
     ok &= WriteIniInt(L"Network", L"MTU", static_cast<int>(cfg.MTU), ini_path);
     ok &= WriteIniInt(L"Network", L"Metric", cfg.Metric, ini_path);
 
-    ok &= WritePrivateProfileStringW(L"Identity", L"ClientID", cfg.ClientID.c_str(), ini_path.c_str()) != 0;
-    ok &= WritePrivateProfileStringW(L"Identity", L"RegisterToken", cfg.RegisterToken.c_str(), ini_path.c_str()) != 0;
+    //多服务器模式下信息已由 [ServerN] 承载）
+    // WritePrivateProfileStringW 传 nullptr 值 = 删除该键
+    WritePrivateProfileStringW(L"Server", L"ServerIP", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Server", L"DebugServerIP", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Server", L"ServerPort", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Identity", L"ClientID", nullptr, ini_path.c_str());
+    WritePrivateProfileStringW(L"Identity", L"RegisterToken", nullptr, ini_path.c_str());
 
+    // 删除服务器后清理残留的旧 [ServerN] 节：
+    // 例如从 3 台删到 2 台，[Server3] 仍留在 ini 里，下次 Count 会拿到脏数据。
+    // 这里枚举全部节名，把编号大于 servers.size() 的 [ServerN] 整体删除。
+    {
+        wchar_t names[16384] = { 0 };   // 所有节名（双 NULL 结尾）
+        const UINT namesLen = GetPrivateProfileSectionNamesW(names, _countof(names), ini_path.c_str());
+        if (namesLen > 0)
+        {
+            const size_t maxOk = cfg.servers.size();
+            for (wchar_t* p = names; *p; p += wcslen(p) + 1)
+            {
+                const std::wstring sec(p);
+                if (sec.rfind(L"Server", 0) != 0)
+                    continue;
+                // 仅处理形如 Server<数字> 的节；跳过 Server 主节本身
+                const std::wstring num = sec.substr(6);
+                if (num.empty() || num.find_first_not_of(L"0123456789") != std::wstring::npos)
+                    continue;
+                const int idx = _wtoi(num.c_str());
+                if (idx <= 0 || static_cast<size_t>(idx) <= maxOk)
+                    continue;
+                // 删除多余节（key 传 nullptr = 删整个节）
+                WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, ini_path.c_str());
+            }
+        }
+    }
     return ok;
 }

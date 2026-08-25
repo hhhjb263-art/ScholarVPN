@@ -1,6 +1,4 @@
-﻿#include "logger.h"
-
-#ifdef NDEBUG
+#include "logger.h"
 
 #include <windows.h>
 #include <direct.h>
@@ -9,12 +7,12 @@
 #include <ctime>
 #include <cwchar>
 #include <mutex>
-#include <string>
 
 namespace {
 
 std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
+LogSink g_sink;
 
 std::wstring GetExeDir()
 {
@@ -77,45 +75,49 @@ void Init()
 
 void Log(const char* fmt, ...)
 {
-    std::lock_guard<std::mutex> lock(g_logMutex);
-    if (!g_logFile) return;
-
-    char buf[4096]{};
-    va_list args;
-    va_start(args, fmt);
-    const int n = std::vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-
-    std::string msg = (n > 0)
-                          ? std::string(buf, (static_cast<size_t>(n) < sizeof(buf)) ? static_cast<size_t>(n) : sizeof(buf) - 1)
-                          : std::string();
-
-    // 字符串字面量按系统 ANSI 代码页（GBK）编译进 exe，这里统一转成 UTF-8 再写入日志文件
-    if (!msg.empty())
+    std::string line;
     {
-        const int wlen = ::MultiByteToWideChar(CP_ACP, 0, msg.data(), static_cast<int>(msg.size()), nullptr, 0);
-        if (wlen > 0)
+        std::lock_guard<std::mutex> lock(g_logMutex);
+
+        char buf[4096]{};
+        va_list args;
+        va_start(args, fmt);
+        const int n = std::vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+
+        std::string msg = (n > 0)
+                              ? std::string(buf, (static_cast<size_t>(n) < sizeof(buf)) ? static_cast<size_t>(n) : sizeof(buf) - 1)
+                              : std::string();
+        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
         {
-            std::wstring w(wlen, L'\0');
-            ::MultiByteToWideChar(CP_ACP, 0, msg.data(), static_cast<int>(msg.size()), &w[0], wlen);
-            const int ulen = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), wlen, nullptr, 0, nullptr, nullptr);
-            if (ulen > 0)
-            {
-                std::string utf8(ulen, '\0');
-                ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), wlen, &utf8[0], ulen, nullptr, nullptr);
-                msg.swap(utf8);
-            }
+            msg.pop_back();
+        }
+
+        line = "[" + CurrentTimestamp() + "] " + msg;
+
+        // 控制台输出（Debug 下即为最终日志；Release 下仍打印，便于前台调试）
+        std::puts(line.c_str());
+
+        // 写文件（Init 后可用）
+        if (g_logFile)
+        {
+            std::fwrite(line.c_str(), 1, line.size(), g_logFile);
+            std::fwrite("\n", 1, 1, g_logFile);
+            std::fflush(g_logFile);
+        }
+
+        // 转发给订阅者（UI 日志窗口），在调用线程执行
+        if (g_sink)
+        {
+            g_sink(line);
         }
     }
+}
 
-    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
-    {
-        msg.pop_back();
-    }
-
-    const std::string line = "[" + CurrentTimestamp() + "] " + msg + "\n";
-    std::fwrite(line.data(), 1, line.size(), g_logFile);
-    std::fflush(g_logFile);
+void SetSink(LogSink sink)
+{
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    g_sink = std::move(sink);
 }
 
 void Shutdown()
@@ -129,5 +131,3 @@ void Shutdown()
 }
 
 } // namespace Logger
-
-#endif // NDEBUG

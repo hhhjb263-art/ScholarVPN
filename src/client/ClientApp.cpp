@@ -105,6 +105,12 @@ bool ClientApp::init()
 {
     Logger::Init();
 
+    // 启动兜底清扫（只执行一次，且在 bridge 工作线程，不会卡 GUI）：
+    // 上次进程异常退出（崩溃/被杀/断电）时，黑洞 DNS / DisableSmartNameResolution
+    // 可能残留。restore() 会把残留的 0.0.0.0 黑洞 DNS 清回 DHCP 自动并恢复注册表策略，
+    // 保证"电脑断网"不会跨进程残留——下次启动自动恢复，不需要手动改网卡。
+    m_dnsGuard.restore();
+
     m_configDir = Config::GetAppDataRoaming() + L"\\ScholarVPN";
     m_configPath = m_configDir + L"\\config.ini";
     Config::CreateDir(m_configDir);
@@ -313,10 +319,9 @@ bool ClientApp::start()
         return false;
     }
 
-    // 启动兜底清扫：上次进程异常退出（崩溃/被杀/断电）时，黑洞 DNS 与静态路由可能残留，
-    // restore() 会把所有残留的 0.0.0.0 黑洞 DNS 清回 DHCP 自动并恢复注册表策略，
-    // 保证"电脑断网"不会跨进程残留——下次启动自动恢复，不需要手动改网卡。
-    m_dnsGuard.restore();
+    // 注意：不能在这里做启动兜底 restore()——start() 每次连接都会调用，
+    // 白遍历一遍网卡；且 m_running 已置 true，若 restore 内部异常会卡死状态机。
+    // 启动兜底已移到 init()（只在程序启动/首次连接时执行一次）。
 
     m_mgr = std::make_unique<ReconnectManager>(m_remote, m_port, 256);
     m_mgr->set_identity(m_ed25519Priv, m_serverSigPubPem,
@@ -333,7 +338,9 @@ bool ClientApp::start()
             {
                 m_state.store(s);
                 emit_log("[Reconnect] state -> %s", ReconnectManager::state_name(s));
-                if (s == ConnState::Reconnecting || s == ConnState::Connecting)
+                // 只在断线重连（Reconnecting）时撤销默认路由 + 恢复物理网卡 DNS：
+                // Connecting 是首次连接/握手开始，DNS 防护尚未激活，无需恢复，白遍历网卡。
+                if (s == ConnState::Reconnecting)
                 {
                     if (m_route)
                     {

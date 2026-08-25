@@ -360,9 +360,16 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	connect(m_pushBtn, &QPushButton::clicked, this, [this, entry, cardIndex]() {
 		if (m_state == ConnState::Stopped) {
 			m_activeCard = cardIndex;          // 标记本卡片为当前活动卡片
-			m_bridge->connect_to_server(entry);
+			// 必须投递到 bridge 所在线程（moveToThread 只作用于信号槽连接，直接调用
+			// 会在 GUI 线程同步执行 init()/建网卡/restore() 等重型操作 → 界面卡死无响应）
+			QMetaObject::invokeMethod(m_bridge, [this, entry]() {
+				m_bridge->connect_to_server(entry);
+			}, Qt::QueuedConnection);
 		} else {
-			m_bridge->stop();                  // 断开
+			// 断开同样投递到 bridge 线程，避免 stop() 同步执行卡 GUI
+			QMetaObject::invokeMethod(m_bridge, [this]() {
+				m_bridge->stop();
+			}, Qt::QueuedConnection);
 		}
 	});
 

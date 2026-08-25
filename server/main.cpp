@@ -124,11 +124,21 @@ int main(int argc, char *argv[])
 
     // 管理员操作：生成一次性注册令牌（vpn_server --gen-token [n]）
     if(cfg.gen_tokens > 0){
+        // 令牌目录必须与运行时 UDP::m_keys_dir 一致：
+        // 运行时 m_keys_dir = parent(key_sig_path)（VpnCore.cpp），
+        // 所以这里也写到 parent(key_sig_path)，而不是硬编码相对路径 "keys/"——
+        // 否则 systemd/start.sh 部署（cwd 不是脚本目录）或 -k 自定义路径时，
+        // 令牌写到别处，服务端验证永远找不到 → 客户端"注册令牌无效"死循环。
         std::error_code ec;
-        std::filesystem::create_directories("keys", ec);
-        FILE *f = std::fopen("keys/register_tokens.txt", "a");
+        std::filesystem::path keys_dir = std::filesystem::path(cfg.key_sig_path).parent_path();
+        if(keys_dir.empty()){
+            keys_dir = ".";
+        }
+        std::filesystem::create_directories(keys_dir, ec);
+        const std::string tokens_path = (keys_dir / "register_tokens.txt").string();
+        FILE *f = std::fopen(tokens_path.c_str(), "a");
         if(f == nullptr){
-            fprintf(stderr, "[main] 无法写入 keys/register_tokens.txt\n");
+            fprintf(stderr, "[main] 无法写入 %s\n", tokens_path.c_str());
             return 1;
         }
         for(int i = 0; i < cfg.gen_tokens; ++i){
@@ -137,7 +147,8 @@ int main(int argc, char *argv[])
             std::printf("register_token: %s\n", tok.c_str());
         }
         std::fclose(f);
-        std::printf("[main] 已生成 %d 个注册令牌并追加到 keys/register_tokens.txt\n", cfg.gen_tokens);
+        std::printf("[main] 已生成 %d 个注册令牌并追加到 %s\n",
+                    cfg.gen_tokens, tokens_path.c_str());
         return 0;
     }
 

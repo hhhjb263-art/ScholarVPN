@@ -99,6 +99,21 @@ bool RouteManager::add_server_bypass_route(const std::wstring& serverIp)
 	return create_route(bypass_row2);
 }
 
+void RouteManager::remove_default_route() noexcept
+{
+	for (auto it = m_createdRoutes.rbegin(); it != m_createdRoutes.rend(); ++it)
+	{
+		// 默认路由 = 目的前缀 0.0.0.0/0
+		if (it->DestinationPrefix.PrefixLength == 0 &&
+			it->DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr == 0)
+		{
+			::DeleteIpForwardEntry2(&(*it));
+			m_createdRoutes.erase(std::next(it).base());  // rbegin -> erase 对应元素
+			return;
+		}
+	}
+}
+
 void RouteManager::clear_routes() noexcept
 {
 	for (auto it = m_createdRoutes.rbegin(); it != m_createdRoutes.rend(); it++) {

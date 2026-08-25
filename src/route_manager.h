@@ -34,6 +34,9 @@ public:
 
 	bool add_default_route(uint32_t metric);
 	bool add_server_bypass_route(const std::wstring& serverIp);
+	// 只删除默认路由（0.0.0.0/0），保留服务器 bypass 路由——断线重连时调用，
+	// 撤销"全流量进 TUN"的黑洞，让物理网卡正常上网，同时握手包仍走 bypass。
+	void remove_default_route() noexcept;
 	void clear_routes() noexcept;
 private:
 	bool create_route(const MIB_IPFORWARD_ROW2& route);

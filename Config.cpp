@@ -201,7 +201,7 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
 
     bool ok = true;
 
-    // ---- 多服务器列表：[Server] Count + [ServerN] 节（每台含各自身份）----
+    //多服务器列表：[Server] Count + [ServerN] 节（每台含各自身份）
     ok &= WriteIniInt(L"Server", L"Count", static_cast<int>(cfg.servers.size()), ini_path);
     for (size_t i = 0; i < cfg.servers.size(); ++i)
     {
@@ -215,14 +215,14 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
         ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerPubKey", cfg.servers[i].ServerPubKey.c_str(), ini_path.c_str()) != 0;
     }
 
-    // ---- [Network] 全局网络设置 ----
+    //[Network]
     ok &= WritePrivateProfileStringW(L"Network", L"VirtualIP", cfg.VirtualIP.c_str(), ini_path.c_str()) != 0;
     ok &= WriteIniInt(L"Network", L"VirtualPrefix", cfg.VirtualPrefix, ini_path);
     ok &= WritePrivateProfileStringW(L"Network", L"DNS", cfg.DNS.c_str(), ini_path.c_str()) != 0;
     ok &= WriteIniInt(L"Network", L"MTU", static_cast<int>(cfg.MTU), ini_path);
     ok &= WriteIniInt(L"Network", L"Metric", cfg.Metric, ini_path);
 
-    // ---- 删除旧版单服务器冗余键（多服务器模式下信息已由 [ServerN] 承载）----
+    //多服务器模式下信息已由 [ServerN] 承载）
     // WritePrivateProfileStringW 传 nullptr 值 = 删除该键
     WritePrivateProfileStringW(L"Server", L"ServerIP", nullptr, ini_path.c_str());
     WritePrivateProfileStringW(L"Server", L"DebugServerIP", nullptr, ini_path.c_str());

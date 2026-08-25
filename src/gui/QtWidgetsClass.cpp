@@ -71,19 +71,16 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	main->addLayout(topBar);
 	main->addWidget(m_scroll, 1);
 
-	// AppBridge 移到后台线程执行 init/start，不卡 UI
 	m_bridge = new AppBridge;
 	m_thread_start = new QThread(this);
 	m_bridge->moveToThread(m_thread_start);
 	m_thread_start->start();
 
-	// 连接成功 → 只更新"当前活动卡片"的内网 IP（其他卡片保持不动）
 	connect(m_bridge, &AppBridge::connected, this, [this](const QString& ip) {
 		if (m_activeCard >= 0 && m_activeCard < m_cardVips.size())
 			m_cardVips[m_activeCard]->setText("内网IP: " + ip);
 	});
 
-	// 状态变化 → 只更新"当前活动卡片"（断开/重连时恢复该卡）
 	connect(m_bridge, &AppBridge::stateChanged, this, [this](ConnState s) {
 		m_state = s;
 		if (m_activeCard < 0 || m_activeCard >= static_cast<int>(m_cardVips.size()))
@@ -92,7 +89,7 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		if (s == ConnState::Stopped || s == ConnState::Reconnecting)
 			v->setText("内网IP: --");
 		QPushButton* b = m_cardBtns[m_activeCard];
-		b->setText(s == ConnState::Stopped ? "连接" : "断开");
+		b->setText(s == ConnState::Stopped ? "连接" : (s == ConnState::Connecting ? "连接中..." : "断开"));
 		b->setStyleSheet(s == ConnState::Stopped ? R"(
 			QPushButton{
 				background-color:#0078d4; color:white; border:none; border-radius:8px;
@@ -123,7 +120,6 @@ QtWidgetsClass::~QtWidgetsClass()
 	delete m_cfg;
 }
 
-// 清空所有卡片（重建前调用）
 void QtWidgetsClass::clear_cards()
 {
 	for (QFrame* f : m_cards) {

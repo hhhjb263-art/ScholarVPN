@@ -288,21 +288,15 @@ bool ClientApp::init()
         LOG_ERR("[Warn] Failed to set DNS, continuing without custom DNS");
     }
     m_route = std::make_unique<RouteManager>(m_tun->get_interface_luid());
+    // 只加服务器 bypass 路由：保证握手包能走物理网卡到达服务器。
+    // 注意：不能在 init 里切默认路由 / 做 DNS 防护——握手可能失败，
+    // 隧道未建立时默认路由指向 TUN 就是"黑洞"，全部流量进 TUN 被丢，
+    // 物理网卡 DNS 被清空则 DNS 解析全挂（表现为浏览器没网）。
+    // 默认路由 + DNS 防护必须等握手成功（Connected 回调）才激活。
     if (!m_route->add_server_bypass_route(to_wstring(m_remote)))
     {
         LOG_ERR("Failed to add server bypass route");
         return false;
-    }
-    if (!m_route->add_default_route(m_cfg.Metric))
-    {
-        LOG_ERR("Failed to add default route");
-        return false;
-    }
-
-    // 防 DNS 泄漏：备份并清空物理网卡等非 TUN 接口的 DNS
-    if (!m_dnsGuard.protect(m_tun->get_interface_luid()))
-    {
-        LOG_ERR("[Warn] DNS leak guard: no physical interface DNS found to clear");
     }
 
     emit_log("ClientApp initialized, server=%s:%u", m_remote.c_str(), static_cast<int>(m_port));
@@ -319,30 +313,64 @@ bool ClientApp::start()
         return false;
     }
 
+    // 启动兜底清扫：上次进程异常退出（崩溃/被杀/断电）时，黑洞 DNS 与静态路由可能残留，
+    // restore() 会把所有残留的 0.0.0.0 黑洞 DNS 清回 DHCP 自动并恢复注册表策略，
+    // 保证"电脑断网"不会跨进程残留——下次启动自动恢复，不需要手动改网卡。
+    m_dnsGuard.restore();
+
     m_mgr = std::make_unique<ReconnectManager>(m_remote, m_port, 256);
     m_mgr->set_identity(m_ed25519Priv, m_serverSigPubPem,
                         narrow(m_cfg.ClientID), narrow(m_cfg.RegisterToken));
 
-    // 状态回调
+    // 状态回调：断线/重连时撤销\"全流量进 TUN\"的黑洞，让物理网卡恢复上网，
+    // 同时恢复物理网卡 DNS（防泄漏守卫反向操作），握手包仍走 bypass 路由。
     m_mgr->set_state_callback([this](ConnState s)
         {
-            m_state.store(s);
-            emit_log("[Reconnect] state -> %s", ReconnectManager::state_name(s));
-            if (m_onState)
+            // 回调运行在 ReconnectManager 的 worker 线程里，任何异常穿过
+            // std::thread 边界都会 std::terminate 崩溃（崩溃后 stop() 跑不到，
+            // 黑洞路由/DNS 残留，电脑断网）。整体 try/catch 兜底。
+            try
             {
-                m_onState(s);
+                m_state.store(s);
+                emit_log("[Reconnect] state -> %s", ReconnectManager::state_name(s));
+                if (s == ConnState::Reconnecting || s == ConnState::Connecting)
+                {
+                    if (m_route)
+                    {
+                        m_route->remove_default_route();   // 只撤默认路由，保留服务器 bypass
+                    }
+                    m_dnsGuard.restore();                 // 恢复物理网卡 DNS（断线期间可正常上网）
+                }
+                if (m_onState)
+                {
+                    m_onState(s);
+                }
+            }
+            catch (const std::exception& e)
+            {
+                LOG_ERR("[ClientApp] state callback exception: %s", e.what());
+            }
+            catch (...)
+            {
+                LOG_ERR("[ClientApp] state callback unknown exception");
             }
         });
 
-    // 连接成功回调：加路由 + 采用服务端通告的虚拟 IP + 注册成功清 RegisterToken
+    // 连接成功回调：加默认路由 + 防 DNS 泄漏 + 采用服务端通告的虚拟 IP + 注册成功清 RegisterToken
+    // 回调运行在 worker 线程，整体 try/catch 防止异常穿过 std::thread 边界导致崩溃。
     m_mgr->set_connected_callback([this]()
         {
+            try
+            {
             if (m_route)
             {
                 m_route->add_server_bypass_route(to_wstring(m_remote));
                 m_route->add_default_route(m_cfg.Metric);
             }
-            emit_log("[Reconnect] Connected, routes added");
+            // 隧道已建立：此时才清物理网卡 DNS / 禁用多宿主解析（防泄漏），
+            // 断线时由状态回调恢复，不会出现\"没连上却把系统 DNS/路由切走\"的黑洞。
+            m_dnsGuard.protect(m_tun->get_interface_luid());
+            emit_log("[Reconnect] Connected, routes + DNS guard active");
 
             // 多用户服务端：identity_ok 通告的虚拟 IP 覆盖网卡地址
             auto u = m_mgr->udp();
@@ -387,17 +415,37 @@ bool ClientApp::start()
                 // ConnectedCallback 携带服务端分配的虚拟 IP（可能为空）
                 m_onConnect(assigned_ip());
             }
+            }
+            catch (const std::exception& e)
+            {
+                LOG_ERR("[ClientApp] connected callback exception: %s", e.what());
+            }
+            catch (...)
+            {
+                LOG_ERR("[ClientApp] connected callback unknown exception");
+            }
         });
 
     // 注册令牌被拒：清空 RegisterToken，切换登录模式重试
     m_mgr->set_register_token_rejected_callback([this]()
         {
-            m_cfg.RegisterToken.clear();
-            save_config();
-            emit_log("[Config] 注册令牌无效或已使用，已自动清空 RegisterToken，将以登录模式重试");
-            if (m_onTokenRejected)
+            try
             {
-                m_onTokenRejected();
+                m_cfg.RegisterToken.clear();
+                save_config();
+                emit_log("[Config] 注册令牌无效或已使用，已自动清空 RegisterToken，将以登录模式重试");
+                if (m_onTokenRejected)
+                {
+                    m_onTokenRejected();
+                }
+            }
+            catch (const std::exception& e)
+            {
+                LOG_ERR("[ClientApp] token rejected callback exception: %s", e.what());
+            }
+            catch (...)
+            {
+                LOG_ERR("[ClientApp] token rejected callback unknown exception");
             }
         });
 

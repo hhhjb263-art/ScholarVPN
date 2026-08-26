@@ -25,6 +25,7 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 
 	QPushButton* btn_add = new QPushButton("+ 添加服务器", this);
 	btn_add->setFixedSize(120, 32);
+	btn_add->setCursor(Qt::PointingHandCursor);   // 鼠标悬停显示手型，提示可点击
 	btn_add->setStyleSheet(R"(
 	QPushButton{
 		background-color:#f1f1f1;
@@ -329,21 +330,35 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	QLabel* m_label_name = new QLabel(m_Frame);
 	m_label_name->setText(name);
 	m_label_name->setGeometry(16, 14, 200, 24);
-	m_label_name->setStyleSheet("font-size:11pt; color:#1a1a1a;");
+	m_label_name->setStyleSheet(R"(
+			background-color : #ffffff;
+			font-size:11pt; 
+			color:#000000;
+	)");
+
 
 	QLabel* m_label_ip = new QLabel(m_Frame);
 	m_label_ip->setGeometry(16, 46, 200, 24);
 	m_label_ip->setText("IP: " + ip);          // 每张卡显示自己的服务器 IP
-	m_label_ip->setStyleSheet("color:#444444;");
+	m_label_ip->setStyleSheet(R"(
+			background-color : #ffffff;
+			font-size:11pt; 
+			color:#000000;
+	)");
 
 	QLabel* m_label_vip = new QLabel(m_Frame);
 	m_label_vip->setGeometry(220, 46, 260, 24);
 	m_label_vip->setText("内网IP: --");
-	m_label_vip->setStyleSheet("color:#444444;");
+	m_label_vip->setStyleSheet(R"(
+			background-color : #ffffff;
+			font-size:11pt; 
+			color:#000000;
+	)");
 
 	QPushButton* m_pushBtn = new QPushButton(m_Frame);
 	m_pushBtn->setText("连接");
 	m_pushBtn->setGeometry(30, 85, 325, 55);
+	m_pushBtn->setCursor(Qt::PointingHandCursor);   // 手型光标
 	m_pushBtn->setStyleSheet(R"(
 	QPushButton{
 		background-color:#0078d4;
@@ -354,6 +369,12 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	QPushButton:hover{background-color:#0086ec;}
 	QPushButton:pressed{background-color:#0069bc;}
 	)");
+
+	QPushButton* m_editBtn = new QPushButton(m_Frame);
+	m_editBtn->setGeometry(270, 14, 60, 25);
+	m_editBtn->setText("编辑");
+	m_editBtn->setCursor(Qt::PointingHandCursor);   // 手型光标
+
 
 	// toggle：未连接 → 连这台服务器；已连接 → 断开（不会重连）
 	const int cardIndex = static_cast<int>(m_cards.size());   // 本卡片索引
@@ -371,6 +392,11 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 				m_bridge->stop();
 			}, Qt::QueuedConnection);
 		}
+	});
+	connect(m_editBtn, &QPushButton::clicked, this, [this, entry, cardIndex]() {
+		qDebug() << "edit_Btn was clicked ! cardIndex=" << cardIndex;
+		m_activeCard = cardIndex;
+		edit_card();
 	});
 
 	m_cardLayout->insertWidget(m_cardLayout->count() - 1, m_Frame);

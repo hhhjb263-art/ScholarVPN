@@ -14,7 +14,7 @@ struct ServerEntry
     // 每台服务器各自的认证身份（各服务器独立注册）
     std::wstring ClientID;      // 该服务器的客户端标识
     std::wstring RegisterToken; // 该服务器的一次性注册令牌（空=登录模式）
-    // 该服务器的身份公钥（Ed25519 SPKI base64，44 字符单行）。
+    // 该服务器的身份公钥（Ed25519 SPKI PEM 的 base64 正文，60 字符单行，不带头尾行）。
     // 每台服务器密钥独立，客户端用它验证该服务器签名（防中间人）；留空=用内置硬编码公钥。
     std::wstring ServerPubKey;
 };
@@ -54,6 +54,8 @@ struct ClientConfig
     // Identity (three-phase auth)
     std::wstring ClientID = L"user";        // client identifier
     std::wstring RegisterToken = L"";       // one-time register token (empty = login mode)
+    // 默认/活动服务器的身份公钥（与 servers[0].ServerPubKey 同步，base64 正文单行，空=用内置公钥）
+    std::wstring ServerPubKey;
 };
 
 class Config

@@ -329,6 +329,20 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		update_glass_card();
 	});
 
+	// 服务端拒绝注册令牌（无效/已使用）：清掉当前卡片的令牌，转登录模式。
+	// 否则令牌留在 m_cardServers / config.ini 里，下次连接又被 set_server 灌回去 → deny 1 死循环。
+	// （若公钥其实已注册成功，清掉令牌后下次连接即以登录模式通过）
+	connect(m_bridge, &AppBridge::tokenRejected, this, [this]() {
+		if (m_selectedCard < 0 || m_selectedCard >= (int)m_cardServers.size())
+			return;
+		m_cardServers[m_selectedCard].RegisterToken.clear();
+		const QString inipath = QString::fromStdWString(
+			Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini");
+		QSettings settings(inipath, QSettings::IniFormat);
+		settings.setValue(QString("Server%1/RegisterToken").arg(m_selectedCard + 1), QString(""));
+		settings.sync();
+	});
+
 	m_btnSwitch = new QPushButton(this);
 	m_btnSwitch->setCursor(Qt::PointingHandCursor);
 	m_btnSwitch->setGeometry(105, 615, 220, 52);
@@ -529,7 +543,22 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	lay->addStretch();
 	lay->addLayout(btnLayout);
 
-	connect(btn_OK, &QPushButton::clicked, &dia, &QDialog::accept);
+	// 公钥校验前移到确认时（与编辑服务器一致）：非法留在对话框提示，不静默清空
+	connect(btn_OK, &QPushButton::clicked, &dia, [&]() {
+		QString pk = input_pubkey->toPlainText();
+		pk.remove(QRegularExpression("\\s"));
+		pk.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
+		pk.remove(QRegularExpression("-*END[^-]*?-+"));
+		pk.remove(QRegularExpression("-+"));
+		if (!pk.isEmpty() && pk.size() != 60) {
+			QMessageBox::warning(&dia, "提示",
+				QString("服务器公钥格式无效：应为 60 位 base64（server_sig.pub 的正文行），当前为 %1 位。\n"
+					"注意：不要复制 registered_clients.txt 里的 hex 或客户端日志整段；\n"
+					"留空 = 使用内置公钥。").arg(pk.size()));
+			return;
+		}
+		dia.accept();
+	});
 	connect(btn_NO, &QPushButton::clicked, &dia, &QDialog::reject);
 
 	if (dia.exec() != QDialog::Accepted)
@@ -549,10 +578,11 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	}
 
 	QString pubkeyB64 = input_pubkey->toPlainText();
-	pubkeyB64.remove(QRegularExpression("-----BEGIN[^-]*-----"));
-	pubkeyB64.remove(QRegularExpression("-----END[^-]*-----"));
 	pubkeyB64.remove(QRegularExpression("\\s"));
-	if (pubkeyB64.length() != 44)
+	pubkeyB64.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
+	pubkeyB64.remove(QRegularExpression("-*END[^-]*?-+"));
+	pubkeyB64.remove(QRegularExpression("-+"));
+	if (pubkeyB64.length() != 60)
 		pubkeyB64.clear();
 
 	// 追加到 [ServerN] 节（真正多服务器，含各自身份）
@@ -933,7 +963,24 @@ QPushButton:hover{background-color:#FF0000;}
 	lay->addStretch();
 	lay->addLayout(btnLayout);
 
-	connect(btn_OK, &QPushButton::clicked, &dia, &QDialog::accept);
+	// 公钥校验前移到确认时：非法直接提示并留在对话框，而不是静默清空后写空串
+	connect(btn_OK, &QPushButton::clicked, &dia, [&]() {
+		QString pk = input_pubkey->toPlainText();
+		// 稳健归一化：先去空白，再按标记词剥离 PEM 头尾（容忍横线缺失/数量不定），
+		// base64 字母表不含 '-'，最后清掉所有连字符即可
+		pk.remove(QRegularExpression("\\s"));
+		pk.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
+		pk.remove(QRegularExpression("-*END[^-]*?-+"));
+		pk.remove(QRegularExpression("-+"));
+		if (!pk.isEmpty() && pk.size() != 60) {
+			QMessageBox::warning(&dia, "提示",
+				QString("服务器公钥格式无效：应为 60 位 base64（server_sig.pub 的正文行），当前为 %1 位。\n"
+					"注意：不要复制 registered_clients.txt 里的 hex 或客户端日志整段；\n"
+					"留空 = 使用内置公钥。").arg(pk.size()));
+			return;   // 不关闭，让用户修改
+		}
+		dia.accept();
+	});
 	connect(btn_NO, &QPushButton::clicked, &dia, &QDialog::reject);
 	connect(btn_Del, &QPushButton::clicked, &dia, [&] {
 		int msg = QMessageBox::question(this,
@@ -972,11 +1019,12 @@ QPushButton:hover{background-color:#FF0000;}
 	}
 
 	QString pubkeyB64 = input_pubkey->toPlainText();
-	pubkeyB64.remove(QRegularExpression("-----BEGIN[^-]*-----"));
-	pubkeyB64.remove(QRegularExpression("-----END[^-]*-----"));
 	pubkeyB64.remove(QRegularExpression("\\s"));
+	pubkeyB64.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
+	pubkeyB64.remove(QRegularExpression("-*END[^-]*?-+"));
+	pubkeyB64.remove(QRegularExpression("-+"));
 
-	if (pubkeyB64.size() != 44)
+	if (pubkeyB64.size() != 60)
 	{
 		pubkeyB64.clear();
 	}

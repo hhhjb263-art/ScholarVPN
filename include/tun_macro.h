@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <cassert>
 
+#include "logger.h"   // LOG_* 统一走 Logger：Release（无控制台）下也写入文件日志
+
 // 编译模式区分
 #ifdef _DEBUG
 #define TUN_DEBUG_MODE 1
@@ -34,20 +36,20 @@ do { \
 #define TUN_API_CHECK(expr, retVal) if(!(expr)) return retVal;
 #endif
 
-// 日志分级
-#define LOG_FATAL(fmt, ...)  fprintf(stderr, "[FATAL] " fmt "\n", ##__VA_ARGS__)
-#define LOG_ERROR(fmt, ...)  fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)   fprintf(stdout, "[WARN]  " fmt "\n", ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)   fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
+// 日志分级（原先 fprintf 到 stdout/stderr，Release 无控制台会整体丢失 → 统一走 Logger）
+#define LOG_FATAL(fmt, ...)  do { ::Logger::Log("[FATAL] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define LOG_ERROR(fmt, ...)  do { ::Logger::Log("[ERROR] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define LOG_WARN(fmt, ...)   do { ::Logger::Log("[WARN]  " fmt "\n", ##__VA_ARGS__); } while (0)
+#define LOG_INFO(fmt, ...)   do { ::Logger::Log("[INFO]  " fmt "\n", ##__VA_ARGS__); } while (0)
 
 #if TUN_DEBUG_LOG
-#define LOG_DEBUG(fmt, ...)  fprintf(stdout, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...)  do { ::Logger::Log("[DEBUG] " fmt "\n", ##__VA_ARGS__); } while (0)
 #else
 #define LOG_DEBUG(fmt, ...) ((void)0)
 #endif
 
 #if TUN_VERBOSE_LOG
-#define LOG_TRACE(fmt, ...)  fprintf(stdout, "[TRACE] " fmt "\n", ##__VA_ARGS__)
+#define LOG_TRACE(fmt, ...)  do { ::Logger::Log("[TRACE] " fmt "\n", ##__VA_ARGS__); } while (0)
 #else
 #define LOG_TRACE(fmt, ...) ((void)0)
 #endif

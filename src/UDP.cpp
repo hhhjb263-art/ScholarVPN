@@ -1,5 +1,6 @@
 #include "UDP.h"
 #include "logger.h"
+#include "tun_macro.h"   // LOG_INFO/LOG_WARN（logger.h 仅提供 LOG_ERR/LOG_KEY/LOG_DBG）
 #include <cstdio>
 #include <chrono>
 #include <cstring>
@@ -464,7 +465,7 @@ void UDP::send_work()
 		m_key_c2s = std::move(keys.key_tx); // 客户端→服务端（发送加密）
 		m_key_s2c = std::move(keys.key_rx); // 服务端→客户端（接收解密）
 		m_enc_ready.store(true);
-		LOG_ERR("[UDP] 加密隧道已建立（阶段2完成）\n");
+		LOG_INFO("[UDP] 加密隧道已建立（阶段2完成）");
 	}
 
 	// 阶段3：加密隧道内身份认证
@@ -509,10 +510,10 @@ void UDP::send_work()
 			m_need_reconnect.store(true);
 			return;
 		}
-		LOG_ERR("[UDP] 身份认证通过，隧道可用（阶段3完成）\n");
+		LOG_INFO("[UDP] 身份认证通过，隧道可用（阶段3完成）");
 		if (!m_register_token.empty()) {
-			LOG_ERR("[UDP] 提示：注册成功，register_token 已一次性作废；\n"
-				"      已自动清空 config.ini 的 RegisterToken，下次连接自动为登录模式\n");
+			LOG_INFO("[UDP] 提示：注册成功，register_token 已一次性作废；"
+				"已自动清空 config.ini 的 RegisterToken，下次连接自动为登录模式");
 		}
 	}
 
@@ -617,23 +618,47 @@ void UDP::recv_work()
 		if (ret <= 0) {
 			continue;
 		}
+		// 只接受目标服务器（m_sockaddr）的回包：
+		// UDP socket 未 bind/connect，任何第三方都能往本端端口发包，
+		// 不校验来源可能被伪造注入（伪造 data 直通 TUN）。
+		// 本协议服务器总是从收到的源地址回包（server 用 s.peer_addr），
+		// 来源 IP/端口必须与客户端发送目标一致。
+		if (peer_addr.sin_addr.s_addr != m_sockaddr.sin_addr.s_addr ||
+			peer_addr.sin_port != m_sockaddr.sin_port)
+		{
+			char src_buf[INET_ADDRSTRLEN] = { 0 };
+			char dst_buf[INET_ADDRSTRLEN] = { 0 };
+			::InetNtopA(AF_INET, &peer_addr.sin_addr, src_buf, sizeof(src_buf));
+			::InetNtopA(AF_INET, &m_sockaddr.sin_addr, dst_buf, sizeof(dst_buf));
+			LOG_DBG("[UDP] 丢弃非目标服务器报文: %s:%u (期望 %s:%u)\n",
+				src_buf, ntohs(peer_addr.sin_port),
+				dst_buf, ntohs(m_sockaddr.sin_port));
+			continue;
+		}
 		if (static_cast<size_t>(ret) < Ktunnel_header) {
 			continue;
 		}
 		tunnel_header header{};
 		memcpy(&header, recv_buf.data(), Ktunnel_header);
 		if (header.magic != Kmagic) {
+			// 来源不是本协议对端（扫描垃圾流量 / 服务端协议完全不同）
+			LOG_ERR("[UDP] 收到非法 magic=0x%08X 的报文，丢弃\n", header.magic);
 			continue;
 		}
 		if (header.version != static_cast<uint8_t>(Kversion)) {
+			// 魔数对但版本不同：几乎总是服务端二进制版本与客户端不一致
+			LOG_ERR("[UDP] 协议版本不匹配: 收到 v%u, 本端 v%u —— 服务端版本可能与客户端不一致，丢弃\n",
+				static_cast<unsigned>(header.version), static_cast<unsigned>(Kversion));
 			continue;
 		}
 		size_t payload_len = ntohs(header.payload_len);
 		if (payload_len > Max_payload_len) {
+			LOG_ERR("[UDP] payload 超长: %zu 字节，丢弃\n", payload_len);
 			continue;
 		}
 		// 校验报文完整性：头部 + payload 长度不超过实际收到字节数
 		if (static_cast<size_t>(ret) < Ktunnel_header + payload_len) {
+			LOG_ERR("[UDP] 报文不完整: 实际 %d 字节 < 头部+%zu，丢弃\n", ret, payload_len);
 			continue;
 		}
 		// 任何合法报文都视为对端存活
@@ -705,7 +730,7 @@ void UDP::recv_work()
 					const uint32_t ip = ntohl(ip_net);
 					m_assigned_ip.store(ip);
 					m_assigned_prefix = inner_payload[4];
-					LOG_ERR("[UDP] 服务端分配虚拟 IP: %u.%u.%u.%u/%u\n",
+					LOG_INFO("[UDP] 服务端分配虚拟 IP: %u.%u.%u.%u/%u",
 						(ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
 						static_cast<unsigned>(m_assigned_prefix));
 				}
@@ -728,6 +753,10 @@ void UDP::recv_work()
 		{
 			// 阶段1：服务器响应 [nonce_s(16) || DH_SRV_EPHEM_PUB(32) || sig_srv(64)]
 			if (payload_len != KAuthServerHelloLen) {
+				// 长度不符几乎总是服务端二进制版本与客户端不一致（协议字段变更），
+				// 必须可见，否则表现为"无任何日志的握手超时"
+				LOG_ERR("[UDP] ServerHello 长度不匹配: 收到 %u 字节, 期望 %zu —— 服务端版本可能与客户端不一致\n",
+					static_cast<unsigned>(payload_len), KAuthServerHelloLen);
 				break;
 			}
 			m_nonce_s.assign(payload, payload + KAuthNonceLen);

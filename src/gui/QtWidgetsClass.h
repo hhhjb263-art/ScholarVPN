@@ -11,9 +11,8 @@
 #include <QThread>
 #include<qlineedit.h>
 #include <QPainter>
-#include <QPolygonF>
-#include <QPainter>
 #include <QTimer>
+
 class SpeedChart : public QWidget
 {
 public:

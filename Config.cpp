@@ -246,11 +246,17 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
         e.RegisterToken = outCfg.RegisterToken;
         outCfg.servers.push_back(std::move(e));
     }
-    // 主字段与 servers[0] 同步（默认/活动服务器）
+    // 主字段与 servers[0] 同步（默认/活动服务器）。
+    // 身份字段（ClientID/RegisterToken/ServerPubKey）一并同步：
+    // 否则直接 start()（未走 set_server()，如 AppBridge::start()）会
+    // "连对地址、用错身份"——ClientID/RegisterToken 仍是 [Identity] 默认值。
     if (!outCfg.servers.empty())
     {
         outCfg.ServerIP = outCfg.servers[0].ServerIP;
         outCfg.ServerPort = outCfg.servers[0].ServerPort;
+        outCfg.ClientID = outCfg.servers[0].ClientID;
+        outCfg.RegisterToken = outCfg.servers[0].RegisterToken;
+        outCfg.ServerPubKey = outCfg.servers[0].ServerPubKey;
     }
 
     outCfg.VirtualIP = ReadIniString(L"Network", L"VirtualIP", outCfg.VirtualIP, ini_path);

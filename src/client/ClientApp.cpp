@@ -1,6 +1,7 @@
 
 #include "ClientApp.h"
 #include <cstdarg>
+#include "tun_macro.h"   // LOG_INFO 等分级日志宏（logger.h 只有 LOG_ERR/LOG_KEY/LOG_DBG）
 #include"../src/util/utf.h"   // narrow/to_wstring/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
 namespace {
 
@@ -43,7 +44,7 @@ MCowBQYDK2VwAyEA+A73aBlJFR3H7ozQ0os5SduqQIga6zIpfI5VSFlGE0A=
 )";
 #else
 const std::string kServerSigPubPem = R"(-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAE9IPOxEDucOHUEhHJ2oZKUhH4wGqV6tgVxdJzhHqQS4=
+MCowBQYDK2VwAyEAQJKqZ2TRYWoyzZynyNACpTZAUPPXVEPNsM8Vb1qpBCU=
 -----END PUBLIC KEY-----
 )";
 #endif
@@ -64,6 +65,10 @@ void ClientApp::emit_log(const char* fmt, ...)
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    // 双写：Logger（控制台 + log 文件）+ UI 回调。
+    // 之前只走 m_onLog → set_server / Connected 等关键步骤只进 GUI 日志窗口，
+    // log 文件里永远缺失（本次排查"握手失败"就因此少了一半线索）。
+    LOG_INFO("%s", buf);
     if (m_onLog)
     {
         m_onLog(buf);
@@ -230,6 +235,17 @@ bool ClientApp::init()
     else
     {
         LOG_KEY("[Config] config.ini not found (%s), using defaults", narrow(m_configPath).c_str());
+    }
+
+    // 多服务器：LoadClientConfig 已把 servers[0] 的 ServerPubKey 同步进主字段。
+    // 非空时用它覆盖内置硬编码公钥（与 set_server() 的包装逻辑一致），
+    // 避免"未走 set_server() 直连"时阶段1验签用错服务器公钥。
+    if (!m_cfg.ServerPubKey.empty())
+    {
+        m_serverSigPubPem = "-----BEGIN PUBLIC KEY-----\n"
+                          + narrow(m_cfg.ServerPubKey)
+                          + "\n-----END PUBLIC KEY-----\n";
+        LOG_KEY("[Identity] 已应用服务器 %ls 配置的 ServerPubKey 验签", m_cfg.ServerIP.c_str());
     }
 
 #ifndef _DEBUG

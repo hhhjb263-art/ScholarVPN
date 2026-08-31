@@ -20,7 +20,12 @@ bool PacketQueue::push(packet_buffer&& buf)
 		if (m_queue.size() >= MaxSize) {
 			return false;
 		}
-		m_queue.push(std::move(buf));
+		try {
+			m_queue.push(std::move(buf));   
+		}
+		catch (...) {
+			return false;
+		}
 	}
 	m_condition.notify_one();
 	return true;

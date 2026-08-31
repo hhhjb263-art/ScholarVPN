@@ -9,8 +9,8 @@
 
 namespace
 {
-    // 单次连接：等待握手完成的上限（UDP 内部握手超时约 5s）
-    constexpr auto kHandshakeWait = std::chrono::seconds(8);
+    // 单次连接：等待握手完成的上限（服务端正常 <1s 回包；4s 无回包即判死）
+    constexpr auto kHandshakeWait = std::chrono::seconds(4);
     // 重连退避：500ms -> 1s -> 2s -> 5s（封顶）
     constexpr auto kMinBackoff = std::chrono::milliseconds(500);
     constexpr auto kMaxBackoff = std::chrono::milliseconds(5000);

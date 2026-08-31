@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <sys/stat.h>   // umask
 #include <system_error>
 #include <unistd.h>   // pause()
 
@@ -117,6 +118,10 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
 
 int main(int argc, char *argv[])
 {
+    // 收紧文件创建权限：server_sig.key / register_tokens.txt /
+    // registered_clients.txt / 日志等一律 0600，本机其他用户不可读
+    ::umask(077);
+
     VpnCore::Config cfg;
     if(!parse_args(argc, argv, cfg)){
         return 1;

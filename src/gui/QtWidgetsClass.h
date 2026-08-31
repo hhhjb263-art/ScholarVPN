@@ -18,7 +18,7 @@ class SpeedChart : public QWidget
 public:
 	explicit SpeedChart(QWidget* parent = nullptr) : QWidget(parent)
 	{
-		setFixedHeight(150);
+		setFixedHeight(190);
 		for (int i = 0; i < N; ++i) { m_rx[i] = 0.0; m_tx[i] = 0.0; }
 	}
 
@@ -44,12 +44,14 @@ protected:
 		p.setBrush(QColor(0xff, 0xff, 0xff));
 		p.drawRoundedRect(rect(), 14, 14);
 
-		// 绘图区：左侧留刻度文字
-		const QRectF area = rect().adjusted(46, 22, -12, -20);
-		double vmax = 1024.0;                       // 量程下限 1KB/s
+		// 绘图区：左侧留刻度文字，顶部留图例/峰值行
+		const QRectF area = rect().adjusted(46, 28, -12, -20);
+
+		// 本窗口峰值（下载/上传取大者），量程与之联动
+		double peak = 0.0;
 		for (int i = 0; i < N; ++i)
-			vmax = qMax(vmax, qMax(m_rx[i], m_tx[i]));
-		vmax *= 1.15;
+			peak = qMax(peak, qMax(m_rx[i], m_tx[i]));
+		const double vmax = qMax(1024.0, peak) * 1.15;
 
 		// 网格 + 纵向刻度
 		p.setFont(QFont("Segoe UI", 7));
@@ -62,16 +64,28 @@ protected:
 				Qt::AlignRight | Qt::AlignVCenter, format_speed(vmax * g / 3.0));
 		}
 
+		// 峰值虚线：横贯绘图区，标出当前窗口最大速率所在高度
+		if (peak > 0) {
+			const double py = area.bottom() - area.height() * (peak / vmax);
+			QPen dashPen(QColor(0xd9, 0x77, 0x06), 1, Qt::DashLine);
+			p.setPen(dashPen);
+			p.drawLine(QPointF(area.left(), py), QPointF(area.right(), py));
+		}
+
 		// 折线：下载蓝 / 上传绿
 		draw_series(p, area, m_rx, QColor(0x25, 0x63, 0xeb), vmax);
 		draw_series(p, area, m_tx, QColor(0x10, 0xb9, 0x81), vmax);
 
-		// 图例
+		// 顶部行：左侧图例，右上方峰值数值
 		p.setFont(QFont("Segoe UI", 8));
 		p.setPen(QColor(0x25, 0x63, 0xeb));
-		p.drawText(QPointF(width() - 140, 16), QStringLiteral("■ 下载"));
+		p.drawText(QPointF(area.left(), 16), QStringLiteral("■ 下载"));
 		p.setPen(QColor(0x10, 0xb9, 0x81));
-		p.drawText(QPointF(width() - 80, 16), QStringLiteral("■ 上传"));
+		p.drawText(QPointF(area.left() + 54, 16), QStringLiteral("■ 上传"));
+		p.setPen(QColor(0xd9, 0x77, 0x06));
+		p.drawText(QRectF(width() - 190, 6, 180, 16),
+			Qt::AlignRight | Qt::AlignVCenter,
+			QStringLiteral("峰值 %1/s").arg(format_speed(peak)));
 	}
 
 private:

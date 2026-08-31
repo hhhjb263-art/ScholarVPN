@@ -872,7 +872,7 @@ void QtWidgetsClass::edit_card()
 
 	QLabel* lab_port = new QLabel("端口:", &dia);
 	QLineEdit* edit_port = new QLineEdit(&dia);
-	edit_port->setPlaceholderText("例:51820");
+	edit_port->setPlaceholderText("默认:51820");
 
 	QLabel* Cilent_id = new QLabel("ClientID: ", &dia);
 	QLineEdit* edit_ID = new QLineEdit(&dia);

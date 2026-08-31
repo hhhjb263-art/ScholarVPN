@@ -484,51 +484,80 @@ bool ClientApp::start()
 
 void ClientApp::tun_to_udp_loop()
 {
+    // 桥接线程兜底：任何异常（内存耗尽/Wintun/加密层）只记日志继续，
+    // 绝不能穿过 std::thread 边界——否则 std::terminate 直接崩溃进程
     while (m_running.load())
     {
-        auto u = m_mgr ? m_mgr->udp() : nullptr;
-        if (!u || !u->is_handshaked())
+        try
         {
+            auto u = m_mgr ? m_mgr->udp() : nullptr;
+            if (!u || !u->is_handshaked())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            DWORD len = 0;
+            uint8_t* pkt = m_tun->read_packet(&len);
+            if (pkt && len > 0)
+            {
+                m_txPkts.fetch_add(1);
+                m_txBytes.fetch_add(len);
+                packet_buffer buf(pkt, len);
+                m_tun->release_read_packet(pkt);
+                u->send_ip_packet(std::move(buf));
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERR("[Bridge] tun->udp 异常（已忽略继续）: %s", e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
         }
-        DWORD len = 0;
-        uint8_t* pkt = m_tun->read_packet(&len);
-        if (pkt && len > 0)
+        catch (...)
         {
-            m_txPkts.fetch_add(1);
-            m_txBytes.fetch_add(len);
-            packet_buffer buf(pkt, len);
-            m_tun->release_read_packet(pkt);
-            u->send_ip_packet(std::move(buf));
-        }
-        else
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            LOG_ERR("[Bridge] tun->udp 未知异常（已忽略继续）");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }
 
 void ClientApp::udp_to_tun_loop()
 {
+    // 桥接线程兜底：同 tun_to_udp_loop，异常不穿线程边界
     while (m_running.load())
     {
-        auto u = m_mgr ? m_mgr->udp() : nullptr;
-        if (!u)
+        try
         {
+            auto u = m_mgr ? m_mgr->udp() : nullptr;
+            if (!u)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            packet_buffer buf;
+            if (!u->recv_ip_packet(buf))
+            {
+                continue;
+            }
+            if (!buf.is_empty())
+            {
+                m_rxPkts.fetch_add(1);
+                m_rxBytes.fetch_add(buf.data_size());
+                m_tun->write_packet(buf.get_data(), static_cast<DWORD>(buf.data_size()));
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERR("[Bridge] udp->tun 异常（已忽略继续）: %s", e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
         }
-        packet_buffer buf;
-        if (!u->recv_ip_packet(buf))
+        catch (...)
         {
-            continue;
-        }
-        if (!buf.is_empty())
-        {
-            m_rxPkts.fetch_add(1);
-            m_rxBytes.fetch_add(buf.data_size());
-            m_tun->write_packet(buf.get_data(), static_cast<DWORD>(buf.data_size()));
+            LOG_ERR("[Bridge] udp->tun 未知异常（已忽略继续）");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }

@@ -65,9 +65,6 @@ void ClientApp::emit_log(const char* fmt, ...)
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    // 双写：Logger（控制台 + log 文件）+ UI 回调。
-    // 之前只走 m_onLog → set_server / Connected 等关键步骤只进 GUI 日志窗口，
-    // log 文件里永远缺失（本次排查"握手失败"就因此少了一半线索）。
     LOG_INFO("%s", buf);
     if (m_onLog)
     {
@@ -113,7 +110,6 @@ bool ClientApp::init()
     // 启动兜底清扫（只执行一次，且在 bridge 工作线程，不会卡 GUI）：
     // 上次进程异常退出（崩溃/被杀/断电）时，黑洞 DNS / DisableSmartNameResolution
     // 可能残留。restore() 会把残留的 0.0.0.0 黑洞 DNS 清回 DHCP 自动并恢复注册表策略，
-    // 保证"电脑断网"不会跨进程残留——下次启动自动恢复，不需要手动改网卡。
     m_dnsGuard.restore();
 
     m_configDir = Config::GetAppDataRoaming() + L"\\ScholarVPN";

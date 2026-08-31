@@ -26,7 +26,12 @@ packet_buffer& packet_buffer::operator=(packet_buffer&& other) noexcept
 	if (this != &other) {
 		m_data = std::move(other.m_data);
 		m_derection = other.m_derection;
+		m_sequene = other.m_sequene;   // 原实现漏了它：移动后序号丢失
 		m_timetamp = other.m_timetamp;
+		// 让被移动对象回到干净的空状态
+		other.m_derection = PacketDirection::TuntoNetwork;
+		other.m_sequene = 0;
+		other.m_timetamp = 0;
 	}
 	return *this;
 }

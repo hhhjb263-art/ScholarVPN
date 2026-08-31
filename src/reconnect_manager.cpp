@@ -16,6 +16,8 @@ namespace
     constexpr auto kMaxBackoff = std::chrono::milliseconds(5000);
     // 连接监视周期
     constexpr auto kMonitorTick = std::chrono::milliseconds(50);
+    // 单次运行最多连续失败次数（成功后清零；超过即停止重连，置 Error）
+    constexpr int kMaxConnectRetries = 5;
 }
 
 ReconnectManager::ReconnectManager(std::string remoteIp, uint16_t port, size_t queueMax)
@@ -114,11 +116,13 @@ void ReconnectManager::worker_loop()
 {
     // 整个状态机包在 try/catch 里：任何异常（回调抛出的、UDP 内部的、
     // 内存分配失败的）都不能穿过 std::thread 边界——否则 std::terminate
-    // 直接崩溃进程（崩溃后 stop() 跑不到，路由/DNS 黑洞残留，电脑没网）。
+    // 直接崩溃进程。
     try
     {
     auto backoff = kMinBackoff;
     bool firstAttempt = true;
+    int retryCount = 0;      // 自 start 起连续失败计数；任一次连接成功后清零
+    bool gaveUp = false;     // 达到上限放弃时保持 Error 状态（否则结尾会被覆盖为 Stopped）
 
     while (m_running.load())
     {
@@ -128,6 +132,7 @@ void ReconnectManager::worker_loop()
         // ---------- 1) 建立连接 ----------
         if (!connect_once())
         {
+            ++retryCount;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 teardown_current_locked();
@@ -136,12 +141,20 @@ void ReconnectManager::worker_loop()
             {
                 break;
             }
+            if (retryCount >= kMaxConnectRetries)
+            {
+                LOG_ERROR("[Reconnect] 连续尝试连接 %d 次全部失败，停止重连", retryCount);
+                set_state(ConnState::Error);
+                gaveUp = true;
+                break; // 跳出外层while，不再重试
+            }
             // 退避后重试
             set_state(ConnState::Reconnecting);
             std::this_thread::sleep_for(backoff);
             backoff = (std::min)(backoff * 2, kMaxBackoff);
             continue;
         }
+        retryCount = 0;      // 连接成功：连续失败计数清零
         backoff = kMinBackoff;
         set_state(ConnState::Connected);
         if (m_onConnected)
@@ -186,7 +199,8 @@ void ReconnectManager::worker_loop()
         std::lock_guard<std::mutex> lock(m_mutex);
         teardown_current_locked();
     }
-    set_state(ConnState::Stopped);
+    // 达到重试上限放弃时保持 Error（用户可见"错误"并需手动重连），否则正常收尾为 Stopped
+    set_state(gaveUp ? ConnState::Error : ConnState::Stopped);
     }
     catch (const std::exception& e)
     {

@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-// 一台服务器的配置（多服务器支持）
+// 一台服务器的配置
 struct ServerEntry
 {
     std::wstring Name;          // 显示名，如 "服务器A"

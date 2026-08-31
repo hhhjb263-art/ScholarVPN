@@ -327,6 +327,17 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		m_btnSwitch->setEnabled(s == ConnState::Stopped);
 		update_home_btn();
 		update_glass_card();
+
+		// 重连达到上限（Error）：弹窗告知，用户手动重连
+		if (s == ConnState::Error) {
+			QMessageBox::warning(this, QStringLiteral("连接失败"),
+				QStringLiteral("连接服务器 [%1] 失败：已连续 5 次尝试未成功，已停止自动重连。\n\n"
+					"请检查：\n"
+					"  1. 服务器 IP / 端口是否正确，服务端是否在运行\n"
+					"  2. 网络/运营商是否拦截（可尝试更换端口）\n"
+					"  3. 首次使用需先注册：在编辑窗口填入有效 RegisterToken")
+					.arg(m_homeName->text()));
+		}
 	});
 
 	// 服务端拒绝注册令牌（无效/已使用）：清掉当前卡片的令牌，转登录模式。
@@ -430,7 +441,7 @@ void QtWidgetsClass::Read_iniFile()
 void QtWidgetsClass::write_edit()
 {
 	QDialog dia(this);
-	dia.resize(380, 470);
+	dia.resize(380, 515);
 	dia.setWindowTitle("添加服务器");
 	QVBoxLayout* lay = new QVBoxLayout(&dia);
 	lay->setContentsMargins(24, 24, 24, 24);
@@ -443,6 +454,11 @@ void QtWidgetsClass::write_edit()
 	QLabel* ip = new QLabel("IP: ");
 	QLineEdit* input_ip = new QLineEdit;
 	input_ip->setPlaceholderText("例:127.0.0.1");
+
+	QLabel* port_lab = new QLabel("端口(默认 51820): ");
+	QLineEdit* input_port = new QLineEdit;
+	input_port->setPlaceholderText("例:51820");
+	input_port->setText("51820");
 
 	QLabel* client_id = new QLabel("ClientID: ");
 	QLineEdit* input_id = new QLineEdit;
@@ -469,6 +485,7 @@ QLineEdit:focus{border:1px solid #0078d4;}
 	)";
 	input_name->setStyleSheet(edit_Style);
 	input_ip->setStyleSheet(edit_Style);
+	input_port->setStyleSheet(edit_Style);
 	input_id->setStyleSheet(edit_Style);
 	input_token->setStyleSheet(edit_Style);
 
@@ -534,6 +551,8 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	lay->addWidget(input_name);
 	lay->addWidget(ip);
 	lay->addWidget(input_ip);
+	lay->addWidget(port_lab);
+	lay->addWidget(input_port);
 	lay->addWidget(client_id);
 	lay->addWidget(input_id);
 	lay->addWidget(token);
@@ -545,6 +564,14 @@ QPushButton:pressed{background-color:#d8d8d8;}
 
 	// 公钥校验前移到确认时（与编辑服务器一致）：非法留在对话框提示，不静默清空
 	connect(btn_OK, &QPushButton::clicked, &dia, [&]() {
+		// 端口校验：1-65535
+		bool portOk = false;
+		const int port = input_port->text().trimmed().toInt(&portOk);
+		if (!portOk || port < 1 || port > 65535) {
+			QMessageBox::warning(&dia, "提示", "端口无效：应为 1-65535 的数字");
+			return;   // 留在对话框
+		}
+
 		QString pk = input_pubkey->toPlainText();
 		pk.remove(QRegularExpression("\\s"));
 		pk.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
@@ -577,6 +604,13 @@ QPushButton:pressed{background-color:#d8d8d8;}
 		return;
 	}
 
+	bool portOk = false;
+	const int newPort = input_port->text().trimmed().toInt(&portOk);
+	if (!portOk || newPort < 1 || newPort > 65535) {
+		QMessageBox::warning(this, "提示", "端口无效：应为 1-65535 的数字");
+		return;
+	}
+
 	QString pubkeyB64 = input_pubkey->toPlainText();
 	pubkeyB64.remove(QRegularExpression("\\s"));
 	pubkeyB64.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
@@ -595,7 +629,7 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	settings.setValue(QString("Server%1/Name").arg(idx),
 		newName.isEmpty() ? QString("computer%1").arg(idx) : newName);
 	settings.setValue(QString("Server%1/ServerIP").arg(idx), newIp);
-	settings.setValue(QString("Server%1/ServerPort").arg(idx), 51820);
+	settings.setValue(QString("Server%1/ServerPort").arg(idx), newPort);
 	settings.setValue(QString("Server%1/ClientID").arg(idx), newId);
 	settings.setValue(QString("Server%1/RegisterToken").arg(idx), newTok);
 	settings.setValue(QString("Server%1/ServerPubKey").arg(idx), pubkeyB64);
@@ -822,7 +856,7 @@ void QtWidgetsClass::edit_card()
 
 	const ServerEntry& entry = m_cardServers[idx];
 	QDialog dia(this);
-	dia.resize(380, 500);
+	dia.resize(380, 545);
 	dia.setWindowTitle("编辑服务器");
 	QVBoxLayout* lay = new QVBoxLayout(&dia);
 	lay->setContentsMargins(24, 24, 24, 24);
@@ -835,6 +869,10 @@ void QtWidgetsClass::edit_card()
 	QLabel* lab_ip = new QLabel("IP:", &dia);
 	QLineEdit* edit_ip = new QLineEdit(&dia);
 	edit_ip->setPlaceholderText("例:127.0.0.1");
+
+	QLabel* lab_port = new QLabel("端口:", &dia);
+	QLineEdit* edit_port = new QLineEdit(&dia);
+	edit_port->setPlaceholderText("例:51820");
 
 	QLabel* Cilent_id = new QLabel("ClientID: ", &dia);
 	QLineEdit* edit_ID = new QLineEdit(&dia);
@@ -863,6 +901,7 @@ QLineEdit:focus{border:1px solid #0078d4;}
 		? QStringLiteral("computer%1").arg(idx + 1)
 		: QString::fromStdWString(entry.Name));
 	edit_ip->setText(QString::fromStdWString(entry.ServerIP));
+	edit_port->setText(QString::number(entry.ServerPort));
 	edit_ID->setText(QString::fromStdWString(entry.ClientID));
 	edit_token->setText(QString::fromStdWString(entry.RegisterToken));
 
@@ -877,6 +916,7 @@ QLineEdit:focus{border:1px solid #0078d4;}
 
 	edit_name->setStyleSheet(edit_Style);
 	edit_ip->setStyleSheet(edit_Style);
+	edit_port->setStyleSheet(edit_Style);
 	edit_ID->setStyleSheet(edit_Style);
 	edit_token->setStyleSheet(edit_Style);
 	input_pubkey->setStyleSheet(R"(
@@ -954,6 +994,8 @@ QPushButton:hover{background-color:#FF0000;}
 	lay->addWidget(edit_name);
 	lay->addWidget(lab_ip);
 	lay->addWidget(edit_ip);
+	lay->addWidget(lab_port);
+	lay->addWidget(edit_port);
 	lay->addWidget(Cilent_id);
 	lay->addWidget(edit_ID);
 	lay->addWidget(lab_token);
@@ -965,6 +1007,14 @@ QPushButton:hover{background-color:#FF0000;}
 
 	// 公钥校验前移到确认时：非法直接提示并留在对话框，而不是静默清空后写空串
 	connect(btn_OK, &QPushButton::clicked, &dia, [&]() {
+		// 端口校验：1-65535
+		bool portOk = false;
+		const int port = edit_port->text().trimmed().toInt(&portOk);
+		if (!portOk || port < 1 || port > 65535) {
+			QMessageBox::warning(&dia, "提示", "端口无效：应为 1-65535 的数字");
+			return;   // 留在对话框
+		}
+
 		QString pk = input_pubkey->toPlainText();
 		// 稳健归一化：先去空白，再按标记词剥离 PEM 头尾（容忍横线缺失/数量不定），
 		// base64 字母表不含 '-'，最后清掉所有连字符即可
@@ -1018,6 +1068,13 @@ QPushButton:hover{background-color:#FF0000;}
 		return;
 	}
 
+	bool portOk = false;
+	const int newPort = edit_port->text().trimmed().toInt(&portOk);
+	if (!portOk || newPort < 1 || newPort > 65535) {
+		QMessageBox::warning(this, "提示", "端口无效：应为 1-65535 的数字");
+		return;
+	}
+
 	QString pubkeyB64 = input_pubkey->toPlainText();
 	pubkeyB64.remove(QRegularExpression("\\s"));
 	pubkeyB64.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
@@ -1038,6 +1095,7 @@ QPushButton:hover{background-color:#FF0000;}
 	settings.setValue(QString("Server%1/Name").arg(idx + 1),
 		newName.isEmpty() ? QString("computer%1").arg(idx + 1) : newName);
 	settings.setValue(QString("Server%1/ServerIP").arg(idx + 1), newIP);
+	settings.setValue(QString("Server%1/ServerPort").arg(idx + 1), newPort);
 	settings.setValue(QString("Server%1/ClientID").arg(idx + 1), newID);
 	settings.setValue(QString("Server%1/RegisterToken").arg(idx + 1), newToken);
 	settings.setValue(QString("Server%1/ServerPubKey").arg(idx + 1), pubkeyB64);

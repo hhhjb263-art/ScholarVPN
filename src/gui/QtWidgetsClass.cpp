@@ -54,17 +54,20 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	brand->addWidget(brandDot, 0, Qt::AlignVCenter);
 	brand->addLayout(brandText);
 
-	QPushButton* btn_add = new QPushButton("+ 添加服务器", this);
-	btn_add->setFixedSize(126, 34);
+	QPushButton* btn_add = new QPushButton("+", this);
+	btn_add->setFixedSize(34, 34);
 	btn_add->setCursor(Qt::PointingHandCursor);
+	btn_add->setToolTip(QStringLiteral("添加服务器"));
 	btn_add->setStyleSheet(R"(
 	QPushButton{
 		background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #3b82f6,stop:1 #2563eb);
 		border:none;
 		border-radius:17px;
 		color:white;
+		font-size:15pt;
 		font-weight:bold;
-		padding:0 16px;
+		text-align:center;
+		padding:0 0 3px 0;   /* 字形沿基线偏低，底部留白把它顶回视觉中心 */
 	}
 	QPushButton:hover{
 		background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #4f8ef7,stop:1 #2f6fe8);
@@ -73,8 +76,14 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #2b6fd4,stop:1 #1e56b8);
 	}
 	)");
+
+
+	auto* leftPad = new QWidget(this);
+	leftPad->setFixedWidth(34);                      // 与"+"按钮同宽，保证对称
+	topBar->addWidget(leftPad);
+	topBar->addStretch(1);
 	topBar->addLayout(brand);
-	topBar->addStretch();
+	topBar->addStretch(1);
 	topBar->addWidget(btn_add);
 
 	m_scroll = new QScrollArea(this);

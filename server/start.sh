@@ -464,7 +464,7 @@ WDE
     echo "    重点日志: $LOG_FILE"
     # 彻底脱离当前 SSH 终端：新会话 + 忽略挂断 + 解除 job 关联
     cd /
-    umask 022
+    umask 077
     nohup setsid "$RUN_DIR/watchdog.sh" > /dev/null 2>&1 < /dev/null &
     disown
     echo $! > "$PID_FILE"

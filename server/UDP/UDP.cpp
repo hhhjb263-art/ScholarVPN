@@ -26,6 +26,10 @@ namespace {
 // 心跳保活参数
 constexpr auto kHeartbeatInterval = std::chrono::seconds(10);   // 每 10s 发一次心跳
 constexpr auto kHeartbeatTimeout  = std::chrono::seconds(30);   // 30s 未收到对端任何报文判失联
+// 未认证（pending）会话独立防护：客户端连接失败/重试风暴不能占满整张会话表
+constexpr auto kHandshakeTimeout  = std::chrono::seconds(10);   // 未认证会话 10s 未完成握手即清理
+constexpr size_t kMaxPendingSessions = 32;                      // 未认证会话独立配额（不挤占已认证容量）
+constexpr size_t kMaxSessionsPerIp   = 3;                       // 每来源 IP 最多同时持有的会话数
 
 // 当前 steady_clock 毫秒时间戳
 uint64_t now_ms()
@@ -93,10 +97,51 @@ UDP::~UDP()
 std::shared_ptr<Session> UDP::get_or_create_session(const sockaddr_in& addr)
 {
     const std::string key = Session::peer_addr_to_key(addr);
+    const std::string ip = key.substr(0, key.rfind(':'));
     std::lock_guard<std::mutex> lock(m_sessions_mutex);
     auto it = m_sessions.find(key);
     if (it != m_sessions.end())
         return it->second;
+
+    // 未认证会话独立配额：连接失败/重试风暴的 pending 会话不能挤占已认证容量
+    size_t pending = 0;
+    for (auto& kv : m_sessions)
+        if (!kv.second->handshaked.load())
+            ++pending;
+    if (pending >= kMaxPendingSessions) {
+        fprintf(stderr, "[UDP] 未认证会话已达上限 %zu，丢弃新连接 %s\n",
+                kMaxPendingSessions, key.c_str());
+        return nullptr;
+    }
+
+    // 每 IP 会话数上限：客户端重试/伪造源都无法用同一来源占满会话表。
+    // 超限时淘汰该 IP 最早的未认证会话（最新连接优先）；该 IP 全是已认证会话才拒绝
+    size_t perIp = 0;
+    std::string oldestPendingKey;
+    uint64_t oldestCreated = UINT64_MAX;
+    for (auto& kv : m_sessions) {
+        if (kv.second->peer_ip != ip)
+            continue;
+        ++perIp;
+        if (!kv.second->handshaked.load()) {
+            const uint64_t created = static_cast<uint64_t>(kv.second->created_at_ms.load());
+            if (created < oldestCreated) {
+                oldestCreated = created;
+                oldestPendingKey = kv.first;
+            }
+        }
+    }
+    if (perIp >= kMaxSessionsPerIp) {
+        if (oldestPendingKey.empty()) {
+            fprintf(stderr, "[UDP] 来源 %s 会话数已达上限 %zu，拒绝新连接\n",
+                    ip.c_str(), kMaxSessionsPerIp);
+            return nullptr;
+        }
+        fprintf(stderr, "[UDP] 来源 %s 超过每源上限，淘汰最早未认证会话 %s\n",
+                ip.c_str(), oldestPendingKey.c_str());
+        m_sessions.erase(oldestPendingKey);
+    }
+
     if (m_sessions.size() >= m_max_clients) {
         fprintf(stderr, "[UDP] 会话数已达上限 %zu，丢弃新连接 %s\n", m_max_clients, key.c_str());
         return nullptr;
@@ -456,13 +501,20 @@ void UDP::recv_work()
 
         int ret = recvfrom(m_sock, recvbuf.data(), recvbuf.size(), 0,
                            reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_addr_size);
-        if (ret <= 0) {
+        if (ret == 0) {
+            // 零长度 UDP 数据报是合法报文：攻击者发一个空包不应打死收包线程
+            continue;
+        }
+        if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;   // 非阻塞下无数据，短暂休眠后重试
             }
+            // 瞬时错误（ENETUNREACH/ENOBUFS 等）：记日志后继续。
+            // 绝不能 break——recv 线程退出后认证/转发/心跳全部停摆且 watchdog 无法感知
             fprintf(stderr, "[UDP] recvfrom() failed: %s\n", strerror(errno));
-            break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
         }
         if (ret < static_cast<int>(Ktunnel_header))
             continue;   // 包太短
@@ -549,11 +601,8 @@ void UDP::recv_work()
             handle_auth_client_hello(*s, payload, pay_len);
             break;
         case m_data: {
-            // 密钥未就绪前的明文数据包（兼容/降级路径）
-            if (!s->handshaked.load())
-                break;
-            std::vector<uint8_t> tmp(payload, payload + pay_len);
-            m_queue_recv.push(packet_buffer(std::move(tmp)));
+            // 明文数据兼容路径已删除：握手后的明文 m_data 可被伪造源地址
+            // 未认证注入 TUN（高危）。数据面只接受 AES-256-GCM 密文（下方密文分支）。
             break;
         }
         case m_heart:
@@ -562,8 +611,8 @@ void UDP::recv_work()
         case m_heart_response:
             break;
         case disconnect:
-            fprintf(stderr, "[UDP] 收到断开消息: %s\n", s->peer_key.c_str());
-            release_session(s->peer_key);
+            // 明文 disconnect 已不再受理：伪造源地址可一包踢人。
+            // 会话生命周期由心跳超时统一管理，无需显式断开消息
             break;
         default:
             break;
@@ -618,6 +667,17 @@ void UDP::handle_auth_hello(Session& s, const uint8_t* payload, size_t len)
         s.dh_srv_priv != nullptr && !s.nonce_s.empty() && !s.dh_srv_pub.empty()) {
         if (send_server_hello())
             fprintf(stderr, "[UDP][AUTH] auth_hello 重传：幂等重发 ServerHello\n");
+        return;
+    }
+
+    // 已建立（握手/加密就绪/已认证）的会话收到"不同 nonce_c"的 auth_hello：
+    // 伪造源地址可借此清空密钥、把合法客户端钉死在离线状态——拒绝重置。
+    // （同一 nonce 走上面的幂等分支无害；客户端真实重连会换端口形成全新会话）
+    if ((s.authenticated.load() || s.enc_ready.load() || s.handshaked.load()) &&
+        !s.nonce_c.empty() && s.nonce_c.size() == KAuthNonceLen &&
+        std::memcmp(s.nonce_c.data(), payload, KAuthNonceLen) != 0) {
+        fprintf(stderr, "[UDP][AUTH] 已建立会话收到不同 nonce 的 auth_hello，拒绝重置 (%s)\n",
+                s.peer_key.c_str());
         return;
     }
 
@@ -867,6 +927,8 @@ void UDP::heartbeat_work()
 {
     const uint64_t timeout_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(kHeartbeatTimeout).count());
+    const uint64_t hs_timeout_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(kHandshakeTimeout).count());
     while (is_running()) {
         std::this_thread::sleep_for(kHeartbeatInterval);
         if (!is_running())
@@ -880,9 +942,9 @@ void UDP::heartbeat_work()
                 sessions.push_back(kv.second);
         }
         for (auto& s : sessions) {
-            // 未认证会话：握手超时清理（防 DoS 占满会话表）
+            // 未认证会话：握手超时清理（10s，快速释放会话表配额防 Connect-Flood）
             if (!s->handshaked.load()) {
-                if (now - static_cast<uint64_t>(s->created_at_ms.load()) > timeout_ms) {
+                if (now - static_cast<uint64_t>(s->created_at_ms.load()) > hs_timeout_ms) {
                     fprintf(stderr, "[UDP] 握手超时，销毁未认证会话 %s\n", s->peer_key.c_str());
                     release_session(s->peer_key);
                 }

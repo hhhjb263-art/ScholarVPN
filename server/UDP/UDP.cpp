@@ -590,8 +590,8 @@ void UDP::recv_work()
             case disconnect:
                 // 客户端显式断开（密文内层）：立即释放会话，每源配额即时归还。
                 // 注意 release_session 会把 s 从表中移除，之后不要再使用 s
-                fprintf(stderr, "[UDP] 客户端断开: %s\n", s.peer_key.c_str());
-                release_session(s.peer_key);
+                fprintf(stderr, "[UDP] 客户端断开: %s\n", s->peer_key.c_str());
+                release_session(s->peer_key);
                 break;
             default:
                 break;

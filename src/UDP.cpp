@@ -235,7 +235,9 @@ bool UDP::try_recv_ip_packet(packet_buffer& buf)
 
 bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector<uint8_t>& sendbuf)
 {
-	if (len > Max_payload_len)
+	// 数据面明文载荷统一按 KMax_data_payload(1400) 限长：密文封装后不超过 Max_payload_len(1429)，
+	// 与服务端 send_packet 的入口检查一致
+	if (len > KMax_data_payload)
 		return false;
 	size_t total_len = Ktunnel_header + len;
 	sendbuf.resize(total_len);
@@ -555,7 +557,7 @@ void UDP::send_work()
 			continue;
 		}
 		size_t paysize = buf.data_size();
-		if (paysize > VPN_MTU) {
+		if (paysize > KMax_data_payload) {
 			buf.clear();
 			continue;
 		}
@@ -801,20 +803,14 @@ void UDP::recv_work()
 		case m_heart_response:
 			// 心跳确认：可用于链路检测，暂不处理
 			break;
-		case m_data:
-		{
-			// 密钥未就绪前的明文数据包（兼容/降级路径）
-			if (payload_len == 0) {
-				break;
-			}
-			packet_buffer pbuf(const_cast<uint8_t*>(payload), payload_len);
-			m_recvqueue.push(std::move(pbuf));
+		case m_data: {
+			// 明文数据兼容路径已删除：伪造源地址的明文 m_data 可在密钥就绪前未认证注入 TUN（高危）。
+			// 数据面只接受 AES-256-GCM 密文（上方密文分支），与服务端行为一致。
 			break;
 		}
 		case disconnect:
-			// 对端 FIN：回复 FIN（近似 FIN+ACK），并标记需要重连
-			send_packet(static_cast<uint8_t>(disconnect), nullptr, 0, sendbuf);
-			m_need_reconnect.store(true);
+			// 明文 disconnect 不再受理：服务端从不发送明文 disconnect，
+			// 受理它只会让伪造源地址的报文触发客户端重连风暴
 			break;
 		default:
 			break;

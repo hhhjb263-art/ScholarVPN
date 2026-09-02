@@ -47,6 +47,9 @@ constexpr uint32_t Kmagic = 0x4D56504E;
 constexpr uint8_t Kversion = v_udp;
 constexpr size_t Ktunnel_header = sizeof(tunnel_header);
 constexpr size_t Max_payload_len = 1429;
+// 数据面明文载荷上限：AES-GCM 封装 inner(1) + nonce(12) + tag(16) 后不得超过 Max_payload_len
+// （对应 TUN MTU 1400，与 server/Buffer/tunnel_protoco.h 保持一致）
+constexpr size_t KMax_data_payload = 1400;
 constexpr size_t KAuthNonceLen = 16;             // nonce_c / nonce_s
 constexpr size_t KAuthDhPubLen = 32;             // ephemeral X25519 pub / Ed25519 pub
 constexpr size_t KAuthSigLen = 64;               // Ed25519 signature

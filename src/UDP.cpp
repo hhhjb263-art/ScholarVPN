@@ -249,13 +249,14 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 	header.sequence = htonl(seq);
 
 	memcpy(sendbuf.data(), &header, Ktunnel_header);
-	// 数据面加密：密钥就绪后 data/heart/identity 等一律以密文发送（阶段1明文消息除外）
+	// 数据面加密：密钥就绪后 data/heart/identity/disconnect 等一律以密文发送（阶段1明文消息除外）
 	if (m_enc_ready.load() && (type == static_cast<uint8_t>(m_data) ||
 		type == static_cast<uint8_t>(m_heart) ||
 		type == static_cast<uint8_t>(m_heart_response) ||
 		type == static_cast<uint8_t>(m_identity) ||
 		type == static_cast<uint8_t>(m_identity_ok) ||
-		type == static_cast<uint8_t>(m_identity_deny)))
+		type == static_cast<uint8_t>(m_identity_deny) ||
+		type == static_cast<uint8_t>(disconnect)))
 	{
 		// enc_len = inner明文(1+len) + nonce12 + tag16
 		const size_t enc_len = len + 1 + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN;
@@ -665,13 +666,14 @@ void UDP::recv_work()
 		m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 		const uint8_t* payload = recv_buf.data() + Ktunnel_header;
 
-		// 密文类型：密钥就绪后 data/heart/identity 等均为 AES-GCM 密文，先解密再按内层类型分发
+		// 密文类型：密钥就绪后 data/heart/identity/disconnect 等均为 AES-GCM 密文，先解密再按内层类型分发
 		if (header.type == static_cast<uint8_t>(m_data) ||
 			header.type == static_cast<uint8_t>(m_heart) ||
 			header.type == static_cast<uint8_t>(m_heart_response) ||
 			header.type == static_cast<uint8_t>(m_identity) ||
 			header.type == static_cast<uint8_t>(m_identity_ok) ||
-			header.type == static_cast<uint8_t>(m_identity_deny))
+			header.type == static_cast<uint8_t>(m_identity_deny) ||
+			header.type == static_cast<uint8_t>(disconnect))
 		{
 			if (!m_enc_ready.load())
 			{
@@ -739,6 +741,10 @@ void UDP::recv_work()
 				// 阶段3：身份验证被拒绝；内层首字节为原因码 0=未注册 1=令牌无效/已使用
 				m_auth_deny_reason.store(inner_payload.empty() ? -1 : static_cast<int>(inner_payload[0]));
 				m_auth_failed.store(true);
+				break;
+			case disconnect:
+				// 服务端显式断开（密文内层）：标记重连
+				m_need_reconnect.store(true);
 				break;
 			default:
 				break;

@@ -540,13 +540,14 @@ void UDP::recv_work()
         }
         const uint8_t* payload = recvbuf.data() + Ktunnel_header;
 
-        // 加密类型：密钥就绪后 data/heart/identity 均为密文
+        // 加密类型：密钥就绪后 data/heart/identity/disconnect 均为密文
         if (hdr.type == static_cast<uint8_t>(m_data) ||
             hdr.type == static_cast<uint8_t>(m_heart) ||
             hdr.type == static_cast<uint8_t>(m_heart_response) ||
             hdr.type == static_cast<uint8_t>(m_identity) ||
             hdr.type == static_cast<uint8_t>(m_identity_ok) ||
-            hdr.type == static_cast<uint8_t>(m_identity_deny)) {
+            hdr.type == static_cast<uint8_t>(m_identity_deny) ||
+            hdr.type == static_cast<uint8_t>(disconnect)) {
             if (!s->enc_ready.load()) {
                 continue;   // 密钥未就绪，丢弃
             }
@@ -585,6 +586,12 @@ void UDP::recv_work()
             case m_identity_ok:
             case m_identity_deny:
                 // 服务端角色不应收到这些，忽略
+                break;
+            case disconnect:
+                // 客户端显式断开（密文内层）：立即释放会话，每源配额即时归还。
+                // 注意 release_session 会把 s 从表中移除，之后不要再使用 s
+                fprintf(stderr, "[UDP] 客户端断开: %s\n", s.peer_key.c_str());
+                release_session(s.peer_key);
                 break;
             default:
                 break;
@@ -942,8 +949,9 @@ void UDP::heartbeat_work()
                 sessions.push_back(kv.second);
         }
         for (auto& s : sessions) {
-            // 未认证会话：握手超时清理（10s，快速释放会话表配额防 Connect-Flood）
-            if (!s->handshaked.load()) {
+            // 未完成身份验证的会话：10s 清理（含走到阶段2但被拒/放弃的——
+            // 这些僵尸会话若按心跳超时算会滞留 30s 占满每源配额）
+            if (!s->authenticated.load()) {
                 if (now - static_cast<uint64_t>(s->created_at_ms.load()) > hs_timeout_ms) {
                     fprintf(stderr, "[UDP] 握手超时，销毁未认证会话 %s\n", s->peer_key.c_str());
                     release_session(s->peer_key);

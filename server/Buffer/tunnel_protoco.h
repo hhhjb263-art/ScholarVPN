@@ -47,6 +47,8 @@ constexpr uint8_t Kversion = v_udp;
 constexpr size_t Ktunnel_header = sizeof(tunnel_header);
 // Max TUN packet 1400 + inner type 1 + nonce 12 + tag 16 = 1429 (match client)
 constexpr size_t Max_payload_len = 1429;
+// 数据面明文载荷上限：AES-GCM 封装 inner(1) + nonce(12) + tag(16) 后不得超过 Max_payload_len
+constexpr size_t KMax_data_payload = 1400;
 
 // 三阶段身份认证线格式常量
 constexpr size_t KAuthNonceLen = 16;             // nonce_c / nonce_s

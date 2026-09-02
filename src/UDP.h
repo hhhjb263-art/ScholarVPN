@@ -100,6 +100,7 @@ private:
     std::vector<std::uint8_t> m_key_s2c;        // key_rx 服务端→客户端（本端接收解密）
     std::atomic<bool> m_enc_ready{ false };     // 密钥派生完成（阶段2 结束）
 private:
-    static constexpr size_t VPN_MTU = 1400;
+    // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 tunnel_protoco.h（两端一致）；
+    // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限
     static constexpr size_t KMax_packet_size = 1441;
 };

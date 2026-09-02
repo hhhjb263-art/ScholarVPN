@@ -361,7 +361,9 @@ bool UDP::recv_ip_packet(packet_buffer& buf)
 bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
                       std::vector<uint8_t>& tmp_buf)
 {
-    if (len > VPN_MTU)
+    // 数据面明文载荷统一按 KMax_data_payload(1400) 限长：密文封装后不超过 Max_payload_len(1429)，
+    // 与客户端 send_packet 的入口检查一致
+    if (len > KMax_data_payload)
         return false;
     if (!is_running())
         return false;
@@ -460,7 +462,7 @@ void UDP::send_work()
             if (buf.is_empty())
                 continue;
             const size_t pay_size = buf.data_size();
-            if (pay_size > VPN_MTU) {
+            if (pay_size > KMax_data_payload) {
                 buf.clear();
                 continue;
             }

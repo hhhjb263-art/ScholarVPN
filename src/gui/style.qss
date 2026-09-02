@@ -1,32 +1,49 @@
-
+/* ScholarVPN 全局基础样式（各控件内联样式优先级更高） */
 QWidget {
-    background-color: #f5f6fa;
     color: #2d3436;
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
     font-size: 13px;
+    background-color: #f4f6fb;
 }
 
-QListWidget {
-    background-color: #ffffff;
-    border: 1px solid #dcdde1;
-    border-radius: 6px;
-    padding: 4px;
-    outline: none;
+QLabel { background: transparent; }
+
+QDialog { background-color: #ffffff; }
+
+QPushButton {
+    background: #f1f3f7;
+    border: 1px solid #e1e5ee;
+    border-radius: 8px;
+    padding: 5px 14px;
+    color: #2d3436;
 }
-QListWidget::item {
+QPushButton:hover  { background: #e8ebf2; }
+QPushButton:pressed{ background: #dde1ea; }
+
+QLineEdit {
+    background: #ffffff;
+    border: 1px solid #e1e5ee;
+    border-radius: 8px;
     padding: 6px 10px;
-    border-radius: 4px;
-    margin: 2px;
+    selection-background-color: #3b82f6;
 }
+QLineEdit:focus { border: 1px solid #3b82f6; }
 
-QFrame#serverCard {
-    background-color: #cccccc;
-    border: 1px solid #444444;
+QPlainTextEdit {
+    background: #ffffff;
+    border: 1px solid #e1e5ee;
     border-radius: 8px;
 }
-QPushButton {
-    background-color: #cccccc;
-    border: 1px solid #999999;
-    border-radius: 4px;
-    padding: 4px 10px;
+
+QScrollBar:vertical {
+    width: 8px;
+    background: transparent;
+    margin: 2px;
 }
+QScrollBar::handle:vertical {
+    background: #c9cedb;
+    min-height: 24px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover { background: #aab1c2; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }

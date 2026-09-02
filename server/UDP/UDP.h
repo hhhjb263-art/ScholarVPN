@@ -97,6 +97,7 @@ private:
     std::unordered_map<uint32_t, std::string> m_vip_to_key;
     std::shared_ptr<VirtualIpPool> m_ip_pool;
 
-    static constexpr size_t VPN_MTU = 1400;
+    // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 Buffer/tunnel_protoco.h（两端一致）；
+    // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限
     static constexpr size_t KMax_packet_size = 1441;
 };

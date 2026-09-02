@@ -29,15 +29,21 @@ class DnsLeakGuard
 {
 public:
     // 备份除 keepLuid（TUN 网卡）之外所有活跃接口的 DNS 并清空，同时禁用多宿主解析；
-    // 返回 false 表示至少一个关键步骤失败（注册表写不进去等），上层应记日志
+    // 成功后派生"崩溃看门狗"进程：本进程退出（含崩溃）时自动复位所有被改的网卡 DNS
+    // 返回 false 表示至少一个关键步骤失败（注册表写不进去等），上层需记日志
     bool protect(NET_LUID keepLuid);
     // 恢复全部备份的 DNS + 恢复多宿主解析设置 + 清理残留黑洞（断开连接时调用）
     void restore();
 
 private:
+    // 派生分离的 PowerShell 看门狗：Wait-Process 盯住本进程，进程死后复位备份网卡的 DNS。
+    // 覆盖崩溃/被任务管理器杀掉等 restore() 来不及执行的异常退出。
+    void spawn_crash_watchdog();
+
     struct Backup
     {
         GUID guid{};           // 接口 GUID
+        ULONG ifIndex = 0;     // 接口索引（看门狗 netsh/PowerShell 复位用，无编码问题）
         std::wstring ipv4Dns;  // 原 DNS 服务器串（wasDhcp=true 时为空）
         bool wasDhcp = false;  // true=原为 DHCP 自动获取 DNS，恢复时切回自动
     };

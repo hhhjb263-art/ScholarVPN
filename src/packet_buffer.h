@@ -23,7 +23,6 @@ public:
 	const uint8_t *get_data() const;
 	bool is_empty() const;
 	size_t data_size() const;
-	void size();
 	void clear();
 	void resize(size_t size);
 	void set_destion(PacketDirection derection);

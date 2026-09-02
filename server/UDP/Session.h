@@ -34,7 +34,10 @@ struct Session
     explicit Session(const sockaddr_in& addr, size_t queueMax = 256)
         : peer_addr(addr), send_queue(queueMax)
     {
-        peer_key = peer_addr_to_key(addr);
+        char ip[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+        peer_ip = ip;
+        peer_key = peer_ip + ":" + std::to_string(ntohs(addr.sin_port));
         const int64_t t = static_cast<int64_t>(now_ms());
         last_rx_ms.store(t);
         created_at_ms.store(t);
@@ -69,6 +72,7 @@ struct Session
 
     sockaddr_in peer_addr{};          // 客户端 UDP 地址（recvfrom 源地址）
     std::string peer_key;             // "ip:port"，会话表键
+    std::string peer_ip;              // 客户端来源 IP（每源会话数限制用）
 
     // 阶段3 通过后填充
     std::string client_id;            // 客户端标识

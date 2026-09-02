@@ -12,11 +12,11 @@ HKDF + AES-256-GCM）。详细说明见根目录 `README.md`。
 - `third_party/`：第三方依赖（OpenSSL 3.5.6、Wintun 0.14.1）
 - `Config.cpp / Config.h`：客户端 INI 配置读写
 - `Crypt.cpp / Crypt.h`：客户端加密层
+- `Config.cpp / Config.h`：客户端 INI 配置读写
+- `Crypt.cpp / Crypt.h`：客户端加密层
 - `docs/`：项目文档与说明
-- `x64/`：Visual Studio 构建输出
 
-> 注：根目录下的 `Buffer/ core/ Crypt/ UDP/` 为早期服务端模块快照（未被任何工程引用），
-> 现行服务端代码以 `server/` 为准。
+> 注：现行服务端代码位于 `server/`。
 
 ## 构建依赖与环境
 

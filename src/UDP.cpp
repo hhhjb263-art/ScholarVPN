@@ -1,5 +1,6 @@
 #include "UDP.h"
 #include "logger.h"
+#include "tun_macro.h"   // LOG_INFO/LOG_WARN（logger.h 仅提供 LOG_ERR/LOG_KEY/LOG_DBG）
 #include <cstdio>
 #include <chrono>
 #include <cstring>
@@ -234,7 +235,9 @@ bool UDP::try_recv_ip_packet(packet_buffer& buf)
 
 bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector<uint8_t>& sendbuf)
 {
-	if (len > Max_payload_len)
+	// 数据面明文载荷统一按 KMax_data_payload(1400) 限长：密文封装后不超过 Max_payload_len(1429)，
+	// 与服务端 send_packet 的入口检查一致
+	if (len > KMax_data_payload)
 		return false;
 	size_t total_len = Ktunnel_header + len;
 	sendbuf.resize(total_len);
@@ -248,13 +251,14 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 	header.sequence = htonl(seq);
 
 	memcpy(sendbuf.data(), &header, Ktunnel_header);
-	// 数据面加密：密钥就绪后 data/heart/identity 等一律以密文发送（阶段1明文消息除外）
+	// 数据面加密：密钥就绪后 data/heart/identity/disconnect 等一律以密文发送（阶段1明文消息除外）
 	if (m_enc_ready.load() && (type == static_cast<uint8_t>(m_data) ||
 		type == static_cast<uint8_t>(m_heart) ||
 		type == static_cast<uint8_t>(m_heart_response) ||
 		type == static_cast<uint8_t>(m_identity) ||
 		type == static_cast<uint8_t>(m_identity_ok) ||
-		type == static_cast<uint8_t>(m_identity_deny)))
+		type == static_cast<uint8_t>(m_identity_deny) ||
+		type == static_cast<uint8_t>(disconnect)))
 	{
 		// enc_len = inner明文(1+len) + nonce12 + tag16
 		const size_t enc_len = len + 1 + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN;
@@ -464,7 +468,7 @@ void UDP::send_work()
 		m_key_c2s = std::move(keys.key_tx); // 客户端→服务端（发送加密）
 		m_key_s2c = std::move(keys.key_rx); // 服务端→客户端（接收解密）
 		m_enc_ready.store(true);
-		LOG_ERR("[UDP] 加密隧道已建立（阶段2完成）\n");
+		LOG_INFO("[UDP] 加密隧道已建立（阶段2完成）");
 	}
 
 	// 阶段3：加密隧道内身份认证
@@ -509,10 +513,10 @@ void UDP::send_work()
 			m_need_reconnect.store(true);
 			return;
 		}
-		LOG_ERR("[UDP] 身份认证通过，隧道可用（阶段3完成）\n");
+		LOG_INFO("[UDP] 身份认证通过，隧道可用（阶段3完成）");
 		if (!m_register_token.empty()) {
-			LOG_ERR("[UDP] 提示：注册成功，register_token 已一次性作废；\n"
-				"      已自动清空 config.ini 的 RegisterToken，下次连接自动为登录模式\n");
+			LOG_INFO("[UDP] 提示：注册成功，register_token 已一次性作废；"
+				"已自动清空 config.ini 的 RegisterToken，下次连接自动为登录模式");
 		}
 	}
 
@@ -553,7 +557,7 @@ void UDP::send_work()
 			continue;
 		}
 		size_t paysize = buf.data_size();
-		if (paysize > VPN_MTU) {
+		if (paysize > KMax_data_payload) {
 			buf.clear();
 			continue;
 		}
@@ -617,36 +621,61 @@ void UDP::recv_work()
 		if (ret <= 0) {
 			continue;
 		}
+		// 只接受目标服务器（m_sockaddr）的回包：
+		// UDP socket 未 bind/connect，任何第三方都能往本端端口发包，
+		// 不校验来源可能被伪造注入（伪造 data 直通 TUN）。
+		// 本协议服务器总是从收到的源地址回包（server 用 s.peer_addr），
+		// 来源 IP/端口必须与客户端发送目标一致。
+		if (peer_addr.sin_addr.s_addr != m_sockaddr.sin_addr.s_addr ||
+			peer_addr.sin_port != m_sockaddr.sin_port)
+		{
+			char src_buf[INET_ADDRSTRLEN] = { 0 };
+			char dst_buf[INET_ADDRSTRLEN] = { 0 };
+			::InetNtopA(AF_INET, &peer_addr.sin_addr, src_buf, sizeof(src_buf));
+			::InetNtopA(AF_INET, &m_sockaddr.sin_addr, dst_buf, sizeof(dst_buf));
+			LOG_DBG("[UDP] 丢弃非目标服务器报文: %s:%u (期望 %s:%u)\n",
+				src_buf, ntohs(peer_addr.sin_port),
+				dst_buf, ntohs(m_sockaddr.sin_port));
+			continue;
+		}
 		if (static_cast<size_t>(ret) < Ktunnel_header) {
 			continue;
 		}
 		tunnel_header header{};
 		memcpy(&header, recv_buf.data(), Ktunnel_header);
 		if (header.magic != Kmagic) {
+			// 来源不是本协议对端（扫描垃圾流量 / 服务端协议完全不同）
+			LOG_ERR("[UDP] 收到非法 magic=0x%08X 的报文，丢弃\n", header.magic);
 			continue;
 		}
 		if (header.version != static_cast<uint8_t>(Kversion)) {
+			// 魔数对但版本不同：几乎总是服务端二进制版本与客户端不一致
+			LOG_ERR("[UDP] 协议版本不匹配: 收到 v%u, 本端 v%u —— 服务端版本可能与客户端不一致，丢弃\n",
+				static_cast<unsigned>(header.version), static_cast<unsigned>(Kversion));
 			continue;
 		}
 		size_t payload_len = ntohs(header.payload_len);
 		if (payload_len > Max_payload_len) {
+			LOG_ERR("[UDP] payload 超长: %zu 字节，丢弃\n", payload_len);
 			continue;
 		}
 		// 校验报文完整性：头部 + payload 长度不超过实际收到字节数
 		if (static_cast<size_t>(ret) < Ktunnel_header + payload_len) {
+			LOG_ERR("[UDP] 报文不完整: 实际 %d 字节 < 头部+%zu，丢弃\n", ret, payload_len);
 			continue;
 		}
 		// 任何合法报文都视为对端存活
 		m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 		const uint8_t* payload = recv_buf.data() + Ktunnel_header;
 
-		// 密文类型：密钥就绪后 data/heart/identity 等均为 AES-GCM 密文，先解密再按内层类型分发
+		// 密文类型：密钥就绪后 data/heart/identity/disconnect 等均为 AES-GCM 密文，先解密再按内层类型分发
 		if (header.type == static_cast<uint8_t>(m_data) ||
 			header.type == static_cast<uint8_t>(m_heart) ||
 			header.type == static_cast<uint8_t>(m_heart_response) ||
 			header.type == static_cast<uint8_t>(m_identity) ||
 			header.type == static_cast<uint8_t>(m_identity_ok) ||
-			header.type == static_cast<uint8_t>(m_identity_deny))
+			header.type == static_cast<uint8_t>(m_identity_deny) ||
+			header.type == static_cast<uint8_t>(disconnect))
 		{
 			if (!m_enc_ready.load())
 			{
@@ -705,7 +734,7 @@ void UDP::recv_work()
 					const uint32_t ip = ntohl(ip_net);
 					m_assigned_ip.store(ip);
 					m_assigned_prefix = inner_payload[4];
-					LOG_ERR("[UDP] 服务端分配虚拟 IP: %u.%u.%u.%u/%u\n",
+					LOG_INFO("[UDP] 服务端分配虚拟 IP: %u.%u.%u.%u/%u",
 						(ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
 						static_cast<unsigned>(m_assigned_prefix));
 				}
@@ -714,6 +743,10 @@ void UDP::recv_work()
 				// 阶段3：身份验证被拒绝；内层首字节为原因码 0=未注册 1=令牌无效/已使用
 				m_auth_deny_reason.store(inner_payload.empty() ? -1 : static_cast<int>(inner_payload[0]));
 				m_auth_failed.store(true);
+				break;
+			case disconnect:
+				// 服务端显式断开（密文内层）：标记重连
+				m_need_reconnect.store(true);
 				break;
 			default:
 				break;
@@ -728,6 +761,10 @@ void UDP::recv_work()
 		{
 			// 阶段1：服务器响应 [nonce_s(16) || DH_SRV_EPHEM_PUB(32) || sig_srv(64)]
 			if (payload_len != KAuthServerHelloLen) {
+				// 长度不符几乎总是服务端二进制版本与客户端不一致（协议字段变更），
+				// 必须可见，否则表现为"无任何日志的握手超时"
+				LOG_ERR("[UDP] ServerHello 长度不匹配: 收到 %u 字节, 期望 %zu —— 服务端版本可能与客户端不一致\n",
+					static_cast<unsigned>(payload_len), KAuthServerHelloLen);
 				break;
 			}
 			m_nonce_s.assign(payload, payload + KAuthNonceLen);
@@ -766,20 +803,14 @@ void UDP::recv_work()
 		case m_heart_response:
 			// 心跳确认：可用于链路检测，暂不处理
 			break;
-		case m_data:
-		{
-			// 密钥未就绪前的明文数据包（兼容/降级路径）
-			if (payload_len == 0) {
-				break;
-			}
-			packet_buffer pbuf(const_cast<uint8_t*>(payload), payload_len);
-			m_recvqueue.push(std::move(pbuf));
+		case m_data: {
+			// 明文数据兼容路径已删除：伪造源地址的明文 m_data 可在密钥就绪前未认证注入 TUN（高危）。
+			// 数据面只接受 AES-256-GCM 密文（上方密文分支），与服务端行为一致。
 			break;
 		}
 		case disconnect:
-			// 对端 FIN：回复 FIN（近似 FIN+ACK），并标记需要重连
-			send_packet(static_cast<uint8_t>(disconnect), nullptr, 0, sendbuf);
-			m_need_reconnect.store(true);
+			// 明文 disconnect 不再受理：服务端从不发送明文 disconnect，
+			// 受理它只会让伪造源地址的报文触发客户端重连风暴
 			break;
 		default:
 			break;

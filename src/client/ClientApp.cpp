@@ -1,6 +1,7 @@
 
 #include "ClientApp.h"
 #include <cstdarg>
+#include "tun_macro.h"   // LOG_INFO 等分级日志宏（logger.h 只有 LOG_ERR/LOG_KEY/LOG_DBG）
 #include"../src/util/utf.h"   // narrow/to_wstring/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
 namespace {
 
@@ -43,7 +44,7 @@ MCowBQYDK2VwAyEA+A73aBlJFR3H7ozQ0os5SduqQIga6zIpfI5VSFlGE0A=
 )";
 #else
 const std::string kServerSigPubPem = R"(-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAE9IPOxEDucOHUEhHJ2oZKUhH4wGqV6tgVxdJzhHqQS4=
+MCowBQYDK2VwAyEAQJKqZ2TRYWoyzZynyNACpTZAUPPXVEPNsM8Vb1qpBCU=
 -----END PUBLIC KEY-----
 )";
 #endif
@@ -64,6 +65,7 @@ void ClientApp::emit_log(const char* fmt, ...)
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    LOG_INFO("%s", buf);
     if (m_onLog)
     {
         m_onLog(buf);
@@ -108,7 +110,6 @@ bool ClientApp::init()
     // 启动兜底清扫（只执行一次，且在 bridge 工作线程，不会卡 GUI）：
     // 上次进程异常退出（崩溃/被杀/断电）时，黑洞 DNS / DisableSmartNameResolution
     // 可能残留。restore() 会把残留的 0.0.0.0 黑洞 DNS 清回 DHCP 自动并恢复注册表策略，
-    // 保证"电脑断网"不会跨进程残留——下次启动自动恢复，不需要手动改网卡。
     m_dnsGuard.restore();
 
     m_configDir = Config::GetAppDataRoaming() + L"\\ScholarVPN";
@@ -230,6 +231,17 @@ bool ClientApp::init()
     else
     {
         LOG_KEY("[Config] config.ini not found (%s), using defaults", narrow(m_configPath).c_str());
+    }
+
+    // 多服务器：LoadClientConfig 已把 servers[0] 的 ServerPubKey 同步进主字段。
+    // 非空时用它覆盖内置硬编码公钥（与 set_server() 的包装逻辑一致），
+    // 避免"未走 set_server() 直连"时阶段1验签用错服务器公钥。
+    if (!m_cfg.ServerPubKey.empty())
+    {
+        m_serverSigPubPem = "-----BEGIN PUBLIC KEY-----\n"
+                          + narrow(m_cfg.ServerPubKey)
+                          + "\n-----END PUBLIC KEY-----\n";
+        LOG_KEY("[Identity] 已应用服务器 %ls 配置的 ServerPubKey 验签", m_cfg.ServerIP.c_str());
     }
 
 #ifndef _DEBUG
@@ -472,51 +484,80 @@ bool ClientApp::start()
 
 void ClientApp::tun_to_udp_loop()
 {
+    // 桥接线程兜底：任何异常（内存耗尽/Wintun/加密层）只记日志继续，
+    // 绝不能穿过 std::thread 边界——否则 std::terminate 直接崩溃进程
     while (m_running.load())
     {
-        auto u = m_mgr ? m_mgr->udp() : nullptr;
-        if (!u || !u->is_handshaked())
+        try
         {
+            auto u = m_mgr ? m_mgr->udp() : nullptr;
+            if (!u || !u->is_handshaked())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            DWORD len = 0;
+            uint8_t* pkt = m_tun->read_packet(&len);
+            if (pkt && len > 0)
+            {
+                m_txPkts.fetch_add(1);
+                m_txBytes.fetch_add(len);
+                packet_buffer buf(pkt, len);
+                m_tun->release_read_packet(pkt);
+                u->send_ip_packet(std::move(buf));
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERR("[Bridge] tun->udp 异常（已忽略继续）: %s", e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
         }
-        DWORD len = 0;
-        uint8_t* pkt = m_tun->read_packet(&len);
-        if (pkt && len > 0)
+        catch (...)
         {
-            m_txPkts.fetch_add(1);
-            m_txBytes.fetch_add(len);
-            packet_buffer buf(pkt, len);
-            m_tun->release_read_packet(pkt);
-            u->send_ip_packet(std::move(buf));
-        }
-        else
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            LOG_ERR("[Bridge] tun->udp 未知异常（已忽略继续）");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }
 
 void ClientApp::udp_to_tun_loop()
 {
+    // 桥接线程兜底：同 tun_to_udp_loop，异常不穿线程边界
     while (m_running.load())
     {
-        auto u = m_mgr ? m_mgr->udp() : nullptr;
-        if (!u)
+        try
         {
+            auto u = m_mgr ? m_mgr->udp() : nullptr;
+            if (!u)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            packet_buffer buf;
+            if (!u->recv_ip_packet(buf))
+            {
+                continue;
+            }
+            if (!buf.is_empty())
+            {
+                m_rxPkts.fetch_add(1);
+                m_rxBytes.fetch_add(buf.data_size());
+                m_tun->write_packet(buf.get_data(), static_cast<DWORD>(buf.data_size()));
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERR("[Bridge] udp->tun 异常（已忽略继续）: %s", e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
         }
-        packet_buffer buf;
-        if (!u->recv_ip_packet(buf))
+        catch (...)
         {
-            continue;
-        }
-        if (!buf.is_empty())
-        {
-            m_rxPkts.fetch_add(1);
-            m_rxBytes.fetch_add(buf.data_size());
-            m_tun->write_packet(buf.get_data(), static_cast<DWORD>(buf.data_size()));
+            LOG_ERR("[Bridge] udp->tun 未知异常（已忽略继续）");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }

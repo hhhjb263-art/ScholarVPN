@@ -119,6 +119,7 @@ bool DnsLeakGuard::protect(NET_LUID keepLuid)
 
         Backup bk;
         bk.guid = g;
+        bk.ifIndex = a->IfIndex;
         bk.ipv4Dns = dns;
         if (gotSettings)
         {
@@ -147,7 +148,77 @@ bool DnsLeakGuard::protect(NET_LUID keepLuid)
     // 刷新 DNS 解析缓存让配置立即生效
     flush_dns_cache();
 
+    // 派生崩溃看门狗：本进程退出（含崩溃/被杀）后自动复位这些网卡的 DNS，
+    // 覆盖 restore() 来不及执行的异常退出。正常退出时 restore() 先行，看门狗幂等无害。
+    spawn_crash_watchdog();
+
     return ok;
+}
+
+// 派生分离的 PowerShell 看门狗：
+//   Wait-Process 等本进程退出 → 逐网卡复位（DHCP→自动 / 静态→写回原值）。
+//   用 InterfaceIndex 而非网卡名，避免中文网卡名的编码问题。
+void DnsLeakGuard::spawn_crash_watchdog()
+{
+    if (m_backup.empty())
+        return;
+
+    auto trim = [](const std::wstring& s) {
+        const size_t b = s.find_first_not_of(L" \t");
+        if (b == std::wstring::npos)
+            return std::wstring();
+        const size_t e = s.find_last_not_of(L" \t");
+        return s.substr(b, e - b + 1);
+    };
+
+    std::wstring cmd =
+        L"powershell.exe -NoProfile -WindowStyle Hidden -Command \""
+        L"Wait-Process -Id " + std::to_wstring(::GetCurrentProcessId()) +
+        L" -ErrorAction SilentlyContinue;";
+
+    for (const auto& bk : m_backup)
+    {
+        if (bk.wasDhcp)
+        {
+            // 原 DHCP 自动获取：复位为自动（等价"恢复为默认"）
+            cmd += L" Set-DnsClientServerAddress -InterfaceIndex "
+                 + std::to_wstring(bk.ifIndex) + L" -ResetServerAddresses;";
+        }
+        else if (!bk.ipv4Dns.empty())
+        {
+            // 原静态 DNS：写回原串（可能是 "1.1.1.1,8.8.8.8" 逗号分隔，拆开逐个加引号）
+            cmd += L" Set-DnsClientServerAddress -InterfaceIndex "
+                 + std::to_wstring(bk.ifIndex) + L" -ServerAddresses";
+            const std::wstring dns = bk.ipv4Dns;
+            size_t pos = 0;
+            bool first = true;
+            while (pos < dns.size())
+            {
+                size_t comma = dns.find(L',', pos);
+                if (comma == std::wstring::npos)
+                    comma = dns.size();
+                const std::wstring item = trim(dns.substr(pos, comma - pos));
+                pos = comma + 1;
+                if (item.empty())
+                    continue;
+                cmd += (first ? L" '" : L",'") + item + L"'";
+                first = false;
+            }
+            cmd += L";";
+        }
+    }
+    cmd += L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi))
+    {
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+    }
+    // 派生失败静默忽略：还有正常 restore() 和下次启动的残留清理两层兜底
 }
 
 // 恢复全部备份的 DNS + 恢复多宿主解析设置 + 清理崩溃残留的黑洞
@@ -170,8 +241,8 @@ void DnsLeakGuard::restore()
                 {
                     if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
                         continue;
-                    if (a->OperStatus != IfOperStatusUp)
-                        continue;
+                    // 注意：不过滤 OperStatus！崩溃发生时某网卡可能恰好断开（如 Wi-Fi 掉线），
+                    // 黑洞残留在其配置里，重新连接后才会暴露——宕着的网卡也必须扫描清理。
                     GUID g{};
                     if (ConvertInterfaceLuidToGuid(&a->Luid, &g) != NO_ERROR)
                         continue;

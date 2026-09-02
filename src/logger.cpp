@@ -95,8 +95,12 @@ void Log(const char* fmt, ...)
 
         line = "[" + CurrentTimestamp() + "] " + msg;
 
-        // 控制台输出（Debug 下即为最终日志；Release 下仍打印，便于前台调试）
-        std::puts(line.c_str());
+        // 控制台输出：仅当进程有控制台时打印（打包为 Windows 子系统无控制台时跳过，
+        // 日志仍写文件 + 转发 UI 的 g_sink，不影响使用）
+        if (::GetConsoleWindow() != nullptr)
+        {
+            std::puts(line.c_str());
+        }
 
         // 写文件（Init 后可用）
         if (g_logFile)

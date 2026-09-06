@@ -221,6 +221,17 @@ bool UDP::start(const std::string& local_ip, uint16_t local_port,
     if (setsockopt(m_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
         fprintf(stderr, "[UDP] setsockopt(SO_REUSEADDR) failed: %s\n", strerror(errno));
     }
+    // 放大收发缓冲：默认 8KB 在突发/高带宽下丢包（UDP 无重传，丢包由上层 TCP
+    // 重传兜底但会严重降速）；4MB 缓冲对突发有足够吸收能力
+    {
+        const int bufsize = 4 * 1024 * 1024;
+        if (setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0) {
+            fprintf(stderr, "[UDP] setsockopt(SO_RCVBUF) failed: %s\n", strerror(errno));
+        }
+        if (setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0) {
+            fprintf(stderr, "[UDP] setsockopt(SO_SNDBUF) failed: %s\n", strerror(errno));
+        }
+    }
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(local_port);
@@ -358,6 +369,10 @@ bool UDP::recv_ip_packet(packet_buffer& buf)
 
 // 发送
 // 通用发送；密钥/序号/目标地址取自 Session（多用户隔离）。
+// TCP：循环写直到全部发出（send 可能部分写；对端断开返回 false，
+// 上层 send_packet 失败 -> 心跳超时清理会话）
+static bool send_all_fd(int fd, const uint8_t* data, size_t len, const std::string& peer_key);
+
 bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
                       std::vector<uint8_t>& tmp_buf)
 {
@@ -374,7 +389,9 @@ bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
     tunnel_header hdr{};
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = Kmagic;
-    hdr.version = Kversion;
+    // 版本字节即传输标识：TCP 会话标 v_tcp，UDP 会话标 v_udp
+    hdr.version = (s.tcp_fd >= 0) ? static_cast<uint8_t>(v_tcp)
+                                  : static_cast<uint8_t>(v_udp);
     hdr.type = type;
     hdr.payload_len = htons(static_cast<uint16_t>(len));
     uint32_t seq = s.seq.fetch_add(1);
@@ -418,6 +435,10 @@ bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
             memcpy(tmp_buf.data() + Ktunnel_header, data, len);
     }
 
+    if (s.tcp_fd >= 0) {
+        // TCP 会话：循环写直到整帧发出（send 可能部分写）
+        return send_all_fd(s.tcp_fd, tmp_buf.data(), total_len, s.peer_key);
+    }
     int ret = sendto(m_sock, tmp_buf.data(), total_len, 0,
                      reinterpret_cast<struct sockaddr*>(&s.peer_addr), sizeof(s.peer_addr));
     if (ret == -1) {
@@ -427,6 +448,26 @@ bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
     if (static_cast<size_t>(ret) != total_len) {
         fprintf(stderr, "[UDP] sendto() partial send: %d / %zu bytes\n", ret, total_len);
         return false;
+    }
+    return true;
+}
+
+// TCP：循环写直到全部发出（send 可能部分写；对端断开返回 false，
+// 上层 send_packet 失败 -> 心跳超时清理会话）
+static bool send_all_fd(int fd, const uint8_t* data, size_t len, const std::string& peer_key)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, data + off, len - off, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            fprintf(stderr, "[TCP] send() failed (%s): %s\n", peer_key.c_str(), strerror(errno));
+            return false;
+        }
+        off += static_cast<size_t>(n);
     }
     return true;
 }
@@ -523,7 +564,9 @@ void UDP::recv_work()
 
         tunnel_header hdr{};
         memcpy(&hdr, recvbuf.data(), Ktunnel_header);
-        if (hdr.magic != Kmagic || hdr.version != Kversion)
+        // 注意：版本字段在此不校验——TCP 帧标 v_tcp、UDP 标 v_udp，
+        // 由 handle_framed 按会话传输类型（expect_ver）统一校验
+        if (hdr.magic != Kmagic)
             continue;
         size_t pay_len = ntohs(hdr.payload_len);
         if (pay_len > Max_payload_len || pay_len + Ktunnel_header > static_cast<size_t>(ret))
@@ -533,99 +576,121 @@ void UDP::recv_work()
         std::shared_ptr<Session> s = get_or_create_session(peer_addr);
         if (!s)
             continue;
-        s->last_rx_ms.store(static_cast<int64_t>(now_ms()));   // 任何合法报文都视为对端存活
-        if (g_packet_log) {
-            char ipstr[INET_ADDRSTRLEN] = {0};
-            inet_ntop(AF_INET, &peer_addr.sin_addr, ipstr, sizeof(ipstr));
-            fprintf(stderr, "[UDP][RX] type=%d len=%zu from=%s:%u\n",
-                    hdr.type, pay_len, ipstr, ntohs(peer_addr.sin_port));
-        }
-        const uint8_t* payload = recvbuf.data() + Ktunnel_header;
+        // 任何合法报文都视为对端存活 + 解密分发/阶段1握手：UDP 与 TCP 两条路径共用
+        handle_framed(*s, hdr, recvbuf.data() + Ktunnel_header, pay_len);
+    }
+}
 
-        // 加密类型：密钥就绪后 data/heart/identity/disconnect 均为密文
-        if (hdr.type == static_cast<uint8_t>(m_data) ||
-            hdr.type == static_cast<uint8_t>(m_heart) ||
-            hdr.type == static_cast<uint8_t>(m_heart_response) ||
-            hdr.type == static_cast<uint8_t>(m_identity) ||
-            hdr.type == static_cast<uint8_t>(m_identity_ok) ||
-            hdr.type == static_cast<uint8_t>(m_identity_deny) ||
-            hdr.type == static_cast<uint8_t>(disconnect)) {
-            if (!s->enc_ready.load()) {
-                continue;   // 密钥未就绪，丢弃
-            }
-            std::vector<uint8_t> enc(payload, payload + pay_len);
-            std::optional<std::vector<uint8_t>> plain;
-            try {
-                plain = aes256_gcm_decrypt(s->key_c2s, enc, recvbuf.data(), Ktunnel_header);
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[UDP] 解密异常: %s\n", e.what());
-                continue;
-            }
-            if (!plain) {
-                continue;   // 认证失败，静默丢弃
-            }
-            uint8_t inner_type = 0;
-            std::vector<uint8_t> inner_payload;
-            if (!parse_inner_packet(*plain, inner_type, inner_payload))
-                continue;
-            switch (inner_type) {
-            case m_data:
-                if (inner_payload.empty())
-                    break;
-                if (!s->authenticated.load())
-                    break;   // 身份未验证通过前禁止把数据转发进 TUN
-                m_queue_recv.push(packet_buffer(std::move(inner_payload)));
-                break;
-            case m_heart:
-                reply_heartbeat(*s);
-                break;
-            case m_heart_response:
-                break;
-            case m_identity:
-                // 阶段3：身份报文（验签 + 注册/登录）
-                handle_identity(*s, inner_payload);
-                break;
-            case m_identity_ok:
-            case m_identity_deny:
-                // 服务端角色不应收到这些，忽略
-                break;
-            case disconnect:
-                // 客户端显式断开（密文内层）：立即释放会话，每源配额即时归还。
-                // 注意 release_session 会把 s 从表中移除，之后不要再使用 s
-                fprintf(stderr, "[UDP] 客户端断开: %s\n", s->peer_key.c_str());
-                release_session(s->peer_key);
-                break;
-            default:
-                break;
-            }
-            continue;
-        }
+// 处理一条已分帧的完整消息（UDP recv 循环与 TCPServer 共用）：
+// 明文阶段1认证 / 密文解密分发（data/heart/identity/disconnect）。
+// TCP 会话（s.tcp_fd >= 0）按 v_tcp 校验/标记版本，UDP 会话按 v_udp
+void UDP::handle_framed(Session& s, const tunnel_header& hdr,
+                        const uint8_t* payload, size_t pay_len)
+{
+    s.last_rx_ms.store(static_cast<int64_t>(now_ms()));   // 任何合法报文都视为对端存活
+    if (g_packet_log) {
+        char ipstr[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &s.peer_addr.sin_addr, ipstr, sizeof(ipstr));
+        fprintf(stderr, "[UDP][RX] type=%d len=%zu from=%s (tcp=%d)\n",
+                hdr.type, pay_len, s.peer_key.c_str(), s.tcp_fd >= 0 ? 1 : 0);
+    }
 
-        // 明文类型：阶段1 认证 / 断开
-        switch (hdr.type) {
-        case m_auth_hello:
-            handle_auth_hello(*s, payload, pay_len);
-            break;
-        case m_auth_client_hello:
-            handle_auth_client_hello(*s, payload, pay_len);
-            break;
-        case m_data: {
-            // 明文数据兼容路径已删除：握手后的明文 m_data 可被伪造源地址
-            // 未认证注入 TUN（高危）。数据面只接受 AES-256-GCM 密文（下方密文分支）。
-            break;
+    // 期望的协议版本：按会话传输类型区分（错误传输的报文在此被丢弃）
+    const uint8_t expect_ver = (s.tcp_fd >= 0) ? static_cast<uint8_t>(v_tcp)
+                                               : static_cast<uint8_t>(v_udp);
+    if (hdr.version != expect_ver) {
+        fprintf(stderr, "[UDP] 协议版本不匹配: 收到 v%u 期望 v%u (%s)，丢弃\n",
+                static_cast<unsigned>(hdr.version), static_cast<unsigned>(expect_ver),
+                s.peer_key.c_str());
+        return;
+    }
+    // AAD = 本帧帧头起始地址（UDP = 数据报起始；TCP = 接收缓冲中帧起始），
+    // 两条路径均满足 payload - Ktunnel_header
+    const uint8_t* aad = payload - Ktunnel_header;
+
+    // 加密类型：密钥就绪后 data/heart/identity/disconnect 均为密文
+    if (hdr.type == static_cast<uint8_t>(m_data) ||
+        hdr.type == static_cast<uint8_t>(m_heart) ||
+        hdr.type == static_cast<uint8_t>(m_heart_response) ||
+        hdr.type == static_cast<uint8_t>(m_identity) ||
+        hdr.type == static_cast<uint8_t>(m_identity_ok) ||
+        hdr.type == static_cast<uint8_t>(m_identity_deny) ||
+        hdr.type == static_cast<uint8_t>(disconnect)) {
+        if (!s.enc_ready.load()) {
+            return;   // 密钥未就绪，丢弃
         }
+        std::vector<uint8_t> enc(payload, payload + pay_len);
+        std::optional<std::vector<uint8_t>> plain;
+        try {
+            plain = aes256_gcm_decrypt(s.key_c2s, enc, aad, Ktunnel_header);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[UDP] 解密异常: %s\n", e.what());
+            return;
+        }
+        if (!plain) {
+            return;   // 认证失败，静默丢弃
+        }
+        uint8_t inner_type = 0;
+        std::vector<uint8_t> inner_payload;
+        if (!parse_inner_packet(*plain, inner_type, inner_payload))
+            return;
+        switch (inner_type) {
+        case m_data:
+            if (inner_payload.empty())
+                break;
+            if (!s.authenticated.load())
+                break;   // 身份未验证通过前禁止把数据转发进 TUN
+            m_queue_recv.push(packet_buffer(std::move(inner_payload)));
+            break;
         case m_heart:
-            reply_heartbeat(*s);
+            reply_heartbeat(s);
             break;
         case m_heart_response:
             break;
+        case m_identity:
+            // 阶段3：身份报文（验签 + 注册/登录）
+            handle_identity(s, inner_payload);
+            break;
+        case m_identity_ok:
+        case m_identity_deny:
+            // 服务端角色不应收到这些，忽略
+            break;
         case disconnect:
-            // 明文 disconnect 已不再受理：伪造源地址可一包踢人。
-            // 会话生命周期由心跳超时统一管理，无需显式断开消息
+            // 客户端显式断开（密文内层）：立即释放会话，每源配额即时归还。
+            // 注意 release_session 会把 s 从表中移除，之后不要再使用 s
+            fprintf(stderr, "[UDP] 客户端断开: %s\n", s.peer_key.c_str());
+            release_session(s.peer_key);
             break;
         default:
             break;
         }
+        return;
+    }
+
+    // 明文类型：阶段1 认证 / 断开
+    switch (hdr.type) {
+    case m_auth_hello:
+        handle_auth_hello(s, payload, pay_len);
+        break;
+    case m_auth_client_hello:
+        handle_auth_client_hello(s, payload, pay_len);
+        break;
+    case m_data: {
+        // 明文数据兼容路径已删除：握手后的明文 m_data 可被伪造源地址
+        // 未认证注入 TUN（高危）。数据面只接受 AES-256-GCM 密文（上方密文分支）。
+        break;
+    }
+    case m_heart:
+        reply_heartbeat(s);
+        break;
+    case m_heart_response:
+        break;
+    case disconnect:
+        // 明文 disconnect 已不再受理：伪造源地址可一包踢人。
+        // 会话生命周期由心跳超时统一管理，无需显式断开消息
+        break;
+    default:
+        break;
     }
 }
 
@@ -938,10 +1003,17 @@ void UDP::heartbeat_work()
         std::chrono::duration_cast<std::chrono::milliseconds>(kHeartbeatTimeout).count());
     const uint64_t hs_timeout_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(kHandshakeTimeout).count());
+    // 首次扫描在 10s 后，之后每 10s 一次；期间每 100ms 醒一次检查停止标志，
+    // 保证 stop()/SIGTERM 能快速 join 本线程（原先整段睡 10s 会让优雅退出卡近 10s，
+    // 导致 stop/restart 看起来无效、需 kill -9，甚至被 watchdog 漏杀成孤儿）
+    auto next_due = std::chrono::steady_clock::now() + kHeartbeatInterval;
     while (is_running()) {
-        std::this_thread::sleep_for(kHeartbeatInterval);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (!is_running())
             break;
+        if (std::chrono::steady_clock::now() < next_due)
+            continue;
+        next_due = std::chrono::steady_clock::now() + kHeartbeatInterval;
         const uint64_t now = now_ms();
         std::vector<std::shared_ptr<Session>> sessions;
         {

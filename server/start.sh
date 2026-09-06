@@ -16,7 +16,8 @@
 #   sudo ./start.sh uninstall 卸载 systemd 服务
 #   sudo ./start.sh doctor    诊断环境（systemd/服务/进程/日志），排查断开问题
 #
-# 环境变量可覆盖：TUN_IP=10.8.0.1 VPN_PORT=51820 QUIET=0 ... 等
+# 环境变量可覆盖：TUN_IP=10.8.0.1 VPN_PORT=51820 TRANSPORT=both QUIET=0 ... 等
+#   TRANSPORT=both|udp|tcp  传输方式（默认 both：UDP 与 TCP 同端口同时监听）
 #   QUIET=1 关闭数据包级次要日志，只保留重点日志（公网服务器推荐）
 # ============================================================
 set -e
@@ -29,8 +30,9 @@ TUN_IP="${TUN_IP:-10.8.0.1}"
 TUN_PREFIX="${TUN_PREFIX:-24}"
 TUN_MTU="${TUN_MTU:-1400}"
 TUN_NET="${TUN_NET:-10.8.0.0/24}"
-VPN_PORT="${VPN_PORT:-51820}"
+VPN_PORT="${VPN_PORT:-51820}"          # UDP 与 TCP 同端口同时监听（双栈）
 LISTEN_IP="${LISTEN_IP:-0.0.0.0}"
+TRANSPORT="${TRANSPORT:-both}"           # 传输方式：both|udp|tcp（默认 both = UDP+TCP 同端口）
 KEY_PATH="${KEY_PATH:-$SCRIPT_DIR/keys/server_sig.key}"
 MAX_CLIENTS="${MAX_CLIENTS:-0}"     # 最大并发客户端数，0=服务端默认(64)；多用户自动分配虚拟 IP
 ENABLE_IPV6="${ENABLE_IPV6:-0}"        # 1=同时开启 IPv6 转发
@@ -38,6 +40,7 @@ ENABLE_IPV6="${ENABLE_IPV6:-0}"        # 1=同时开启 IPv6 转发
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"        # 重点日志保存目录（按天轮转）
 RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/run}"           # PID / 标志文件目录
 LOG_FILE="$LOGS_DIR/vpn-server-$(date +%Y%m%d).log"
+LOG_OWNER="${LOG_OWNER:-${SUDO_USER:-}}"       # 以 root（sudo）运行时，把日志/密钥归还原主用户（调用者）
 PID_FILE="$RUN_DIR/vpn_server.watchdog.pid"     # watchdog 守护进程 PID
 VPID_FILE="$RUN_DIR/vpn_server.pid"             # 实际 vpn_server 进程 PID
 STOP_FLAG="$RUN_DIR/.vpn_server.stop"           # 停止标志（watchdog 据此不再重启）
@@ -77,6 +80,7 @@ is_running() {
 }
 
 do_status() {
+    # 托管进程（有 PID 文件且存活）优先
     if is_running; then
         local vpid=""
         [ -f "$VPID_FILE" ] && vpid="$(cat "$VPID_FILE")"
@@ -88,16 +92,33 @@ do_status() {
         echo "    日志: $LOG_FILE"
         return 0
     fi
+    # 无 PID 文件但存在 vpn_server 进程 = 孤儿残留（前次异常退出/另开终端直跑）
+    # 它占用 vpn0 与端口，会让后续 start 报"已在运行"
+    local orphan
+    orphan="$(pgrep -x vpn_server 2>/dev/null | tr '\n' ' ')"
+    if [ -n "$orphan" ]; then
+        echo "[*] 检测到孤儿 vpn_server 进程（无 PID 文件，PID: ${orphan}）"
+        echo "    该进程未被本脚本托管，会占用 vpn0/端口导致无法启动"
+        echo "    清理: sudo ./start.sh stop"
+        return 1
+    fi
     echo "[*] vpn_server 未运行"
     rm -f "$PID_FILE" "$VPID_FILE" "$STOP_FLAG"
     return 1
 }
 
 do_stop() {
-    if [ ! -f "$PID_FILE" ] && [ ! -f "$VPID_FILE" ]; then
+    # 判断是否“需要停止”：托管进程或孤儿进程，二者任一存在都要清理
+    local managed=0 orphan=0
+    [ -f "$PID_FILE" ] || [ -f "$VPID_FILE" ] && managed=1
+    pgrep -x vpn_server >/dev/null 2>&1 && orphan=1
+    if [ "$managed" = "0" ] && [ "$orphan" = "0" ]; then
         echo "[*] vpn_server 未运行，无需停止"
         rm -f "$PID_FILE" "$VPID_FILE" "$STOP_FLAG"
         return 0
+    fi
+    if [ "$orphan" = "1" ] && [ "$managed" = "0" ]; then
+        echo "[*] 检测到孤儿 vpn_server 进程（无 PID 文件），将强制清理"
     fi
     echo "[*] 停止 vpn_server ..."
     # 1) 置停止标志，通知 watchdog 不要再重启
@@ -120,8 +141,13 @@ do_stop() {
         [ "$alive" = "0" ] && break
         sleep 0.1
     done
-    # 强制清理
-    if [ -f "$VPID_FILE" ]; then vpid="$(cat "$VPID_FILE")"; [ -n "$vpid" ] && kill -0 "$vpid" 2>/dev/null && kill -9 "$vpid" 2>/dev/null || true; fi
+    # 强制清理：vpn_server 一律按进程名兜底强杀（不能只依赖 PID 文件——
+    # watchdog 收到 TERM 退出时会删除 VPID_FILE，若 vpn_server 优雅退出超时
+    # 会漏杀，留下孤儿占用 vpn0，导致后续启动报 Device or resource busy）
+    if pgrep -x vpn_server >/dev/null 2>&1; then
+        pkill -9 -x vpn_server 2>/dev/null || true
+    fi
+    # watchdog 守护进程兜底
     if [ -f "$PID_FILE" ]; then wpid="$(cat "$PID_FILE")"; [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null && kill -9 "$wpid" 2>/dev/null || true; fi
     rm -f "$PID_FILE" "$VPID_FILE" "$STOP_FLAG"
     echo "[*] 已停止"
@@ -186,7 +212,7 @@ do_doctor() {
     fi
     if [ -f /etc/default/vpn-server ]; then
         echo "    环境文件: /etc/default/vpn-server (存在；编辑后 systemctl restart vpn-server 生效)"
-        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|MAX_CLIENTS|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
+        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|TRANSPORT|MAX_CLIENTS|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
     else
         echo "    环境文件: 无 (/etc/default/vpn-server 缺失，使用 start.sh 默认参数)"
     fi
@@ -255,6 +281,7 @@ do_install() {
         echo "TUN_NET=\"$TUN_NET\""
         echo "VPN_PORT=\"$VPN_PORT\""
         echo "LISTEN_IP=\"$LISTEN_IP\""
+        echo "TRANSPORT=\"$TRANSPORT\""
         echo "KEY_PATH=\"$KEY_PATH\""
         echo "MAX_CLIENTS=\"$MAX_CLIENTS\""
         echo "ENABLE_IPV6=\"$ENABLE_IPV6\""
@@ -332,6 +359,30 @@ if [ "$ENABLE_IPV6" = "1" ]; then
     echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-vpn.conf
 fi
 
+# ===== 1.1 内核缓冲上限调高（配合程序内 4MB SO_RCVBUF/SO_SNDBUF 生效）=====
+# Linux 默认 net.core.rmem_max/wmem_max≈208KB，setsockopt 超过上限会被内核
+# 静默截断——TCP 传输模式收发窗口打不开，长肥网络（高带宽×高RTT）吞吐上不去。
+# 程序请求 4MB（内核实际约双倍 8MB），这里把上限放到 16MB。
+echo "[*] 调高内核 socket 缓冲上限（TCP 高吞吐必需）"
+echo 16777216 > /proc/sys/net/core/rmem_max 2>/dev/null || true
+echo 16777216 > /proc/sys/net/core/wmem_max 2>/dev/null || true
+echo 4194304  > /proc/sys/net/core/rmem_default 2>/dev/null || true
+echo 4194304  > /proc/sys/net/core/wmem_default 2>/dev/null || true
+# 持久化（与 ip_forward 同一文件）
+if [ -d /etc/sysctl.d ]; then
+    SYSCTL_FILE=/etc/sysctl.d/99-vpn.conf
+    grep -q "^net.core.rmem_max"  "$SYSCTL_FILE" 2>/dev/null || echo "net.core.rmem_max=16777216"  >> "$SYSCTL_FILE"
+    grep -q "^net.core.wmem_max"  "$SYSCTL_FILE" 2>/dev/null || echo "net.core.wmem_max=16777216"  >> "$SYSCTL_FILE"
+    grep -q "^net.core.rmem_default" "$SYSCTL_FILE" 2>/dev/null || echo "net.core.rmem_default=4194304" >> "$SYSCTL_FILE"
+    grep -q "^net.core.wmem_default" "$SYSCTL_FILE" 2>/dev/null || echo "net.core.wmem_default=4194304" >> "$SYSCTL_FILE"
+else
+    for kv in "net.core.rmem_max=16777216" "net.core.wmem_max=16777216" \
+              "net.core.rmem_default=4194304" "net.core.wmem_default=4194304"; do
+        key="${kv%%=*}"
+        grep -q "^${key}" /etc/sysctl.conf 2>/dev/null || echo "$kv" >> /etc/sysctl.conf
+    done
+fi
+
 # ===== 2. 检测出口网卡（iproute2，回退 ip addr）=====
 detect_iface() {
     local iface
@@ -356,14 +407,18 @@ setup_firewall() {
             iptables -A FORWARD -i "$TUN_NAME" -o "$IFACE" -j ACCEPT
         iptables -C FORWARD -i "$IFACE" -o "$TUN_NAME" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
             iptables -A FORWARD -i "$IFACE" -o "$TUN_NAME" -m state --state ESTABLISHED,RELATED -j ACCEPT
+        # vpn_server 同端口双栈监听：UDP 与 TCP 一律放行
         iptables -C INPUT -p udp --dport "$VPN_PORT" -j ACCEPT 2>/dev/null || \
             iptables -A INPUT -p udp --dport "$VPN_PORT" -j ACCEPT
+        iptables -C INPUT -p tcp --dport "$VPN_PORT" -j ACCEPT 2>/dev/null || \
+            iptables -A INPUT -p tcp --dport "$VPN_PORT" -j ACCEPT
         return 0
     fi
     # 3.2 回退 nftables（先删旧表保证幂等）
     if command -v nft >/dev/null 2>&1; then
         echo "[*] 使用 nftables 配置 NAT / 转发 / 端口"
         nft delete table inet vpn 2>/dev/null || true
+        # vpn_server 同端口双栈监听：UDP 与 TCP 一律放行
         nft -f - <<EOF
 table inet vpn {
     chain forward {
@@ -374,6 +429,7 @@ table inet vpn {
     chain input {
         type filter hook input priority 0; policy accept;
         udp dport $VPN_PORT accept
+        tcp dport $VPN_PORT accept
     }
     chain postrouting {
         type nat hook postrouting priority 100;
@@ -389,18 +445,25 @@ setup_firewall
 
 # ===== 4. 补充：ufw / firewalld 放行端口（若存在）=====
 if command -v ufw >/dev/null 2>&1; then
-    echo "[*] ufw 放行 UDP/$VPN_PORT"
+    echo "[*] ufw 放行 UDP/$VPN_PORT + TCP/$VPN_PORT"
     ufw allow "$VPN_PORT/udp" >/dev/null 2>&1 || true
+    ufw allow "$VPN_PORT/tcp" >/dev/null 2>&1 || true
 fi
 if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-    echo "[*] firewalld 放行 UDP/$VPN_PORT"
+    echo "[*] firewalld 放行 UDP/$VPN_PORT + TCP/$VPN_PORT"
     firewall-cmd --permanent --add-port="$VPN_PORT/udp" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port="$VPN_PORT/tcp" >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
 # ===== 5. 启动 vpn_server =====
+case "$TRANSPORT" in
+    tcp) LISTEN_DESC="TCP/$VPN_PORT" ;;
+    udp) LISTEN_DESC="UDP/$VPN_PORT" ;;
+    *)   LISTEN_DESC="UDP+TCP/$VPN_PORT" ;;
+esac
 ARGS=(-l "$LISTEN_IP" -p "$VPN_PORT" -n "$TUN_NAME" -a "$TUN_IP"
-      --prefix "$TUN_PREFIX" --mtu "$TUN_MTU" -k "$KEY_PATH")
+      --prefix "$TUN_PREFIX" --mtu "$TUN_MTU" -k "$KEY_PATH" --transport both)
 if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
     ARGS+=(--max-clients "$MAX_CLIENTS")
 fi
@@ -413,12 +476,24 @@ fi
 
 if [ "$DAEMON" = "1" ]; then
     mkdir -p "$LOGS_DIR" "$RUN_DIR"
+    # 以 root（sudo）运行：把日志目录归属还给调用者（user），
+    # 这样 VS Code 等以普通用户运行的工具也能读日志/管理日志
+    if [ -n "$LOG_OWNER" ]; then
+        chown "$LOG_OWNER" "$LOGS_DIR" 2>/dev/null || true
+    fi
+    # 若存在无 PID 文件的残留 vpn_server（孤儿，占用 vpn0），先提示清理，
+    # 避免新实例反复 EBUSY 启动失败
+    if ! is_running && pgrep -x vpn_server >/dev/null 2>&1; then
+        echo "[错误] 检测到残留 vpn_server 进程（无守护 PID 文件，可能占用 vpn0）" >&2
+        echo "       请先执行: sudo ./start.sh stop，再重新启动" >&2
+        exit 1
+    fi
     if is_running; then
         echo "[错误] vpn_server 已在运行（守护 PID $(cat "$PID_FILE")），请先执行 stop" >&2
         exit 1
     fi
     rm -f "$STOP_FLAG" "$VPID_FILE"
-    ARGS_STR="-l $LISTEN_IP -p $VPN_PORT -n $TUN_NAME -a $TUN_IP --prefix $TUN_PREFIX --mtu $TUN_MTU -k $KEY_PATH"
+    ARGS_STR="-l $LISTEN_IP -p $VPN_PORT -n $TUN_NAME -a $TUN_IP --prefix $TUN_PREFIX --mtu $TUN_MTU -k $KEY_PATH --transport both"
     if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
         ARGS_STR="$ARGS_STR --max-clients $MAX_CLIENTS"
     fi
@@ -430,6 +505,7 @@ if [ "$DAEMON" = "1" ]; then
 set +e
 VPN_BIN="$VPN_BIN"
 LOG_FILE="$LOG_FILE"
+LOG_OWNER="$LOG_OWNER"
 VPID_FILE="$VPID_FILE"
 STOP_FLAG="$STOP_FLAG"
 ARGS_STR="$ARGS_STR"
@@ -439,6 +515,11 @@ TSTAMP(){ date '+%F %T'; }
 trap '[ -f "$STOP_FLAG" ] || touch "$STOP_FLAG"' TERM INT
 while true; do
     rm -f "$STOP_FLAG"
+    # 按天轮转会产生新日志文件：确保每次启动前文件已存在并归还原主用户
+    touch "\$LOG_FILE" 2>/dev/null || true
+    if [ -n "\$LOG_OWNER" ]; then
+        chown "\$LOG_OWNER" "\$LOG_FILE" 2>/dev/null || true
+    fi
     "\$VPN_BIN" \$ARGS_STR >> "\$LOG_FILE" 2>&1 &
     VPID=\$!
     echo "\$VPID" > "\$VPID_FILE"
@@ -460,6 +541,7 @@ WDE
     chmod +x "$RUN_DIR/watchdog.sh"
     export MAX_RESTARTS
     echo "[*] 后台启动 vpn_server（异常退出将自动重启）..."
+    echo "    监听: $LISTEN_IP:$VPN_PORT ($LISTEN_DESC)"
     echo "    日志模式: $LOG_DESC"
     echo "    重点日志: $LOG_FILE"
     # 彻底脱离当前 SSH 终端：新会话 + 忽略挂断 + 解除 job 关联
@@ -480,7 +562,14 @@ WDE
         exit 1
     fi
 else
-    echo "[*] 前台启动 vpn_server: listen=$LISTEN_IP:$VPN_PORT tun=$TUN_NAME($TUN_IP/$TUN_PREFIX mtu=$TUN_MTU)"
+    # 前台启动前检查：已有实例（daemon / 残留前台）在运行则拒绝，
+    # 避免第二个实例因 vpn0 已被占用而报 "Device or resource busy" 的困惑
+    if pgrep -x vpn_server >/dev/null 2>&1; then
+        echo "[错误] vpn_server 已在运行，请勿重复启动（当前状态: sudo ./start.sh status）" >&2
+        echo "       如需前台调试：先执行 sudo ./start.sh stop，再运行本命令" >&2
+        exit 1
+    fi
+    echo "[*] 前台启动 vpn_server: listen=$LISTEN_IP:$VPN_PORT ($LISTEN_DESC) tun=$TUN_NAME($TUN_IP/$TUN_PREFIX mtu=$TUN_MTU)"
     echo "    key=$KEY_PATH"
     echo "    日志模式: $LOG_DESC"
     echo "    [按 Ctrl+C 退出]"

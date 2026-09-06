@@ -236,6 +236,9 @@ bool ClientApp::init()
     // 多服务器：LoadClientConfig 已把 servers[0] 的 ServerPubKey 同步进主字段。
     // 非空时用它覆盖内置硬编码公钥（与 set_server() 的包装逻辑一致），
     // 避免"未走 set_server() 直连"时阶段1验签用错服务器公钥。
+    // 覆盖前先备份内置公钥：切换到"未配置自定义公钥"的服务器时恢复用，
+    // 否则上一台的自定义公钥会残留，导致验签必失败（公钥串台）
+    m_builtinServerSigPubPem = m_serverSigPubPem;
     if (!m_cfg.ServerPubKey.empty())
     {
         m_serverSigPubPem = "-----BEGIN PUBLIC KEY-----\n"
@@ -311,10 +314,16 @@ bool ClientApp::init()
     // 隧道未建立时默认路由指向 TUN 就是"黑洞"，全部流量进 TUN 被丢，
     // 物理网卡 DNS 被清空则 DNS 解析全挂（表现为浏览器没网）。
     // 默认路由 + DNS 防护必须等握手成功（Connected 回调）才激活。
-    if (!m_route->add_server_bypass_route(to_wstring(m_remote)))
+    // 多服务器模式（m_remote 为空）：此刻尚无目标服务器，跳过；
+    // 由 start() 在 set_server() 指定目标后补加（空 IP 的 InetPton 必失败，
+    // 否则 init() 整体失败，表现为"初始化失败"永远连不上）。
+    if (!m_remote.empty())
     {
-        LOG_ERR("Failed to add server bypass route");
-        return false;
+        if (!m_route->add_server_bypass_route(to_wstring(m_remote)))
+        {
+            LOG_ERR("Failed to add server bypass route");
+            return false;
+        }
     }
 
     emit_log("ClientApp initialized, server=%s:%u", m_remote.c_str(), static_cast<int>(m_port));
@@ -335,7 +344,19 @@ bool ClientApp::start()
     // 白遍历一遍网卡；且 m_running 已置 true，若 restore 内部异常会卡死状态机。
     // 启动兜底已移到 init()（只在程序启动/首次连接时执行一次）。
 
+    // set_server() 可能已切换/首次指定目标服务器：这里补加 bypass 路由，
+    // 保证握手包走物理网卡到达服务器（init() 时 m_remote 为空会跳过）。
+    // create_route 对已存在的同前缀路由返回成功，重复添加无害。
+    if (m_route && !m_remote.empty() &&
+        !m_route->add_server_bypass_route(to_wstring(m_remote)))
+    {
+        LOG_ERR("Failed to add server bypass route");
+        m_running.store(false);
+        return false;
+    }
+
     m_mgr = std::make_unique<ReconnectManager>(m_remote, m_port, 256);
+    m_mgr->set_transport(m_transport);
     m_mgr->set_identity(m_ed25519Priv, m_serverSigPubPem,
                         narrow(m_cfg.ClientID), narrow(m_cfg.RegisterToken));
 
@@ -632,16 +653,22 @@ void ClientApp::set_server(const ServerEntry& entry)
 {
     m_remote = narrow(entry.ServerIP);
     m_port = static_cast<uint16_t>(entry.ServerPort);
+    m_transport = entry.transport ? Transport::TCP : Transport::UDP;
     m_cfg.ClientID = entry.ClientID;
     m_cfg.RegisterToken = entry.RegisterToken;
-    // 服务器身份公钥：该服务器配置了公钥就用它验签（多服务器各自独立），
-    // 为空则保留内置硬编码公钥
+    // 服务器身份公钥：该服务器配置了公钥就用它验签（多服务器各自独立）；
+    // 为空则恢复内置硬编码公钥——绝不能保留上一台服务器的自定义公钥，
+    // 否则切换服务器后拿 A 的公钥验 B 的签名，验签必失败（公钥串台）
     if (!entry.ServerPubKey.empty())
     {
         m_serverSigPubPem = "-----BEGIN PUBLIC KEY-----\n"
                           + narrow(entry.ServerPubKey)
                           + "\n-----END PUBLIC KEY-----\n";
         emit_log("已加载服务器公钥（用于验签防中间人）: %s", m_remote.c_str());
+    }
+    else
+    {
+        m_serverSigPubPem = m_builtinServerSigPubPem;
     }
     emit_log("已选择服务器: %s:%u, ClientID=%s", m_remote.c_str(), static_cast<int>(m_port),
              narrow(m_cfg.ClientID).c_str());

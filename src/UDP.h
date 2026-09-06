@@ -6,12 +6,22 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+// 传输方式：一条隧道连接二选一（协议层完全一致，仅承载不同）
+enum class Transport : uint8_t { UDP = 0, TCP = 1 };
 
-class UDP{
+// ============================================================
+// 隧道对端基类：三阶段认证 / AES-256-GCM / 心跳 / 收发队列全部在此实现，
+// 传输差异（UDP 数据报 / TCP 流式）由子类覆写 4 个钩子：
+//   open_socket / establish / raw_send / recv_frame
+// 子类：UDP（本文件，默认）与 TCP（tcp.h）
+// 协议版本字节即传输标识：发送打标 / 接收校验（proto_version 虚函数）
+// ============================================================
+class UDP {
 public:
     UDP(
         const char* remoteip,
@@ -19,9 +29,15 @@ public:
         bool is_running = false,
         size_t queueMax = 4096
     );
-    ~UDP();
-    bool init();
-    void stop();
+    virtual ~UDP();
+    virtual bool init();
+    virtual void stop();
+    // 协议版本字节随传输变化：UDP 报文标 v_udp，TCP 子类覆写为 v_tcp。
+    // 发送时打标、接收时校验——错误传输的报文在 version 检查处自然被丢弃
+    virtual uint8_t proto_version() const
+    {
+        return static_cast<uint8_t>(v_udp);
+    }
     // ---- 重连状态机查询接口 ----
     bool is_handshaked() const { return m_handshaked.load(); }
     bool is_authenticated() const { return m_authenticated.load(); }
@@ -55,13 +71,27 @@ public:
     uint32_t GenerateISN();
 public:
     void send_work();
-    void recv_work();
+    void recv_work();   // 收包循环：recv_frame 取一条消息 -> handle_frame 统一处理
+protected:
+    // ---- 传输钩子（子类覆写；基类实现 = UDP）----
+    virtual SOCKET open_socket();      // UDP: SOCK_DGRAM；TCP: SOCK_STREAM
+    virtual bool establish();          // UDP: 无连接 no-op；TCP: connect + TCP_NODELAY
+    virtual bool raw_send(const uint8_t* data, size_t len);   // UDP: sendto；TCP: send_all
+    // 取一条完整消息（数据报天然一条；TCP 由子类分帧凑齐）
+    // 返回 false = 连接已死亡（收包线程退出，实例随后被销毁）
+    // got = true 时 payload 指针在下次调用前有效
+    virtual bool recv_frame(tunnel_header& hdr, const uint8_t*& payload,
+                            size_t& pay_len, bool& got);
 private:
     // 阶段3：组装并签名身份报文（不含内层 type 字节，send_packet 会补）
     bool build_identity_message(std::vector<uint8_t>& out);
-private:
+protected:
     SOCKET m_sock;
     sockaddr_in m_sockaddr{};
+    std::vector<uint8_t> m_udpBuf;                // UDP recvfrom 缓冲（成员保证 payload 指针有效）
+    std::mutex m_send_mutex;                      // 串行化 send_packet 的 socket 写：
+                                                  // send_work 与 recv_work（心跳应答）两个线程
+                                                  // 可能同时发送，TCP 流式写必须整帧原子（防粘帧交错）
     PacketQueue m_sendqueue;
     PacketQueue m_recvqueue;
     std::thread send_thread;
@@ -99,8 +129,11 @@ private:
     std::vector<std::uint8_t> m_key_c2s;        // key_tx 客户端→服务端（本端发送加密）
     std::vector<std::uint8_t> m_key_s2c;        // key_rx 服务端→客户端（本端接收解密）
     std::atomic<bool> m_enc_ready{ false };     // 密钥派生完成（阶段2 结束）
-private:
+protected:
     // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 tunnel_protoco.h（两端一致）；
     // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限
     static constexpr size_t KMax_packet_size = 1441;
+
+    void handle_frame(const tunnel_header& header, const uint8_t* payload,
+                      size_t payload_len, std::vector<uint8_t>& sendbuf);
 };

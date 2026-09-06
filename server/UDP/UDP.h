@@ -46,15 +46,22 @@ public:
     int client_count() const;
     size_t max_clients() const { return m_max_clients; }
 
+    // 处理一条已分帧的完整消息（TCPServer 与 UDP recv 循环共用）：
+    // 明文阶段1认证 / 密文解密分发（data/heart/identity/disconnect）。
+    // TCP 会话（s.tcp_fd >= 0）按 v_tcp 校验/标记版本，UDP 会话按 v_udp
+    void handle_framed(Session& s, const tunnel_header& hdr,
+                       const uint8_t* payload, size_t pay_len);
+    // 从表移除 + 释放虚拟 IP + 标记下线（TCPServer 连接断开时也调用）
+    void release_session(const std::string& key);
+    // 取/建会话（TCPServer accept 后也调用；pending 配额/每源上限对 TCP 同样生效）
+    std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr);
+
 private:
     void send_work();
     void recv_work();
     void heartbeat_work();
     bool start_threads();
     void stop_threads();
-
-    std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr);
-    void release_session(const std::string& key);   // 从表移除 + 释放虚拟 IP + 标记下线
 
     uint32_t allocate_virtual_ip();
     void release_virtual_ip(uint32_t ip);

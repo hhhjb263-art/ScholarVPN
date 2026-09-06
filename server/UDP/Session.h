@@ -73,6 +73,8 @@ struct Session
     sockaddr_in peer_addr{};          // 客户端 UDP 地址（recvfrom 源地址）
     std::string peer_key;             // "ip:port"，会话表键
     std::string peer_ip;              // 客户端来源 IP（每源会话数限制用）
+    int tcp_fd = -1;                  // TCP 会话的连接 socket（UDP 会话 -1）；
+                                      // send_packet 按 fd 分流，心跳/认证回包对 TCP 同样生效
 
     // 阶段3 通过后填充
     std::string client_id;            // 客户端标识

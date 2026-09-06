@@ -11,6 +11,8 @@ struct ServerEntry
     std::wstring Name;          // 显示名，如 "服务器A"
     std::wstring ServerIP;      // 服务器 IP
     int ServerPort = 51820;
+    // 传输方式：0 = UDP（默认），1 = TCP（应对运营商丢 UDP，可配合 443 端口）
+    uint8_t transport = 0;
     // 每台服务器各自的认证身份（各服务器独立注册）
     std::wstring ClientID;      // 该服务器的客户端标识
     std::wstring RegisterToken; // 该服务器的一次性注册令牌（空=登录模式）

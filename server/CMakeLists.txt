@@ -18,6 +18,7 @@ add_library(vpn_modules STATIC
     Buffer/PacketBuffer.cpp
     Buffer/QueueBuffer.cpp
     UDP/UDP.cpp
+    TCP/tcpserver.cpp
     tun/tun.cpp
     LinuxAdapter/LinuxAdapter.cpp
     core/VpnCore.cpp
@@ -29,6 +30,7 @@ target_include_directories(vpn_modules PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/Buffer
     ${CMAKE_CURRENT_SOURCE_DIR}/UDP
+    ${CMAKE_CURRENT_SOURCE_DIR}/TCP
     ${CMAKE_CURRENT_SOURCE_DIR}/tun
     ${CMAKE_CURRENT_SOURCE_DIR}/LinuxAdapter
     ${CMAKE_CURRENT_SOURCE_DIR}/core

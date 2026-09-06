@@ -1,0 +1,107 @@
+================================================================
+ ScholarVPN TCP 传输模式改造清单
+================================================================
+目标：在现有 UDP 隧道之外增加 TCP 承载（应对运营商/校园卡丢 UDP）。
+核心原则：协议层零改动——三阶段认证 / AES-256-GCM / 心跳报文格式
+原样复用，只把"数据报承载"换成"流式承载"，每条消息 =
+tunnel_header(12B) + payload，按 payload_len 做分帧。
+
+----------------------------------------------------------------
+一、协议层（1 处小改）
+----------------------------------------------------------------
+[tunnel_protoco.h]
+  1. version 枚举已有 v_tcp = 2，无需新增
+  2. 新增流式帧规则说明（注释即可）：
+     - TCP 上每条消息 = tunnel_header + payload
+     - 接收侧：先读满 12 字节 header -> 解出 payload_len
+       -> 继续读满 payload_len 字节（处理粘包/半包）
+     - 发送侧：一次 send 可能只写出一部分，必须循环写完
+  3. 建议常量：kFrameHeaderLen = Ktunnel_header
+
+----------------------------------------------------------------
+二、服务端（新增 1 个模块 + 3 处接入）
+----------------------------------------------------------------
+[新增 server/TCPServer.h / TCPServer.cpp]  ~300 行
+  1. listen 线程：socket/bind/listen/accept
+     - 每个 accept 到的连接创建一个 Session（复用现有结构）
+     - 会话键：client 的 ip:port（与 UDP 一致）
+     - accept 后设 TCP_NODELAY（禁 Nagle，降低隧道延迟）
+  2. 每连接 recv 线程：
+     - 维护连接级接收缓冲（std::vector + 偏移量）
+     - 状态机：读 header(12B) -> 读 payload(payload_len) -> 分发
+     - 复用现有分发逻辑：密文解密 -> 内层类型 switch
+       （m_data / m_heart / m_identity / disconnect）
+       明文阶段1：m_auth_hello / m_auth_client_hello
+     - 连接断开（recv 返回 0 / 错误）-> release_session
+  3. send：send_all 循环写（send 返回值可能小于请求长度）
+     - 复用 send_packet 的加密逻辑，只是落盘方式换成 send_all
+  4. 背压策略（实现前必须定）：
+     - 发送队列满（Slow consumer）-> 断开该客户端（推荐，
+       与 UDP 模式丢包容忍语义一致，避免阻塞转发线程）
+
+[改 server/core/VpnCore.cpp]
+  1. Config 加 transport 字段（enum: UDP / TCP / BOTH，默认 BOTH）
+  2. init/start/stop 按 transport 启动/停止对应监听
+  3. 转发桥接零改动（面向 Session 的 send/recv 队列抽象不变）
+
+[改 server/main.cpp]
+  1. 新增 --transport udp|tcp|both 参数（默认 both）
+  2. 帮助文本更新
+
+[改 server/UDP/UDP.cpp]（可选，推荐）
+  1. 把三阶段认证 handler（handle_auth_hello / handle_auth_client_hello /
+     handle_identity）抽成自由函数或 mixin，UDP/TCP 两个传输层共用，
+     避免 ~300 行认证逻辑复制两份
+
+[CMakeLists.txt]
+  1. vpn_modules 源列表加 TCPServer.cpp
+  2. 无新外部依赖
+
+----------------------------------------------------------------
+三、客户端（3 处改动）
+----------------------------------------------------------------
+[改 src/UDP.h / UDP.cpp]  ~200 行
+  1. 构造/连接：socket(AF_INET, SOCK_STREAM) + connect()
+     替代 bind + sendto/recvfrom
+     - connect 失败立即返回（比 UDP 的 4s 等待快，重连更灵敏）
+  2. send_work：send_all 循环写；包边界由帧头保证
+  3. recv_work：按帧读取（同服务端状态机），整帧到手后走
+     现有解密/分发逻辑（零改动）
+  4. 心跳：保留（TCP 断开也能靠 recv 返回 0 立即感知，
+     心跳用于探测半开连接）
+
+[改 Config.h + Config.cpp]
+  1. ServerEntry 新增 transport 字段（0=UDP 默认，1=TCP）
+  2. LoadClientConfig / SaveClientConfig 读写 [ServerN] Transport 键
+
+[改 src/gui/QtWidgetsClass.cpp]
+  1. 添加/编辑服务器对话框：新增"协议"下拉框（UDP / TCP）
+  2. 预填 + 写回 ini
+
+----------------------------------------------------------------
+四、部署 / 运维（2 处）
+----------------------------------------------------------------
+1. start.sh：透传 --transport（环境变量 TRANSPORT），双栈时
+   防火墙/安全组同时放行 UDP+TCP 同端口
+2. README：协议说明更新（校园卡/物联网卡场景推荐 TCP+443）
+
+----------------------------------------------------------------
+五、实现顺序建议
+----------------------------------------------------------------
+1. 服务端：抽公共认证 handler -> TCPServer 骨架 -> curl/nc 联调分帧
+2. 服务端：接入 VpnCore + --transport
+3. 客户端：UDP 类 TCP 分支 -> GUI 协议选择
+4. 联调：UDP 客户端 + TCP 客户端同时在线（both 模式）
+5. 压测：慢消费者背压 / 断开清理 / 每 IP 上限对 TCP 同样生效
+   （TCPServer 需接入 get_or_create_session 同一套防护）
+
+----------------------------------------------------------------
+六、设计决策点（实现前确认）
+----------------------------------------------------------------
+1. 背压：队列满 -> 断开慢客户端（推荐）还是阻塞转发线程
+2. 端口：TCP/UDP 同端口双栈（推荐，安全组只开一次）还是分开
+3. 校园卡场景：TCP 直接用 443 端口（流量形态最像 HTTPS）
+4. TCP-over-TCP 拥塞叠加：学习项目可接受，不做优化
+5. TCP 模式无丢包 -> PacketQueue 满时的丢弃语义改为断开/阻塞
+   （与第 1 点联动）
+================================================================

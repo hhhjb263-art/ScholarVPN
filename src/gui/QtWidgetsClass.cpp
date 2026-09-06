@@ -10,7 +10,7 @@
 #include <QPlainTextEdit>
 #include <QRegularExpression>
 #include <QStyle>
-
+#include<QComboBox>
 
 
 
@@ -692,7 +692,7 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	)");
 
 	QLabel* lab_name = new QLabel(card);
-	lab_name->setGeometry(78, 22, 300, 26);
+	lab_name->setGeometry(78, 22, 210, 26);   // 右侧留出传输下拉框的位置
 	lab_name->setText(name);
 	lab_name->setStyleSheet("background:transparent; font-size:11pt; font-weight:bold; color:#1f2937;");
 
@@ -701,6 +701,43 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	lab_ip->setText("IP: " + ip);
 	lab_ip->setStyleSheet("background:transparent; font-family:Consolas,'Courier New',monospace; font-size:9pt; color:#6b7280;");
 
+	// 传输方式下拉框：UDP / TCP（userData = ServerEntry.transport，0=UDP 1=TCP）
+	QComboBox* box_sock = new QComboBox(card);
+	box_sock->setGeometry(296, 20, 92, 24);
+	box_sock->setCursor(Qt::PointingHandCursor);
+	box_sock->addItem(QStringLiteral("UDP"), 0);
+	box_sock->addItem(QStringLiteral("TCP"), 1);
+	box_sock->setCurrentIndex(entry.transport ? 1 : 0);
+	box_sock->setStyleSheet(R"(
+	QComboBox{
+		background-color:#f1f3f7;
+		border:1px solid #e2e6ee;
+		border-radius:6px;
+		padding:2px 6px;
+		color:#1f2937;
+		font-size:9pt;
+	}
+	QComboBox::drop-down{ border:none; width:16px; }
+	QComboBox QAbstractItemView{
+		background-color:#ffffff;
+		border:1px solid #e2e6ee;
+		selection-background-color:#eef5ff;
+		selection-color:#1f2937;
+	}
+	)");
+	const int sockIdx = static_cast<int>(m_cards.size());
+	// 选择即持久化：写入该服务器的 Transport 配置并同步内存（连接时生效）
+	connect(box_sock, &QComboBox::currentIndexChanged, this, [this, sockIdx, box_sock](int index) {
+		if (sockIdx < 0 || sockIdx >= (int)m_cardServers.size())
+			return;
+		m_cardServers[sockIdx].transport = box_sock->itemData(index).toInt() ? 1 : 0;
+		const QString inipath = QString::fromStdWString(
+			Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini");
+		QSettings settings(inipath, QSettings::IniFormat);
+		settings.setValue(QString("Server%1/Transport").arg(sockIdx + 1),
+			m_cardServers[sockIdx].transport);
+		settings.sync();
+	});
 	card->installEventFilter(this);   // 整卡可点 → 选中
 
 	m_cardLayout->insertWidget(m_cardLayout->count() - 1, card);

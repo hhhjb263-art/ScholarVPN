@@ -55,6 +55,9 @@ public:
     // 注册成功后调用：清除内存中的令牌，后续重连直接走登录
     void clear_register_token() { m_register_token.clear(); }
 
+    // 选择传输方式（必须在 start() 之前调用；默认 UDP）
+    void set_transport(Transport t) { m_transport = t; }
+
     // 测试用：模拟一次断线，触发状态机自动重连
     void force_disconnect_for_test();
 
@@ -70,6 +73,7 @@ private:
     std::string m_remote;
     uint16_t m_port;
     size_t m_queueMax;
+    Transport m_transport{ Transport::UDP };   // 传输方式：UDP（默认）/ TCP
 
     // 身份（三阶段认证）
     std::shared_ptr<EVP_PKEY> m_ed25519_priv;      // 客户端身份私钥 SIG_CLI_PRI

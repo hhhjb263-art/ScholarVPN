@@ -8,6 +8,7 @@
 
 #include "../tun/tun.h"
 #include "../UDP/UDP.h"
+#include "../TCP/tcpserver.h"
 #include "../LinuxAdapter/LinuxAdapter.h"
 
 // VPN 核心（服务端）：把 TUN 虚拟网卡与 UDP 隧道桥接起来。
@@ -67,7 +68,8 @@ private:
 private:
     Config m_cfg;
     Tun m_tun;                     // 虚拟网卡
-    UDP m_udp;                     // UDP 隧道（服务端：绑定监听）
+    UDP m_udp;                     // UDP 隧道（服务端：绑定监听，含会话表/认证/心跳）
+    TCPServer m_tcp{m_udp};        // TCP 监听（同端口双栈，会话表与 UDP 共用）
     LinuxAdapter m_adapter;        // 系统网卡配置（IP/MTU/路由）
     std::thread m_thread_t2u;      // 转发线程1: tun → udp
     std::thread m_thread_u2t;      // 转发线程2: udp → tun

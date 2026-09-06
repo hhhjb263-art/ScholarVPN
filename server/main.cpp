@@ -36,6 +36,7 @@ static void print_usage(const char *prog)
     printf("      --max-clients <n> 最大并发客户端数，自动分配虚拟 IP (默认 64)\n");
     printf("  -g, --gen-token [n]   生成 n 个一次性注册令牌(默认1)追加到 keys/register_tokens.txt 后退出\n");
     printf("      --quiet           关闭数据包级日志，只输出重点日志（公网服务器推荐）\n");
+    printf("      --transport both  传输方式 both|udp|tcp（默认 both：同端口双栈）\n");
     printf("  -h, --help            显示本帮助\n");
 }
 
@@ -107,6 +108,13 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
             cfg.gen_tokens = count;
         }else if(arg == "--quiet"){
             g_packet_log = false;
+        }else if(arg == "--transport"){
+            const char *v = next("both|udp|tcp");
+            if(!v) return false;
+            // 当前版本实现同端口双栈（both）：UDP 与 TCP 同时监听，
+            // 客户端按条目选择传输；单栈开关留待后续
+            if(std::string(v) != "both")
+                fprintf(stderr, "[main] 提示: 当前实现为同端口双栈（both），参数 '%s' 暂被忽略\n", v);
         }else{
             fprintf(stderr, "未知选项: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -159,7 +167,9 @@ int main(int argc, char *argv[])
 
     VpnCore core;
     if(!core.init(cfg)){
-        fprintf(stderr, "[main] 初始化失败（创建 TUN 需要 root 权限）\n");
+        fprintf(stderr,
+                "[main] 初始化失败：请查看上方 [TUN ERROR]/[VpnCore] 日志确认具体原因\n"
+                "       （常见：vpn0 已被占用(Device or resource busy) / 权限不足 / /dev/net/tun 缺失）\n");
         return 1;
     }
     if(!core.start()){

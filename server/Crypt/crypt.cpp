@@ -16,6 +16,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -38,6 +40,30 @@ using KdfPtr = std::unique_ptr<EVP_KDF, decltype(&EVP_KDF_free)>;
 using KdfCtxPtr = std::unique_ptr<EVP_KDF_CTX, decltype(&EVP_KDF_CTX_free)>;
 using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
 using MdCtxPtr = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+
+// 创建密钥文件后修正权限与属主：
+//   私钥恒为 0600（仅属主可读），公钥为 0644（公钥本就应公开，便于分发）。
+//   若以 root 运行（sudo / systemd），把文件属主改为"所在目录的属主"——
+//   例如 keys/ 目录属主是 user，则自动生成的密钥归 user 所有：
+//   项目属主（VS Code）可读可备份，其他本地用户因 0600 仍不可读。
+//   非 root 运行时文件本就属当前用户，仅设置权限即可。
+void fix_key_file_owner(const std::string& private_pem_path,
+                        const std::string& public_pem_path)
+{
+    if (::geteuid() == 0) {
+        const std::string::size_type slash = private_pem_path.find_last_of('/');
+        const std::string dir =
+            (slash == std::string::npos) ? "." : private_pem_path.substr(0, slash);
+        struct stat st {};
+        if (::stat(dir.c_str(), &st) == 0) {
+            ::chown(private_pem_path.c_str(), st.st_uid, st.st_gid);
+            ::chown(public_pem_path.c_str(), st.st_uid, st.st_gid);
+        }
+    }
+    // chown 可能清掉 setuid/setgid 位，因此权限放在 chown 之后设置
+    ::chmod(private_pem_path.c_str(), 0600);
+    ::chmod(public_pem_path.c_str(), 0644);
+}
 
 
 std::string collect_openssl_errors()
@@ -185,6 +211,8 @@ bool generate_x25519_keypair(const std::string& private_pem_path,
         if (PEM_write_PUBKEY(fp.get(), key.get()) != 1)
             return false;
     }
+
+    fix_key_file_owner(private_pem_path, public_pem_path);
 
     return true;
 }
@@ -681,6 +709,8 @@ bool generate_ed25519_keypair(const std::string& private_pem_path,
         if (len > 0 && data != nullptr)
             pub_pem_out.assign(data, static_cast<std::size_t>(len));
     }
+
+    fix_key_file_owner(private_pem_path, public_pem_path);
 
     return true;
 }

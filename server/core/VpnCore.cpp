@@ -85,6 +85,18 @@ bool VpnCore::init(const Config &cfg)
                 std::filesystem::path(m_cfg.key_sig_path).parent_path().string();
             m_udp.set_identity(std::shared_ptr<EVP_PKEY>(priv, EVP_PKEY_free), keys_dir);
             fprintf(stderr, "[VpnCore] 已加载服务器身份私钥: %s\n", m_cfg.key_sig_path.c_str());
+            // 诊断：打印服务器签名用的公钥指纹（与客户端日志的
+            // "客户端验签用的服务器公钥指纹"比对——不一致即密钥配置错误）
+            {
+                unsigned char raw[32];
+                size_t raw_len = sizeof(raw);
+                if (EVP_PKEY_get_raw_public_key(priv, raw, &raw_len) == 1) {
+                    char hex[65] = { 0 };
+                    for (size_t i = 0; i < raw_len && i < 32; ++i)
+                        snprintf(hex + i * 2, 3, "%02x", raw[i]);
+                    fprintf(stderr, "[VpnCore] 服务器身份公钥指纹: %s\n", hex);
+                }
+            }
         } catch(const std::exception &e){
             fprintf(stderr, "[VpnCore] 加载身份私钥 %s 失败: %s\n", m_cfg.key_sig_path.c_str(), e.what());
             stop();
@@ -98,6 +110,14 @@ bool VpnCore::init(const Config &cfg)
     if(!m_udp.start(m_cfg.listen_ip, m_cfg.listen_port,
                     m_cfg.tun_ip, m_cfg.tun_prefix, m_cfg.max_clients)){
         fprintf(stderr, "[VpnCore] udp.start(%s:%u) failed\n",
+                m_cfg.listen_ip.c_str(), m_cfg.listen_port);
+        stop();
+        return false;
+    }
+    // 6) 启动 TCP 监听（同端口双栈）：运营商丢 UDP 的备用通道；
+    //    会话表/认证/加密/心跳与 UDP 共用，客户端按条目选择传输
+    if(!m_tcp.start(m_cfg.listen_ip, m_cfg.listen_port)){
+        fprintf(stderr, "[VpnCore] tcp.start(%s:%u) failed\n",
                 m_cfg.listen_ip.c_str(), m_cfg.listen_port);
         stop();
         return false;
@@ -138,6 +158,8 @@ void VpnCore::stop()
     if(m_thread_u2t.joinable()){
         m_thread_u2t.join();
     }
+    // 停止 TCP 监听（accept 线程退出；存量连接自然终结）
+    m_tcp.stop();
     // 停止 UDP 收发线程
     m_udp.stop();
     // 清理路由与网卡（仅在 TUN 创建成功后才做网卡操作）

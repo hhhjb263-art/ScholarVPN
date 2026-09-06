@@ -80,6 +80,8 @@ private:
 
 	std::shared_ptr<EVP_PKEY> m_ed25519Priv;
 	std::string m_serverSigPubPem;
+	std::string m_builtinServerSigPubPem;   // 内置硬编码公钥备份（切换未配公钥的服务器时恢复，防公钥串台）
+	Transport m_transport{ Transport::UDP };   // 当前服务器条目的传输方式（UDP 默认 / TCP）
 	std::string m_remote;
 	uint16_t m_port = 0;
 

@@ -75,6 +75,10 @@ struct Session
     std::string peer_ip;              // 客户端来源 IP（每源会话数限制用）
     int tcp_fd = -1;                  // TCP 会话的连接 socket（UDP 会话 -1）；
                                       // send_packet 按 fd 分流，心跳/认证回包对 TCP 同样生效
+    std::atomic<bool> tcp_drop{ false };  // TCP 连接请求断开（发送队列满/发送失败/
+                                          // 心跳超时/disconnect/同身份互踢）：
+                                          // fd 由 epoll 事件线程统一 shutdown+close
+                                          // （唯一 owner），其他线程只置本标志
 
     // 阶段3 通过后填充
     std::string client_id;            // 客户端标识

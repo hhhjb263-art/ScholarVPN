@@ -4,19 +4,26 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <poll.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <chrono>
+#include <utility>
 #include <vector>
+#include <system_error>
 
 // ============================================================================
 // TCPServer 实现（类声明见 tcpserver.h）
-// 会话防护（pending 配额 / 每源上限 / 未认证 10s 清理）走 UDP 类的
-// get_or_create_session / release_session，对 TCP 同样生效。
+// epoll 事件驱动：单事件线程管理监听 socket + 全部连接（非阻塞 fd），
+// 取代旧"每连接一个线程 + detach"模型——连接数不再受线程数限制，
+// fd 的 close 全部收敛在本线程（唯一 owner），跨线程只通过 Session.tcp_drop
+// 标志请求断开。会话防护（pending 配额 / 每源上限 / 未认证 10s 清理）走
+// UDP 类的 get_or_create_session / release_session，对 TCP 同样生效。
 // ============================================================================
 
 TCPServer::TCPServer(UDP& udp)
@@ -34,7 +41,7 @@ bool TCPServer::start(const std::string& listen_ip, uint16_t port)
     if (m_running.load())
         return false;
 
-    m_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0) {
         fprintf(stderr, "[TCP] socket() failed: %s\n", strerror(errno));
         return false;
@@ -54,18 +61,62 @@ bool TCPServer::start(const std::string& listen_ip, uint16_t port)
         m_listen_fd = -1;
         return false;
     }
-    if (listen(m_listen_fd, 16) < 0) {
+    if (listen(m_listen_fd, 64) < 0) {
         fprintf(stderr, "[TCP] listen() failed: %s\n", strerror(errno));
         close(m_listen_fd);
         m_listen_fd = -1;
         return false;
     }
 
+    m_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (m_epoll_fd < 0) {
+        fprintf(stderr, "[TCP] epoll_create1() failed: %s\n", strerror(errno));
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = m_listen_fd;
+    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_listen_fd, &ev) < 0) {
+        fprintf(stderr, "[TCP] epoll_ctl(listen) failed: %s\n", strerror(errno));
+        close(m_epoll_fd);
+        m_epoll_fd = -1;
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    // 唤醒管道：stop() 从别的线程写 eventfd，让阻塞中的 epoll_wait 立即返回
+    m_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (m_wake_fd < 0) {
+        fprintf(stderr, "[TCP] eventfd() failed: %s\n", strerror(errno));
+        close(m_epoll_fd);
+        m_epoll_fd = -1;
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    ev.events = EPOLLIN;
+    ev.data.fd = m_wake_fd;
+    epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_wake_fd, &ev);
+
     m_listen_ip = listen_ip;
     m_port = port;
     m_running.store(true);
-    m_accept_thread = std::thread(&TCPServer::accept_loop, this);
-    fprintf(stderr, "[TCP] 监听 %s:%u（同端口双栈，等待客户端 TCP 连接）\n",
+    try {
+        m_event_thread = std::thread(&TCPServer::event_loop, this);
+    } catch (const std::system_error& e) {
+        fprintf(stderr, "[TCP] 启动事件线程失败: %s\n", e.what());
+        m_running.store(false);
+        close(m_wake_fd);
+        m_wake_fd = -1;
+        close(m_epoll_fd);
+        m_epoll_fd = -1;
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    fprintf(stderr, "[TCP] 监听 %s:%u（epoll 事件驱动，同端口双栈，等待客户端 TCP 连接）\n",
             listen_ip.c_str(), static_cast<unsigned>(port));
     return true;
 }
@@ -74,46 +125,115 @@ void TCPServer::stop()
 {
     if (!m_running.exchange(false))
         return;
-    // 关闭监听 socket：accept 的阻塞调用被唤醒并退出线程。
-    // 存量连接由对端断开/心跳超时/进程退出自然终结（学习项目取舍）
+    // 写 eventfd 唤醒 epoll_wait，事件线程在一个周期内退出
+    if (m_wake_fd >= 0) {
+        const uint64_t one = 1;
+        const ssize_t n = write(m_wake_fd, &one, sizeof(one));
+        (void)n;
+    }
+    if (m_event_thread.joinable())
+        m_event_thread.join();
+    // 线程已回收：统一关闭全部连接（本线程接管 fd 所有权，无并发）
+    for (auto& kv : m_conns) {
+        if (kv.second.session && kv.second.session->tcp_fd == kv.first)
+            kv.second.session->tcp_fd = -1;
+        close(kv.first);
+    }
+    m_conns.clear();
     if (m_listen_fd >= 0) {
         close(m_listen_fd);
         m_listen_fd = -1;
     }
-    if (m_accept_thread.joinable())
-        m_accept_thread.join();
+    if (m_epoll_fd >= 0) {
+        close(m_epoll_fd);
+        m_epoll_fd = -1;
+    }
+    if (m_wake_fd >= 0) {
+        close(m_wake_fd);
+        m_wake_fd = -1;
+    }
     fprintf(stderr, "[TCP] 监听已停止\n");
 }
 
-// accept 线程：每连接取/建会话（复用 pending 配额/每源上限防护），
-// 挂上 tcp_fd 后交给独立的分帧收包线程。
-// 用 poll 超时循环而非裸阻塞 accept()：stop() 从别的线程 close() 监听 fd
-// 无法可靠打断 Linux 上阻塞中的 accept()（信号还会被 SA_RESTART 自动重启），
-// 会导致 join(accept 线程) 永远等不到、Ctrl+C 后进程无法退出。
-void TCPServer::accept_loop()
+// 事件线程：epoll_wait 驱动 accept / 读事件 / 断开请求扫描。
+// 200ms 超时兜底：即使没有事件（含 stop() 唤醒丢失的极端情况）也能周期性
+// 检查 m_running 与 tcp_drop 标志
+void TCPServer::event_loop()
 {
+    std::vector<epoll_event> events(64);
     while (m_running.load()) {
-        struct pollfd pfd{};
-        pfd.fd = m_listen_fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        // 500ms 超时：stop() 后最多一个周期内退出（关闭 fd 也会让 poll 返回）
-        const int pr = poll(&pfd, 1, 500);
-        if (pr <= 0)
-            continue;                       // 超时 / fd 已关闭 / 被信号打断：回到循环头检查 m_running
-        if ((pfd.revents & POLLIN) == 0)
-            continue;                       // POLLNVAL/POLLERR 等：下轮重新 poll
+        const int n = epoll_wait(m_epoll_fd, events.data(),
+                                 static_cast<int>(events.size()), 200);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "[TCP] epoll_wait() failed: %s\n", strerror(errno));
+            break;
+        }
+        for (int i = 0; i < n; ++i) {
+            const int fd = events[i].data.fd;
+            if (fd == m_listen_fd) {
+                handle_accept();
+                continue;
+            }
+            if (fd == m_wake_fd) {
+                // stop() 唤醒：清空计数，回循环头检查 m_running
+                uint64_t v = 0;
+                const ssize_t rd = read(m_wake_fd, &v, sizeof(v));
+                (void)rd;
+                continue;
+            }
+            const uint32_t revents = events[i].events;
+            // 事件数组中的 fd 可能已被前一个事件的处理清理：逐个重新查表
+            auto it = m_conns.find(fd);
+            if (it == m_conns.end())
+                continue;
+            if (revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                drop_conn(fd, "对端关闭/连接错误");
+                continue;
+            }
+            if (revents & EPOLLIN) {
+                if (!read_conn(fd, it->second)) {
+                    drop_conn(fd, "读失败/对端关闭");
+                    continue;
+                }
+                if (it->second.session && it->second.session->tcp_drop.load()) {
+                    drop_conn(fd, "会话请求断开");
+                }
+            }
+        }
+        // 扫描其他线程请求断开的连接（发送队列满/发送失败/心跳超时/
+        // disconnect/互踢）。规模 ≤ max-clients 且每 ≤200ms 一次，成本可忽略
+        for (auto it = m_conns.begin(); it != m_conns.end(); ) {
+            const int fd = it->first;
+            const bool drop = it->second.session && it->second.session->tcp_drop.load();
+            ++it;                 // 先前进再 drop（drop_conn 内部会 erase）
+            if (drop)
+                drop_conn(fd, "会话请求断开");
+        }
+    }
+}
 
+// accept：非阻塞排空 backlog，每连接挂会话（复用 pending 配额/每源上限），
+// 注册 epoll 后由事件循环统一分帧处理
+void TCPServer::handle_accept()
+{
+    for (;;) {
         sockaddr_in peer{};
         socklen_t peer_len = sizeof(peer);
-        int fd = accept(m_listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        const int fd = accept4(m_listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len,
+                               SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
-            if (!m_running.load())
-                break;              // stop() 关闭监听导致，正常退出
-            // 瞬时错误（ECONNABORTED 等）：继续 accept，绝不退出线程
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;          // backlog 已排空
+            if (errno == EINTR)
+                continue;
+            if (errno == EMFILE || errno == ENFILE) {
+                fprintf(stderr, "[TCP] accept() fd 耗尽，暂停接收新连接\n");
+                break;
+            }
             fprintf(stderr, "[TCP] accept() failed: %s\n", strerror(errno));
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
+            break;
         }
 
         // TCP_NODELAY：VPN 帧是小包频发（隧道头+密文），Nagle 会累积 40ms 级
@@ -129,84 +249,99 @@ void TCPServer::accept_loop()
         // 取/建会话：pending 配额 / 每 IP 上限 / 未认证快速清理对 TCP 同样生效
         std::shared_ptr<Session> s = m_udp.get_or_create_session(peer);
         if (!s) {
-            close(fd);
-            continue;               // 会话表满：丢弃连接
+            close(fd);         // 会话表满：丢弃连接
+            continue;
         }
         s->tcp_fd = fd;
-        fprintf(stderr, "[TCP] 新连接 %s（当前会话 %d）\n",
-                s->peer_key.c_str(), m_udp.client_count());
+        s->tcp_drop.store(false);
 
-        // 每连接收包线程：分帧 -> handle_framed。detach 简化生命周期：
-        // 线程退出条件 = 连接死亡（自身关 fd + release_session）或进程退出
-        std::thread(&TCPServer::conn_loop, this, s, fd).detach();
+        epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLRDHUP;
+        ev.data.fd = fd;
+        if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            fprintf(stderr, "[TCP] epoll_ctl(ADD) failed: %s\n", strerror(errno));
+            s->tcp_fd = -1;
+            m_udp.release_session(s->peer_key);
+            close(fd);
+            continue;
+        }
+        m_conns[fd] = Conn{ s, {} };
+        fprintf(stderr, "[TCP] 新连接 %s fd=%d（当前会话 %d）\n",
+                s->peer_key.c_str(), fd, m_udp.client_count());
     }
 }
 
-// 每连接收包线程：recv -> 喂接收缓冲 -> 分帧凑齐一条 -> handle_framed。
-// 帧规则：tunnel_header(12B) + payload；客户端 TCP 帧标 v_tcp，
-// handle_framed 内部按会话传输类型（tcp_fd >= 0 -> v_tcp）校验/回包。
-void TCPServer::conn_loop(std::shared_ptr<Session> s, int fd)
+// 读事件：非阻塞 recv 循环排空内核缓冲，一次吃完所有完整帧再回读
+// （应用层读速度最大化，避免内核接收缓冲堆积）。
+// 返回 false = 连接作废（对端关闭/致命错误/非法帧头），调用方 drop
+bool TCPServer::read_conn(int fd, Conn& c)
 {
-    std::vector<uint8_t> rxBuf;         // 接收累积缓冲
-    size_t rxHave = 0;
-    size_t consumed = 0;                // 已交付帧字节数（下次循环先消费）
     std::vector<uint8_t> tmp(1441 + 64);
-
     for (;;) {
-        ssize_t n = recv(fd, tmp.data(), tmp.size(), 0);
-        if (n == 0) {           // 对端优雅关闭
-            fprintf(stderr, "[TCP] 客户端断开: %s\n", s->peer_key.c_str());
-            break;
-        }
+        const ssize_t n = recv(fd, tmp.data(), tmp.size(), 0);
+        if (n == 0)            // 对端优雅关闭
+            return false;
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;         // 内核缓冲已排空：本连接这轮读完
             if (errno == EINTR)
                 continue;
             fprintf(stderr, "[TCP] recv() failed (%s): %s\n",
-                    s->peer_key.c_str(), strerror(errno));
-            break;
+                    c.session ? c.session->peer_key.c_str() : "?", strerror(errno));
+            return false;
         }
-        rxBuf.insert(rxBuf.end(), tmp.data(), tmp.data() + n);
-        rxHave += static_cast<size_t>(n);
+        c.rxBuf.insert(c.rxBuf.end(), tmp.data(), tmp.data() + n);
 
-        // 分帧循环：一次 recv 可能携带多条粘包，凑齐一条处理一条
-        for (;;)
-        {
-            if (rxHave < Ktunnel_header)        // 半包：等下一段数据
-                break;
+        // 分帧：一次 recv 携带的多条粘包全部处理完再回读
+        for (;;) {
+            if (c.rxBuf.size() < Ktunnel_header)
+                break;         // 半包：等下一段数据
             tunnel_header hdr{};
-            memcpy(&hdr, rxBuf.data(), Ktunnel_header);
+            memcpy(&hdr, c.rxBuf.data(), Ktunnel_header);
             if (hdr.magic != Kmagic) {
                 fprintf(stderr, "[TCP] 非法 magic=0x%08X，连接作废 (%s)\n",
-                        hdr.magic, s->peer_key.c_str());
-                close(fd);
-                m_udp.release_session(s->peer_key);
-                return;
+                        hdr.magic, c.session ? c.session->peer_key.c_str() : "?");
+                return false;
             }
-            size_t pay_len = ntohs(hdr.payload_len);            if (pay_len > Max_payload_len) {
-                fprintf(stderr, "[TCP] 帧超长: %zu，连接作废 (%s)\n", pay_len, s->peer_key.c_str());
-                close(fd);
-                m_udp.release_session(s->peer_key);
-                return;
+            const size_t pay_len = ntohs(hdr.payload_len);
+            if (pay_len > Max_payload_len) {
+                fprintf(stderr, "[TCP] 帧超长: %zu，连接作废 (%s)\n", pay_len,
+                        c.session ? c.session->peer_key.c_str() : "?");
+                return false;
             }
-            if (rxHave < Ktunnel_header + pay_len)     // 半包：等下一段数据
-                break;
+            if (c.rxBuf.size() < Ktunnel_header + pay_len)
+                break;         // 半包：等下一段数据
 
-            // 整帧到手：AAD = 帧头起始（handle_framed 内部由 payload 推导）
-            m_udp.handle_framed(*s, hdr, rxBuf.data() + Ktunnel_header, pay_len);
+            // 整帧到手：AAD = 帧头起始（handle_framed 内部由 payload 推导）。
+            // handle_framed 的 disconnect 分支只置 tcp_drop（release 交本函数
+            // 调用后的 drop_conn 统一收尾），之后不要再直接使用 session 表状态
+            if (c.session)
+                m_udp.handle_framed(*c.session, hdr,
+                                     c.rxBuf.data() + Ktunnel_header, pay_len);
+            c.rxBuf.erase(c.rxBuf.begin(),
+                          c.rxBuf.begin() + static_cast<std::ptrdiff_t>(Ktunnel_header + pay_len));
 
-            // handle_framed 的 disconnect 分支可能已 release 会话：
-            // 引用是否仍在表中不再重要，本连接随客户端断开自然终结
-            consumed = Ktunnel_header + pay_len;
-            rxBuf.erase(rxBuf.begin(), rxBuf.begin() + static_cast<std::ptrdiff_t>(consumed));
-            rxHave -= consumed;
+            if (c.session && c.session->tcp_drop.load())
+                return false;  // 处理中断开请求（disconnect/互踢等）：立即收尾
         }
     }
+    return true;
+}
 
-    // 连接死亡统一收尾：关 fd + 释放会话（配额即时归还）
+// 断开收尾：本线程是 fd 唯一 owner。epoll 移除 + close + 会话释放（幂等：
+// 会话可能已被其他路径释放，release_session 内部查表为空直接返回）
+void TCPServer::drop_conn(int fd, const char* reason)
+{
+    auto it = m_conns.find(fd);
+    if (it == m_conns.end())
+        return;
+    const std::shared_ptr<Session> s = std::move(it->second.session);
+    m_conns.erase(it);
+    epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
+    if (!s)
+        return;
+    s->tcp_fd = -1;   // fd 已关闭：send_packet/send_all 不再使用
+    fprintf(stderr, "[TCP] 连接断开 fd=%d (%s): %s\n", fd, s->peer_key.c_str(), reason);
     m_udp.release_session(s->peer_key);
 }

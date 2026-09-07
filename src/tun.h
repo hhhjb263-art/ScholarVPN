@@ -17,10 +17,13 @@ public:
 	bool init_tun(const std::string &TunName,const std::string &tunnelType) override;
 	uint8_t *read_packet(DWORD* outPackLen) override;
 	void release_read_packet(const uint8_t * pkt) override;
-	bool write_packet(const uint8_t * RawIPdata , DWORD len) override;
+	bool write_packet(const uint8_t* RawIPdata , DWORD len) override;
 	NET_LUID get_interface_luid() const override;
 	bool is_ready() const override;
 	uint64_t receive_count() const;
+	// 读等待事件句柄（WintunGetReadWaitEvent）：环形缓冲空时 WaitForSingleObject
+	// 等它，有包到达立即唤醒——替代读循环固定 sleep 轮询；不可用时返回 nullptr
+	HANDLE read_wait_event() const;
 protected:
 	void cleanup_resource() override;
 private:
@@ -42,6 +45,7 @@ private:
 
 	WINTUN_START_SESSION_FUNC * m_fnStartSession = nullptr;
 	WINTUN_END_SESSION_FUNC * m_fnEndSession = nullptr;
+	WINTUN_GET_READ_WAIT_EVENT_FUNC * m_fnGetReadWaitEvent = nullptr;
 	WINTUN_RECEIVE_PACKET_FUNC * m_fnReceivePacket = nullptr;
 	WINTUN_RELEASE_RECEIVE_PACKET_FUNC * m_fnReleaseReceivePacket = nullptr;
 

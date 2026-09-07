@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <poll.h>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -357,7 +358,48 @@ bool UDP::forward_tun_packet(packet_buffer&& buf)
     }
     if (!s || !s->authenticated.load())
         return false;
-    return s->send_queue.push(std::move(buf));
+    if (!s->send_queue.push(std::move(buf))) {
+        // 发送队列满：该客户端持续消费不动（TCP 对端不收 / 链路劣化）。
+        // 按既定策略直接断开而非无限堆积——否则内存无界增长，且
+        // TCP-over-TCP 队头阻塞会把其他会话一起拖死。
+        // TCP 交 epoll 线程统一 close（fd 唯一 owner），UDP 无连接直接释放
+        fprintf(stderr, "[UDP] 发送队列满，断开会话 %s\n", s->peer_key.c_str());
+        if (s->tcp_fd >= 0)
+            s->tcp_drop.store(true);   // epoll 线程收尾时 close + release_session
+        else
+            release_session(key);
+        return false;
+    }
+    wake_send_waiters();   // 有下行数据：精确唤醒 send_work（无 sleep 轮询）
+    return true;
+}
+
+// 队列消费者唤醒：入队后置标志并 notify，等待方用带谓词的 wait_for
+// 在锁内检查标志，杜绝"先判空再睡"的丢失唤醒窗口
+void UDP::wake_send_waiters()
+{
+    {
+        std::lock_guard<std::mutex> lk(m_wake_mutex);
+        m_send_wake = true;
+    }
+    m_send_cv.notify_one();
+}
+
+void UDP::wake_recv_waiters()
+{
+    {
+        std::lock_guard<std::mutex> lk(m_wake_mutex);
+        m_recv_wake = true;
+    }
+    m_recv_cv.notify_all();
+}
+
+void UDP::wait_recv_queue(int timeout_ms)
+{
+    std::unique_lock<std::mutex> lk(m_wake_mutex);
+    m_recv_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                       [this] { return m_recv_wake || !is_running(); });
+    m_recv_wake = false;
 }
 
 bool UDP::recv_ip_packet(packet_buffer& buf)
@@ -436,8 +478,14 @@ bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
     }
 
     if (s.tcp_fd >= 0) {
-        // TCP 会话：循环写直到整帧发出（send 可能部分写）
-        return send_all_fd(s.tcp_fd, tmp_buf.data(), total_len, s.peer_key);
+        // TCP 会话：循环写直到整帧发出（send 可能部分写）。
+        // 失败 = 连接已死/对端持续不收：标记断开（epoll 线程统一
+        // shutdown+close+release，fd 唯一 owner），不再等心跳超时慢慢发现
+        if (!send_all_fd(s.tcp_fd, tmp_buf.data(), total_len, s.peer_key)) {
+            s.tcp_drop.store(true);
+            return false;
+        }
+        return true;
     }
     int ret = sendto(m_sock, tmp_buf.data(), total_len, 0,
                      reinterpret_cast<struct sockaddr*>(&s.peer_addr), sizeof(s.peer_addr));
@@ -452,22 +500,39 @@ bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
     return true;
 }
 
-// TCP：循环写直到全部发出（send 可能部分写；对端断开返回 false，
-// 上层 send_packet 失败 -> 心跳超时清理会话）
+// TCP：循环写直到全部发出（send 可能部分写）。连接 fd 为非阻塞
+// （epoll 事件驱动模型）：EAGAIN 用 poll 等可写（事件驱动，无 1ms sleep 轮询），
+// 总等待上限 5s——对端持续不收 = 链路已劣化，返回 false 由调用方断开会话，
+// 不无限堆积（TCP-over-TCP 下半死连接要尽快排掉）
 static bool send_all_fd(int fd, const uint8_t* data, size_t len, const std::string& peer_key)
 {
     size_t off = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (off < len) {
         ssize_t n = send(fd, data + off, len - off, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
-            fprintf(stderr, "[TCP] send() failed (%s): %s\n", peer_key.c_str(), strerror(errno));
-            return false;
+        if (n > 0) {
+            off += static_cast<size_t>(n);
+            continue;
         }
-        off += static_cast<size_t>(n);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                fprintf(stderr, "[TCP] send 持续 5s 不可写（对端消费不动）: %s\n",
+                        peer_key.c_str());
+                return false;
+            }
+            struct pollfd pfd{};
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            const int pr = poll(&pfd, 1, 100);
+            if (pr < 0 && errno != EINTR) {
+                fprintf(stderr, "[TCP] poll(POLLOUT) failed (%s): %s\n",
+                        peer_key.c_str(), strerror(errno));
+                return false;
+            }
+            continue;
+        }
+        fprintf(stderr, "[TCP] send() failed (%s): %s\n", peer_key.c_str(), strerror(errno));
+        return false;
     }
     return true;
 }
@@ -511,13 +576,20 @@ void UDP::send_work()
                 fprintf(stderr, "[UDP][TX] 发送数据 len=%zu to %s\n", pay_size, s->peer_key.c_str());
             }
             if (!send_packet(*s, static_cast<uint8_t>(m_data), buf.get_data(), pay_size, sendbuf)) {
+                // TCP 连接级失败已在 send_packet 内标记 tcp_drop（epoll 线程断开）
                 fprintf(stderr, "[UDP] 发送数据失败: %s\n", s->peer_key.c_str());
             }
             buf.clear();
             any = true;
         }
-        if (!any)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!any) {
+            // 无下行数据：条件等待 TUN 入队唤醒（事件驱动，替代 1ms sleep 轮询）；
+            // 200ms 超时兜底检查 is_running
+            std::unique_lock<std::mutex> lk(m_wake_mutex);
+            m_send_cv.wait_for(lk, std::chrono::milliseconds(200),
+                               [this] { return m_send_wake || !is_running(); });
+            m_send_wake = false;
+        }
     }
 }
 
@@ -539,6 +611,17 @@ void UDP::recv_work()
     sockaddr_in peer_addr{};
 
     while (is_running()) {
+        // poll 短超时等数据（非阻塞 socket + 事件驱动，替代 1ms sleep 轮询）：
+        // 数据到达立即唤醒，超时回循环头检查 is_running
+        struct pollfd pfd{};
+        pfd.fd = m_sock;
+        pfd.events = POLLIN;
+        const int pr = poll(&pfd, 1, 200);
+        if (pr <= 0)
+            continue;   // 超时/被信号打断/停止唤醒：回循环头检查 is_running
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            continue;
+
         recvbuf.resize(KMax_packet_size);
         socklen_t peer_addr_size = sizeof(peer_addr);
 
@@ -550,8 +633,8 @@ void UDP::recv_work()
         }
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;   // 非阻塞下无数据，短暂休眠后重试
+                // 与 poll 结果的竞态窗口内数据被取走：立即回 poll，不 sleep
+                continue;
             }
             // 瞬时错误（ENETUNREACH/ENOBUFS 等）：记日志后继续。
             // 绝不能 break——recv 线程退出后认证/转发/心跳全部停摆且 watchdog 无法感知
@@ -640,7 +723,8 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
                 break;
             if (!s.authenticated.load())
                 break;   // 身份未验证通过前禁止把数据转发进 TUN
-            m_queue_recv.push(packet_buffer(std::move(inner_payload)));
+            if (m_queue_recv.push(packet_buffer(std::move(inner_payload))))
+                wake_recv_waiters();   // 上行入队：精确唤醒 VpnCore 转发线程
             break;
         case m_heart:
             reply_heartbeat(s);
@@ -657,9 +741,13 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
             break;
         case disconnect:
             // 客户端显式断开（密文内层）：立即释放会话，每源配额即时归还。
-            // 注意 release_session 会把 s 从表中移除，之后不要再使用 s
+            // TCP 连接同时标记断开：epoll 线程统一 close（fd 唯一 owner），
+            // 不留"会话已释放、连接还挂着"的僵尸
             fprintf(stderr, "[UDP] 客户端断开: %s\n", s.peer_key.c_str());
-            release_session(s.peer_key);
+            if (s.tcp_fd >= 0)
+                s.tcp_drop.store(true);   // epoll 线程收尾时 close + release_session
+            else
+                release_session(s.peer_key);
             break;
         default:
             break;
@@ -946,18 +1034,23 @@ void UDP::handle_identity(Session& s, const std::vector<uint8_t>& inner)
     s.client_id = client_id;
     s.cli_pub_hex = cli_pub_hex;
 
-    // 同身份重复登录：踢掉旧的在线会话（同一 client_id 只保留最新）
+    // 同身份重复登录：踢掉旧的在线会话（同一 client_id 只保留最新）。
+    // TCP 旧连接同时标记断开：epoll 线程统一 close，不留僵尸连接
     {
-        std::vector<std::string> to_kill;
+        std::vector<std::shared_ptr<Session>> victims;
         {
             std::lock_guard<std::mutex> lock(m_sessions_mutex);
             for (auto& kv : m_sessions) {
                 if (kv.second.get() != &s && kv.second->client_id == s.client_id)
-                    to_kill.push_back(kv.first);
+                    victims.push_back(kv.second);
             }
         }
-        for (auto& k : to_kill)
-            release_session(k);
+        for (auto& victim : victims) {
+            if (victim->tcp_fd >= 0)
+                victim->tcp_drop.store(true);   // epoll 线程收尾时 close + release_session
+            else
+                release_session(victim->peer_key);
+        }
     }
 
     // 分配虚拟 IP（多用户唯一地址；认证通过后才分配）
@@ -1023,25 +1116,32 @@ void UDP::heartbeat_work()
                 sessions.push_back(kv.second);
         }
         for (auto& s : sessions) {
+            // 统一销毁路径：TCP 会话标记 tcp_drop 由 epoll 线程 close+release
+            // （fd 唯一 owner）；UDP 会话无连接直接释放
+            auto destroy = [&](const char* why) {
+                fprintf(stderr, "[UDP] %s，销毁会话 %s\n", why, s->peer_key.c_str());
+                if (s->tcp_fd >= 0)
+                    s->tcp_drop.store(true);
+                else
+                    release_session(s->peer_key);
+            };
             // 未完成身份验证的会话：10s 清理（含走到阶段2但被拒/放弃的——
             // 这些僵尸会话若按心跳超时算会滞留 30s 占满每源配额）
             if (!s->authenticated.load()) {
-                if (now - static_cast<uint64_t>(s->created_at_ms.load()) > hs_timeout_ms) {
-                    fprintf(stderr, "[UDP] 握手超时，销毁未认证会话 %s\n", s->peer_key.c_str());
-                    release_session(s->peer_key);
-                }
+                if (now - static_cast<uint64_t>(s->created_at_ms.load()) > hs_timeout_ms)
+                    destroy("握手超时");
                 continue;
             }
             // 认证会话：心跳超时 → 判失联销毁
             const int64_t last = s->last_rx_ms.load();
             if (last != 0 && (now - static_cast<uint64_t>(last)) > timeout_ms) {
-                fprintf(stderr, "[UDP] heartbeat timeout, destroy session %s\n", s->peer_key.c_str());
-                release_session(s->peer_key);
+                destroy("heartbeat timeout");
                 continue;
             }
             // 主动发送心跳
             std::vector<uint8_t> sendbuf;
             if (!send_packet(*s, static_cast<uint8_t>(m_heart), nullptr, 0, sendbuf)) {
+                // TCP 连接级失败已在 send_packet 内标记 tcp_drop
                 fprintf(stderr, "[UDP] send heartbeat failed: %s\n", s->peer_key.c_str());
             }
         }

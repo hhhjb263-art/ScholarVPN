@@ -657,13 +657,15 @@ void UDP::send_work()
 			break;
 		}
 
-		// 队列为空时短暂休眠，避免阻塞导致心跳无法周期发送
-		if (m_sendqueue.empty()) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(20));
-			continue;
-		}
-		if (!m_sendqueue.pop(buf)) {
+		// 事件驱动等待发送数据，最多等到下一个心跳时刻：有数据立即醒来发送，
+		// 到点自动醒来发心跳。取代原先"队列空固定 sleep 20ms 轮询"——
+		// 突发首包不再额外拖平均 10ms 延迟
+		const auto status = m_sendqueue.pop_until(buf, last_heart + kHeartbeatInterval);
+		if (status == PacketQueue::PopResult::Shutdown) {
 			break;
+		}
+		if (status == PacketQueue::PopResult::Timeout) {
+			continue;   // 到心跳时刻：回循环头发送心跳
 		}
 		if (buf.is_empty()) {
 			continue;

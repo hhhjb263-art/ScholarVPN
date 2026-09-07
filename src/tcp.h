@@ -3,8 +3,12 @@
 // TCP 隧道：继承 UDP 基类，只覆写 4 个传输钩子 + 协议版本字节。
 // 协议（三阶段认证 / AES-256-GCM / 心跳 / 队列 / 重连状态机）全部复用基类。
 //
-// 帧规则：每条消息 = tunnel_header(12B) + payload，按 payload_len 凑帧；
-// 粘包/半包由本类的接收缓冲状态机处理，凑齐一帧交付一次。
+// socket 保持非阻塞：读侧 recv_frame 用 WSAPoll 短超时等数据（无 sleep 轮询），
+// 写侧 raw_send 用 WSAPoll 等可写；stop() 靠 closesocket 让 poll 立即出错返回。
+//
+// 帧规则：每条消息 = tunnel_header(12B) + payload，按 payload_len 凑帧。
+// recv_frame 先吃接收缓冲：粘包帧逐帧连续交付（外层循环每帧调一次，
+// 交付期间不碰 recv），缓冲不足才 poll+recv 补数据。
 // 协议版本：TCP 帧标 v_tcp（错误传输的报文在接收侧 version 校验被丢弃）。
 // 实现在 tcp.cpp；本头文件仅声明。
 // ============================================================================
@@ -31,6 +35,9 @@ protected:
                     // 返回 false = 连接死亡（收包线程应退出）
 
 private:
+    // 从接收缓冲取一帧（不动 socket）：1=整帧已交付 0=数据不足 -1=非法帧（连接作废）
+    int take_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_len);
+
     std::vector<uint8_t> m_rxBuf;       // 接收累积缓冲
     size_t m_rxHave = 0;                // 已收字节数
     size_t m_consumed = 0;              // 已交付帧字节数（下次调用先消费）

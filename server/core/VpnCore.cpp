@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cerrno>
 #include <filesystem>
+#include <poll.h>
 #include <system_error>
 #include <chrono>
 #include <thread>
@@ -158,7 +159,7 @@ void VpnCore::stop()
     if(m_thread_u2t.joinable()){
         m_thread_u2t.join();
     }
-    // 停止 TCP 监听（accept 线程退出；存量连接自然终结）
+    // 停止 TCP 监听（epoll 事件线程退出并统一关闭全部连接）
     m_tcp.stop();
     // 停止 UDP 收发线程
     m_udp.stop();
@@ -192,7 +193,8 @@ void VpnCore::forward_tun_to_udp()
                 if(g_packet_log){
                     fprintf(stderr, "[CORE][TUN→UDP] len=%zu\n", buf.data_size());
                 }
-                // 无匹配会话（目的 IP 未分配 / 客户端不在线）则丢弃
+                // 无匹配会话（目的 IP 未分配 / 客户端不在线）则丢弃；
+                // 目标会话发送队列满则断开该会话（见 forward_tun_packet）
                 if(!m_udp.forward_tun_packet(std::move(buf))){
                     if(g_packet_log){
                         fprintf(stderr, "[CORE][TUN→UDP] no session for dst, drop\n");
@@ -200,8 +202,16 @@ void VpnCore::forward_tun_to_udp()
                 }
             }
         } else {
-            // TUN 无数据（非阻塞 EAGAIN），短暂休眠避免忙轮询
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // TUN 无数据（非阻塞 EAGAIN）：poll 等待 fd 可读（事件驱动，
+            // 替代 1ms sleep 轮询），200ms 超时兜底检查 m_running
+            struct pollfd pfd{};
+            pfd.fd = m_tun.get_fd();
+            pfd.events = POLLIN;
+            if(pfd.fd >= 0){
+                poll(&pfd, 1, 200);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
         }
     }
 }
@@ -219,8 +229,8 @@ void VpnCore::forward_udp_to_tun()
                 m_tun.write_buf(buf);
             }
         } else {
-            // UDP 接收队列空，短暂休眠
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // UDP 接收队列空：条件等待入队唤醒（事件驱动，替代 1ms sleep 轮询）
+            m_udp.wait_recv_queue(200);
         }
     }
 }

@@ -163,6 +163,10 @@ bool WintunTun::load_wintun_api()
 	{
 		LOG_ERROR("加载 WintunEndSession 失败"); success = false;
 	}
+	if (!load_function(m_hDll, "WintunGetReadWaitEvent", m_fnGetReadWaitEvent))
+	{
+		LOG_ERROR("加载 WintunGetReadWaitEvent 失败"); success = false;
+	}
 	if (!load_function(m_hDll, "WintunReceivePacket", m_fnReceivePacket))
 	{
 		LOG_ERROR("加载 WintunReceivePacket 失败"); success = false;
@@ -264,6 +268,14 @@ uint8_t* WintunTun::read_packet(DWORD* outPackLen)
 	return nullptr;
 }
 
+HANDLE WintunTun::read_wait_event() const
+{
+	if (!is_ready() || m_fnGetReadWaitEvent == nullptr) {
+		return nullptr;
+	}
+	return m_fnGetReadWaitEvent(m_hsession);
+}
+
 bool WintunTun::write_packet(const uint8_t* RawIPdata, DWORD len)
 {
 	if (!is_ready()) {
@@ -338,6 +350,7 @@ void WintunTun::reset_api_pointers() noexcept
 	m_fnGetAdapterLuid = nullptr;
 	m_fnStartSession = nullptr;
 	m_fnEndSession = nullptr;
+	m_fnGetReadWaitEvent = nullptr;
 	m_fnReceivePacket = nullptr;
 	m_fnReleaseReceivePacket = nullptr;
 	m_fnAllocateSendPacket = nullptr;

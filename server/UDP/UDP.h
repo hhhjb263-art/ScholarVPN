@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -38,10 +39,15 @@ public:
     // sig_priv：服务器持久身份私钥 SIG_SRV_PRI；keys_dir：注册/登录数据库目录
     void set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir = "keys");
 
-    // TUN 读到的 IP 包按目的 IP 转发到对应会话；无匹配会话返回 false
+    // TUN 读到的 IP 包按目的 IP 转发到对应会话；无匹配会话返回 false。
+    // 目标会话发送队列满 = 客户端持续消费不动：按既定策略断开该会话
+    // （TCP 交 epoll 线程统一 close，UDP 直接释放），而非无限堆积
     bool forward_tun_packet(packet_buffer&& buf);
     // 从全局接收队列取一个解密后的 IP 包（VpnCore 写入 TUN）
     bool recv_ip_packet(packet_buffer& buf);
+    // 队列空时最多等 timeout_ms（入队即被唤醒，事件驱动）：
+    // 供 VpnCore 转发线程替代固定 sleep 轮询
+    void wait_recv_queue(int timeout_ms);
 
     int client_count() const;
     size_t max_clients() const { return m_max_clients; }
@@ -62,6 +68,12 @@ private:
     void heartbeat_work();
     bool start_threads();
     void stop_threads();
+
+    // 队列入队后的消费者唤醒（替代固定 sleep 轮询）：
+    //   wake_send_waiters：TUN 下行包入会话发送队列后唤醒 send_work
+    //   wake_recv_waiters：上行 IP 包入全局接收队列后唤醒 VpnCore 转发线程
+    void wake_send_waiters();
+    void wake_recv_waiters();
 
     uint32_t allocate_virtual_ip();
     void release_virtual_ip(uint32_t ip);
@@ -103,6 +115,13 @@ private:
     mutable std::mutex m_vip_mutex;
     std::unordered_map<uint32_t, std::string> m_vip_to_key;
     std::shared_ptr<VirtualIpPool> m_ip_pool;
+
+    // 队列消费者唤醒（m_wake_mutex 保护两个唤醒标志，杜绝丢失唤醒）
+    std::mutex m_wake_mutex;
+    std::condition_variable m_send_cv;
+    std::condition_variable m_recv_cv;
+    bool m_send_wake{ false };
+    bool m_recv_wake{ false };
 
     // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 Buffer/tunnel_protoco.h（两端一致）；
     // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限

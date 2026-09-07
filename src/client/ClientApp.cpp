@@ -527,8 +527,15 @@ void ClientApp::tun_to_udp_loop()
                 m_tun->release_read_packet(pkt);
                 u->send_ip_packet(std::move(buf));
             }
+            else if (HANDLE ev = m_tun->read_wait_event())
+            {
+                // 环形缓冲空：等读事件（事件驱动，有包立即唤醒），
+                // 200ms 超时兜底检查 m_running/重连状态——替代固定 5ms sleep 轮询
+                ::WaitForSingleObject(ev, 200);
+            }
             else
             {
+                // 读事件不可用（API 缺失/会话未就绪）：退回短休眠
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }

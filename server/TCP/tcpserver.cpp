@@ -53,7 +53,17 @@ bool TCPServer::start(const std::string& listen_ip, uint16_t port)
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = listen_ip.empty() ? INADDR_ANY : inet_addr(listen_ip.c_str());
+    if(listen_ip.empty()){
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }else{
+        int ret = inet_pton(AF_INET,listen_ip.c_str(),&addr.sin_addr);
+        if(ret < 0){
+            fprintf(stderr,"[TCP] invalid listen ip %s\n", listen_ip.c_str());
+            close(m_listen_fd);
+            m_listen_fd = -1;
+            return false;
+        }
+    }
     if (bind(m_listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         fprintf(stderr, "[TCP] bind() failed (%s:%u): %s\n",
                 listen_ip.c_str(), static_cast<unsigned>(port), strerror(errno));

@@ -72,6 +72,12 @@
     <ClInclude Include="src\gui\ui_QtWidgetsClass.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="src\DnsLeakGuard.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\tcp.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\tun.cpp">
@@ -119,7 +125,13 @@
     <ClCompile Include="src\gui\moc_AppBridge.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="src\tcp.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="src\gui\moc_QtWidgetsClass.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\DnsLeakGuard.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>

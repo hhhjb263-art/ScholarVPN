@@ -1,4 +1,5 @@
 #include "reconnect_manager.h"
+#include "tcp.h"
 
 #include <algorithm>
 #include <chrono>
@@ -229,7 +230,11 @@ bool ReconnectManager::connect_once()
     std::shared_ptr<UDP> u;
     try
     {
-        u = std::make_shared<UDP>(m_remote.c_str(), m_port, false, m_queueMax);
+        // 传输方式：按 m_transport 实例化对应类（多态接入，协议层共用基类）
+        if (m_transport == Transport::TCP)
+            u = std::make_shared<TCP>(m_remote.c_str(), m_port, false, m_queueMax);
+        else
+            u = std::make_shared<UDP>(m_remote.c_str(), m_port, false, m_queueMax);
         u->set_identity(m_ed25519_priv, m_server_sig_pub_pem, m_client_id, m_register_token);
     }
     catch (const std::exception& e)

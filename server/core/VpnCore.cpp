@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cerrno>
 #include <filesystem>
+#include <poll.h>
 #include <system_error>
 #include <chrono>
 #include <thread>
@@ -85,6 +86,18 @@ bool VpnCore::init(const Config &cfg)
                 std::filesystem::path(m_cfg.key_sig_path).parent_path().string();
             m_udp.set_identity(std::shared_ptr<EVP_PKEY>(priv, EVP_PKEY_free), keys_dir);
             fprintf(stderr, "[VpnCore] 已加载服务器身份私钥: %s\n", m_cfg.key_sig_path.c_str());
+            // 诊断：打印服务器签名用的公钥指纹（与客户端日志的
+            // "客户端验签用的服务器公钥指纹"比对——不一致即密钥配置错误）
+            {
+                unsigned char raw[32];
+                size_t raw_len = sizeof(raw);
+                if (EVP_PKEY_get_raw_public_key(priv, raw, &raw_len) == 1) {
+                    char hex[65] = { 0 };
+                    for (size_t i = 0; i < raw_len && i < 32; ++i)
+                        snprintf(hex + i * 2, 3, "%02x", raw[i]);
+                    fprintf(stderr, "[VpnCore] 服务器身份公钥指纹: %s\n", hex);
+                }
+            }
         } catch(const std::exception &e){
             fprintf(stderr, "[VpnCore] 加载身份私钥 %s 失败: %s\n", m_cfg.key_sig_path.c_str(), e.what());
             stop();
@@ -98,6 +111,14 @@ bool VpnCore::init(const Config &cfg)
     if(!m_udp.start(m_cfg.listen_ip, m_cfg.listen_port,
                     m_cfg.tun_ip, m_cfg.tun_prefix, m_cfg.max_clients)){
         fprintf(stderr, "[VpnCore] udp.start(%s:%u) failed\n",
+                m_cfg.listen_ip.c_str(), m_cfg.listen_port);
+        stop();
+        return false;
+    }
+    // 6) 启动 TCP 监听（同端口双栈）：运营商丢 UDP 的备用通道；
+    //    会话表/认证/加密/心跳与 UDP 共用，客户端按条目选择传输
+    if(!m_tcp.start(m_cfg.listen_ip, m_cfg.listen_port)){
+        fprintf(stderr, "[VpnCore] tcp.start(%s:%u) failed\n",
                 m_cfg.listen_ip.c_str(), m_cfg.listen_port);
         stop();
         return false;
@@ -138,6 +159,8 @@ void VpnCore::stop()
     if(m_thread_u2t.joinable()){
         m_thread_u2t.join();
     }
+    // 停止 TCP 监听（epoll 事件线程退出并统一关闭全部连接）
+    m_tcp.stop();
     // 停止 UDP 收发线程
     m_udp.stop();
     // 清理路由与网卡（仅在 TUN 创建成功后才做网卡操作）
@@ -170,7 +193,8 @@ void VpnCore::forward_tun_to_udp()
                 if(g_packet_log){
                     fprintf(stderr, "[CORE][TUN→UDP] len=%zu\n", buf.data_size());
                 }
-                // 无匹配会话（目的 IP 未分配 / 客户端不在线）则丢弃
+                // 无匹配会话（目的 IP 未分配 / 客户端不在线）则丢弃；
+                // 目标会话发送队列满则断开该会话（见 forward_tun_packet）
                 if(!m_udp.forward_tun_packet(std::move(buf))){
                     if(g_packet_log){
                         fprintf(stderr, "[CORE][TUN→UDP] no session for dst, drop\n");
@@ -178,8 +202,16 @@ void VpnCore::forward_tun_to_udp()
                 }
             }
         } else {
-            // TUN 无数据（非阻塞 EAGAIN），短暂休眠避免忙轮询
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // TUN 无数据（非阻塞 EAGAIN）：poll 等待 fd 可读（事件驱动，
+            // 替代 1ms sleep 轮询），200ms 超时兜底检查 m_running
+            struct pollfd pfd{};
+            pfd.fd = m_tun.get_fd();
+            pfd.events = POLLIN;
+            if(pfd.fd >= 0){
+                poll(&pfd, 1, 200);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
         }
     }
 }
@@ -197,8 +229,8 @@ void VpnCore::forward_udp_to_tun()
                 m_tun.write_buf(buf);
             }
         } else {
-            // UDP 接收队列空，短暂休眠
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // UDP 接收队列空：条件等待入队唤醒（事件驱动，替代 1ms sleep 轮询）
+            m_udp.wait_recv_queue(200);
         }
     }
 }

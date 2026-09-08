@@ -164,12 +164,21 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
 
                 ServerEntry e;
                 e.Name = ReadIniString(sec.c_str(), L"Name", L"", ini_path);
+                if (e.Name.size() >= 2 && e.Name.front() == L'"' && e.Name.back() == L'"')
+                    e.Name = e.Name.substr(1, e.Name.size() - 2);   // QSettings 引号剥离
                 e.ServerIP = ReadIniString(sec.c_str(), L"ServerIP", L"", ini_path);
                 e.ServerPort = static_cast<int>(
                     GetPrivateProfileIntW(sec.c_str(), L"ServerPort", 51820, ini_path.c_str()));
                 e.ClientID = ReadIniString(sec.c_str(), L"ClientID", outCfg.ClientID, ini_path);
                 e.RegisterToken = ReadIniString(sec.c_str(), L"RegisterToken", outCfg.RegisterToken, ini_path);
                 e.ServerPubKey = ReadIniString(sec.c_str(), L"ServerPubKey", L"", ini_path);
+                // QSettings 写入的值会带双引号（Win32 API 读取时不剥）：
+                // 引号混进 PEM 正文会污染公钥，剥掉首尾引号
+                if (e.ServerPubKey.size() >= 2 &&
+                    e.ServerPubKey.front() == L'"' && e.ServerPubKey.back() == L'"')
+                    e.ServerPubKey = e.ServerPubKey.substr(1, e.ServerPubKey.size() - 2);
+                e.transport = static_cast<uint8_t>(
+                    GetPrivateProfileIntW(sec.c_str(), L"Transport", 0, ini_path.c_str()));
                 if (!e.ServerIP.empty())
                     found.emplace_back(idx, std::move(e));
             }
@@ -225,6 +234,7 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
             WritePrivateProfileStringW(sec.c_str(), L"Name", found[i].second.Name.c_str(), ini_path.c_str());
             WritePrivateProfileStringW(sec.c_str(), L"ServerIP", found[i].second.ServerIP.c_str(), ini_path.c_str());
             WriteIniInt(sec.c_str(), L"ServerPort", found[i].second.ServerPort, ini_path);
+            WriteIniInt(sec.c_str(), L"Transport", found[i].second.transport, ini_path);
             WritePrivateProfileStringW(sec.c_str(), L"ClientID", found[i].second.ClientID.c_str(), ini_path.c_str());
             WritePrivateProfileStringW(sec.c_str(), L"RegisterToken", found[i].second.RegisterToken.c_str(), ini_path.c_str());
             WritePrivateProfileStringW(sec.c_str(), L"ServerPubKey", found[i].second.ServerPubKey.c_str(), ini_path.c_str());
@@ -295,6 +305,7 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
         ok &= WritePrivateProfileStringW(sec.c_str(), L"Name", cfg.servers[i].Name.c_str(), ini_path.c_str()) != 0;
         ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerIP", cfg.servers[i].ServerIP.c_str(), ini_path.c_str()) != 0;
         ok &= WriteIniInt(sec.c_str(), L"ServerPort", cfg.servers[i].ServerPort, ini_path);
+        ok &= WriteIniInt(sec.c_str(), L"Transport", cfg.servers[i].transport, ini_path);
         // 每台服务器各自的认证身份 + 服务器公钥
         ok &= WritePrivateProfileStringW(sec.c_str(), L"ClientID", cfg.servers[i].ClientID.c_str(), ini_path.c_str()) != 0;
         ok &= WritePrivateProfileStringW(sec.c_str(), L"RegisterToken", cfg.servers[i].RegisterToken.c_str(), ini_path.c_str()) != 0;

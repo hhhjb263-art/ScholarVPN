@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -38,13 +39,28 @@ public:
     // sig_priv：服务器持久身份私钥 SIG_SRV_PRI；keys_dir：注册/登录数据库目录
     void set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir = "keys");
 
-    // TUN 读到的 IP 包按目的 IP 转发到对应会话；无匹配会话返回 false
+    // TUN 读到的 IP 包按目的 IP 转发到对应会话；无匹配会话返回 false。
+    // 目标会话发送队列满 = 客户端持续消费不动：按既定策略断开该会话
+    // （TCP 交 epoll 线程统一 close，UDP 直接释放），而非无限堆积
     bool forward_tun_packet(packet_buffer&& buf);
     // 从全局接收队列取一个解密后的 IP 包（VpnCore 写入 TUN）
     bool recv_ip_packet(packet_buffer& buf);
+    // 队列空时最多等 timeout_ms（入队即被唤醒，事件驱动）：
+    // 供 VpnCore 转发线程替代固定 sleep 轮询
+    void wait_recv_queue(int timeout_ms);
 
     int client_count() const;
     size_t max_clients() const { return m_max_clients; }
+
+    // 处理一条已分帧的完整消息（TCPServer 与 UDP recv 循环共用）：
+    // 明文阶段1认证 / 密文解密分发（data/heart/identity/disconnect）。
+    // TCP 会话（s.tcp_fd >= 0）按 v_tcp 校验/标记版本，UDP 会话按 v_udp
+    void handle_framed(Session& s, const tunnel_header& hdr,
+                       const uint8_t* payload, size_t pay_len);
+    // 从表移除 + 释放虚拟 IP + 标记下线（TCPServer 连接断开时也调用）
+    void release_session(const std::string& key);
+    // 取/建会话（TCPServer accept 后也调用；pending 配额/每源上限对 TCP 同样生效）
+    std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr);
 
 private:
     void send_work();
@@ -53,8 +69,11 @@ private:
     bool start_threads();
     void stop_threads();
 
-    std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr);
-    void release_session(const std::string& key);   // 从表移除 + 释放虚拟 IP + 标记下线
+    // 队列入队后的消费者唤醒（替代固定 sleep 轮询）：
+    //   wake_send_waiters：TUN 下行包入会话发送队列后唤醒 send_work
+    //   wake_recv_waiters：上行 IP 包入全局接收队列后唤醒 VpnCore 转发线程
+    void wake_send_waiters();
+    void wake_recv_waiters();
 
     uint32_t allocate_virtual_ip();
     void release_virtual_ip(uint32_t ip);
@@ -96,6 +115,13 @@ private:
     mutable std::mutex m_vip_mutex;
     std::unordered_map<uint32_t, std::string> m_vip_to_key;
     std::shared_ptr<VirtualIpPool> m_ip_pool;
+
+    // 队列消费者唤醒（m_wake_mutex 保护两个唤醒标志，杜绝丢失唤醒）
+    std::mutex m_wake_mutex;
+    std::condition_variable m_send_cv;
+    std::condition_variable m_recv_cv;
+    bool m_send_wake{ false };
+    bool m_recv_wake{ false };
 
     // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 Buffer/tunnel_protoco.h（两端一致）；
     // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限

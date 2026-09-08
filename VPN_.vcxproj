@@ -128,6 +128,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindows.dll" "$(OutDir)p
     <ClInclude Include="src\packet_buffer.h" />
     <ClInclude Include="src\route_manager.h" />
     <ClInclude Include="src\reconnect_manager.h" />
+    <ClInclude Include="src\tcp.h" />
     <ClInclude Include="src\tun.h" />
     <ClInclude Include="src\tunnel_protoco.h" />
     <ClInclude Include="src\UDP.h" />
@@ -151,6 +152,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindows.dll" "$(OutDir)p
     <ClCompile Include="src\reconnect_manager.cpp" />
     <ClCompile Include="src\tun.cpp" />
     <ClCompile Include="src\UDP.cpp" />
+    <ClCompile Include="src\tcp.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\ui_QtWidgetsClass.h" />

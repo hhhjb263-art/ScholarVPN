@@ -1,0 +1,10 @@
+# Android 构建产物
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+logcat.txt

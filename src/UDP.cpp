@@ -138,9 +138,10 @@ bool UDP::init()
 	m_server_hello_ok.store(false);
 	m_enc_ready.store(false);
 	m_need_reconnect.store(false);
+	m_replay.reset();   // 新连接新会话：反重放窗口重置
 	m_nonce_s.clear();
-	m_dh_srv_pub.clear();
 	m_dh_cli_pub.clear();
+	m_dh_srv_pub.clear();
 	if (m_dh_cli_priv != nullptr) {
 		EVP_PKEY_free(m_dh_cli_priv);
 		m_dh_cli_priv = nullptr;
@@ -211,6 +212,7 @@ void UDP::stop()
 	m_server_hello_ok.store(false);
 	m_enc_ready.store(false);
 	m_need_reconnect.store(false);
+	m_replay.reset();   // 停止即重置：下次连接（实例复用时）从干净窗口开始
 	secure_wipe(m_key_c2s);
 	secure_wipe(m_key_s2c);
 	m_nonce_c.clear();
@@ -769,6 +771,11 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			if (!m_enc_ready.load())
 			{
 				return; // 密钥未就绪前收到的数据/心跳一律丢弃
+			}
+			// 反重放：对端密文帧序号过滑窗（重放/复制帧在解密前即静默丢弃；
+			// 序号在 AAD 内不可篡改，静默丢弃不断连——防注入式 DoS）
+			if (!m_replay.accept(ntohl(header.sequence))) {
+				return;
 			}
 			std::vector<uint8_t> enc(payload, payload + payload_len);
 			std::optional<std::vector<uint8_t>> plain;

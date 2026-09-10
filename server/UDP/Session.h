@@ -14,6 +14,52 @@
 #include "../Crypt/crypt.h"
 
 // ===================================================================
+// 反重放滑动窗口（WireGuard/IPsec 同款语义，对密文帧生效）：
+//   每帧 sequence 在 AAD 内不可篡改，且客户端每次发送都递增（重传也是
+//   新序号），故"同一序号再次出现"必然是重放/网络复制：
+//     seq > highest             → 放行并滑动窗口
+//     highest-窗口内且未见过     → 放行（正常 UDP 乱序）
+//     其余                      → 静默丢弃（不断连，防注入式 DoS）
+//   窗口 64 位位图，实例随 Session 销毁（新会话新密钥自然重置）；
+//   带互斥锁：UDP recv 线程与 TCP epoll 线程可能并发触碰同一会话。
+class ReplayWindow
+{
+public:
+    // seq 为主机序；@return true=放行 false=重放（丢弃）
+    bool accept(uint32_t seq)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint64_t s = seq;
+        if (m_highest == kNone) {
+            m_highest = s;
+            m_window = 1;
+            return true;
+        }
+        if (s > m_highest) {
+            const uint64_t shift = s - m_highest;
+            m_window = (shift >= kWindow) ? 1 : ((m_window << shift) | 1);
+            m_highest = s;
+            return true;
+        }
+        const uint64_t age = m_highest - s;
+        if (age >= kWindow)
+            return false;   // 太旧（已滑出窗口）
+        const uint64_t bit = 1ull << age;
+        if (m_window & bit)
+            return false;   // 已见过：重放
+        m_window |= bit;
+        return true;
+    }
+
+private:
+    static constexpr uint64_t kWindow = 64;
+    static constexpr uint64_t kNone = ~0ull;   // 未初始化哨兵
+    std::mutex m_mutex;
+    uint64_t m_highest = kNone;
+    uint64_t m_window = 0;
+};
+
+// ===================================================================
 // 多用户架构导读：
 //   单用户时代，UDP 类直接保存"那一个客户端"的认证/密钥状态（成员变量）。
 //   多用户改造后，把"一个客户端连接"的全部状态抽到独立的 Session 对象，
@@ -101,6 +147,7 @@ struct Session
     PacketQueue send_queue;           // 本会话待发数据（TUN 下行）
     std::mutex send_mutex;            // sendto 串行化（多个线程可能同时发送）
     std::atomic<uint32_t> seq{ 0 };
+    ReplayWindow replay;              // 上行密文帧反重放滑窗
 
     std::atomic<int64_t> last_rx_ms{ 0 };     // 最近收到对端报文的时间
     std::atomic<int64_t> created_at_ms{ 0 };  // 会话创建时间（握手超时清理用）

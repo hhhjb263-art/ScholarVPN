@@ -702,6 +702,15 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
         if (!s.enc_ready.load()) {
             return;   // 密钥未就绪，丢弃
         }
+        // 反重放：上行密文帧序号过滑窗（重放/复制帧静默丢弃；
+        // 序号在 AAD 内不可篡改，静默丢弃不断连——防注入式 DoS）
+        if (!s.replay.accept(ntohl(hdr.sequence))) {
+            if (g_packet_log) {
+                fprintf(stderr, "[UDP] 重放帧被丢弃 seq=%u (%s)\n",
+                        ntohl(hdr.sequence), s.peer_key.c_str());
+            }
+            return;
+        }
         std::vector<uint8_t> enc(payload, payload + pay_len);
         std::optional<std::vector<uint8_t>> plain;
         try {

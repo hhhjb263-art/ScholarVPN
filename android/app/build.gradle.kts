@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -7,6 +9,25 @@ plugins {
 android {
     namespace = "com.scholarvpn.client"
     compileSdk = 35
+
+    // 正式签名凭据（android/keystore.properties，不入库）：
+    // 密钥库丢失/忘记密码 = 永远无法以同一签名更新应用，务必备份
+    val keystoreProps = Properties().apply {
+        val f = rootProject.file("keystore.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+
+    signingConfigs {
+        if (keystoreProps.isNotEmpty()) {
+            create("release") {
+                // keystore.properties 里的路径相对 android/（项目根）解析
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
 
     defaultConfig {
         applicationId = "com.scholarvpn.client"
@@ -23,9 +44,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 用 debug 签名使 release 包可直接安装（自用分发）；
-            // 正式对外分发请创建独立 keystore 并替换 signingConfig
-            signingConfig = signingConfigs.getByName("debug")
+            // 优先用正式签名（keystore.properties 存在时）；否则退回 debug 签名
+            signingConfig = if (keystoreProps.isNotEmpty())
+                signingConfigs.getByName("release")
+            else
+                signingConfigs.getByName("debug")
         }
     }
 

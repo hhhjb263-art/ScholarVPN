@@ -3,6 +3,7 @@
 #include "tunnel_protoco.h"
 #include "PacketQueue.h"
 #include "Crypt.h"
+#include "replay_window.h"
 
 #include <atomic>
 #include <memory>
@@ -129,6 +130,8 @@ protected:
     std::vector<std::uint8_t> m_key_c2s;        // key_tx 客户端→服务端（本端发送加密）
     std::vector<std::uint8_t> m_key_s2c;        // key_rx 服务端→客户端（本端接收解密）
     std::atomic<bool> m_enc_ready{ false };     // 密钥派生完成（阶段2 结束）
+    ReplayWindow m_replay;                      // 下行（对端→本端）密文帧反重放滑窗
+                                                // （handle_frame 仅 recv 线程执行，天然串行）
 protected:
     // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 tunnel_protoco.h（两端一致）；
     // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限

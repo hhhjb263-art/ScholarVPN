@@ -9,9 +9,13 @@ package com.scholarvpn.client.tunnel
  *   highest-窗口内且未见过  → 放行（正常 UDP 乱序）
  *   其余                   → 静默丢弃（不断连，防注入式 DoS）
  *
+ * 重要：accept() 会修改状态，必须在 AES-GCM 验证成功【之后】调用；
+ * 解密前只允许 isStale()（不修改状态）做廉价预检——未认证报文不能推进
+ * 窗口（否则伪造高序号会污染窗口，后续合法报文被误判太旧）。
+ *
  * 实例与隧道会话同生命周期：重连 = 新会话新密钥，窗口自然重置。
- * 注：sequence 为 32 位，单会话 >2^32 帧会回绕（实际流量不可达，回绕后
- * 按新流处理，安全性不劣化）。
+ * 注：32 位序号回绕由发送侧在 2^31 处强制换会话规避（TunnelClient），
+ * 本窗口单会话生命周期内不会遇到回绕。
  */
 class ReplayWindow(private val size: Int = 64) {
     init { require(size in 1..64) { "窗口必须 ≤64（Long 位图）" } }
@@ -19,7 +23,15 @@ class ReplayWindow(private val size: Int = 64) {
     private var highest = -1L        // 已见最高序号（-1 = 未初始化）
     private var window = 0L          // 位 i = (highest - i) 已见过
 
-    /** @return true = 放行；false = 重放帧（丢弃） */
+    /** 不修改状态的"过旧"预检（解密前调用）：true = 太旧必是重放，直接丢弃 */
+    @Synchronized
+    fun isStale(seq: Long): Boolean {
+        if (highest < 0) return false
+        if (seq > highest) return false
+        return highest - seq >= size
+    }
+
+    /** @return true = 放行；false = 重放帧（丢弃）。只应在帧验签成功后调用 */
     @Synchronized
     fun accept(seq: Long): Boolean {
         if (highest < 0) {

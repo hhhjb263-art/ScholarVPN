@@ -230,14 +230,17 @@ class TunnelClient(
             return   // 非法帧：丢弃
         }
         if (header.version != wireVersion) return   // 传输不匹配（对应 C++ 版本校验）
-        lastRxMs.set(System.currentTimeMillis())
 
         if (header.type in Protocol.ENCRYPTED_TYPES) {
             if (!keysReady.get()) return   // 密钥未就绪：丢弃
-            // 反重放：序号过滑窗（重放帧在解密前即丢弃；AAD 保证序号不可篡改）
-            if (!replayWindow.accept(header.sequence.toLong() and 0xFFFFFFFFL)) return
+            val seq = header.sequence.toLong() and 0xFFFFFFFFL
+            // 反重放分两步：解密前只做"不修改状态"的过旧预检（未认证报文
+            // 不能污染窗口），GCM 验证成功后才提交窗口与存活时间
+            if (replayWindow.isStale(seq)) return
             val inner = TunnelCrypto.gcmOpen(keyRx, buf, Protocol.HEADER_SIZE, len - Protocol.HEADER_SIZE, buf, 0)
-                ?: return   // 解密失败静默丢弃
+                ?: return   // 解密失败静默丢弃（不推进窗口、不刷新存活）
+            if (!replayWindow.accept(seq)) return   // 重放帧：静默丢弃
+            lastRxMs.set(System.currentTimeMillis())   // 仅已认证报文刷新存活
             handleInner(inner[0], inner, 1, inner.size - 1)
         } else if (header.type == Protocol.TYPE_AUTH_SERVER_HELLO) {
             handleServerHello(buf.copyOfRange(Protocol.HEADER_SIZE, len))
@@ -310,9 +313,16 @@ class TunnelClient(
      */
     private fun sendEncryptedSeg(type: Byte, data: ByteArray, off: Int, len: Int) {
         if (!keysReady.get()) throw IOException("密钥未就绪")
+        // 序号安全上限（=2^31）：触发重连换新会话（新密钥=新反重放窗口），
+        // 防止 32 位序号回绕被滑窗误判
+        val seqNum = sequence.getAndIncrement().toLong() and 0xFFFFFFFFL
+        if (seqNum >= 0x80000000L) {
+            notifyDead("发送序号空间耗尽，重连换新会话密钥")
+            return
+        }
         val sealedLen = 1 + len + Protocol.GCM_NONCE_LEN + Protocol.GCM_TAG_LEN
         val frame = ByteArray(Protocol.HEADER_SIZE + sealedLen)
-        Protocol.encodeHeaderInto(frame, 0, wireVersion, type, sealedLen, sequence.getAndIncrement())
+        Protocol.encodeHeaderInto(frame, 0, wireVersion, type, sealedLen, seqNum.toInt())
         TunnelCrypto.gcmSealInto(keyTx, type, data, off, len, frame, 0, frame, Protocol.HEADER_SIZE)
         rawSend(frame)
     }

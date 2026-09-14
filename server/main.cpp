@@ -111,10 +111,12 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
         }else if(arg == "--transport"){
             const char *v = next("both|udp|tcp");
             if(!v) return false;
-            // 当前版本实现同端口双栈（both）：UDP 与 TCP 同时监听，
-            // 客户端按条目选择传输；单栈开关留待后续
-            if(std::string(v) != "both")
-                fprintf(stderr, "[main] 提示: 当前实现为同端口双栈（both），参数 '%s' 暂被忽略\n", v);
+            const std::string mode(v);
+            if(mode != "both" && mode != "udp" && mode != "tcp"){
+                fprintf(stderr, "非法 --transport 值: %s（both|udp|tcp）\n", v);
+                return false;
+            }
+            cfg.transport_mode = mode;
         }else{
             fprintf(stderr, "未知选项: %s\n", arg.c_str());
             print_usage(argv[0]);

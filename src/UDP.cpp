@@ -115,9 +115,9 @@ bool UDP::init()
 	}
 	// 放大收发缓冲：Windows 默认 8KB，突发流量下 UDP 直接丢包、
 	// TCP 拥塞窗口收缩，表现为"连接正常但网速很慢"。
-	// 缓冲对 UDP/TCP 两种传输都生效（TCP 单连接实际受系统限制，无副作用）。
+	// 8MB 对 1Gbps×~50ms RTT 的带宽延迟积留出余量；无 Linux 式 rmem_max 钳制
 	{
-		const int bufsize = 4 * 1024 * 1024;
+		const int bufsize = 8 * 1024 * 1024;
 		setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF,
 			reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
 		setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF,

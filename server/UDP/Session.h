@@ -114,8 +114,9 @@ enum HandshakeStage : int
 // ===================================================================
 struct Session
 {
-    // tcp=true 生成 TCP 会话（传输类型创建后不可变，会话键含协议）
-    explicit Session(const sockaddr_in& addr, bool tcp, size_t queueMax = 256)
+    // tcp=true 生成 TCP 会话（传输类型创建后不可变，会话键含协议）；
+    // 发送队列 512：吸收 TUN 下行突发（64 会话 × 512 × ~1.5KB ≈ 峰值 ~48MB，可控）
+    explicit Session(const sockaddr_in& addr, bool tcp, size_t queueMax = 512)
         : is_tcp(tcp), peer_addr(addr), send_queue(queueMax)
     {
         char ip[INET_ADDRSTRLEN] = {0};

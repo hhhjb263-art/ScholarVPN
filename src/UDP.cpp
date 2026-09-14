@@ -284,6 +284,13 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 	header.type = type;
 	header.payload_len = htons(static_cast<uint16_t>(len));
 	uint32_t seq = m_seq.fetch_add(1);
+	// 序号安全上限：达到 2^31 标记重连（新会话=新密钥=新反重放窗口），
+	// 防止 32 位序号回绕后被滑窗误判
+	if (seq >= kSeqRekeyLimit) {
+		LOG_ERR("[UDP] 发送序号达到安全上限，触发重连换会话\n");
+		m_need_reconnect.store(true);
+		return false;
+	}
 	header.sequence = htonl(seq);
 
 	memcpy(sendbuf.data(), &header, Ktunnel_header);
@@ -756,8 +763,8 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 	size_t payload_len, std::vector<uint8_t>& sendbuf)
 {
 	const uint8_t* aad = payload - Ktunnel_header;
-	// 任何合法报文都视为对端存活
-	m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	// 存活时间不再在此无条件刷新：未认证报文（伪造/扫描）不应阻止心跳
+	// 超时清理；密文帧在 GCM 验证成功后才刷新 m_last_rx_ms
 
 		// 密文类型：密钥就绪后 data/heart/identity/disconnect 等均为 AES-GCM 密文，先解密再按内层类型分发
 		if (header.type == static_cast<uint8_t>(m_data) ||
@@ -772,9 +779,10 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			{
 				return; // 密钥未就绪前收到的数据/心跳一律丢弃
 			}
-			// 反重放：对端密文帧序号过滑窗（重放/复制帧在解密前即静默丢弃；
-			// 序号在 AAD 内不可篡改，静默丢弃不断连——防注入式 DoS）
-			if (!m_replay.accept(ntohl(header.sequence))) {
+			const uint32_t seq_host = ntohl(header.sequence);
+			// 反重放分两步：解密前只做"不修改状态"的过旧预检（未认证报文
+			// 不能污染窗口），GCM 验证成功后才提交窗口与存活时间
+			if (m_replay.too_old(seq_host)) {
 				return;
 			}
 			std::vector<uint8_t> enc(payload, payload + payload_len);
@@ -793,8 +801,13 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			}
 			if (!plain)
 			{
-				return; // 认证失败，静默丢弃
+				return; // 认证失败，静默丢弃（不推进窗口、不刷新存活）
 			}
+			// 验证通过才提交反重放窗口 + 刷新存活时间
+			if (!m_replay.accept(seq_host)) {
+				return;   // 重放帧：静默丢弃
+			}
+			m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 			uint8_t inner_type = 0;
 			std::vector<uint8_t> inner_payload;
 			if (!parse_inner_packet(*plain, inner_type, inner_payload))

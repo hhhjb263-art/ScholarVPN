@@ -26,6 +26,11 @@
 // UDP 类的 get_or_create_session / release_session，对 TCP 同样生效。
 // ============================================================================
 
+namespace {
+// 真实 TCP 连接数硬上限（独立于会话配额：未认证连接同样占 fd/内存）
+constexpr size_t kMaxTcpConns = 128;
+} // namespace
+
 TCPServer::TCPServer(UDP& udp)
     : m_udp(udp)
 {
@@ -57,7 +62,8 @@ bool TCPServer::start(const std::string& listen_ip, uint16_t port)
         addr.sin_addr.s_addr = INADDR_ANY;
     }else{
         int ret = inet_pton(AF_INET,listen_ip.c_str(),&addr.sin_addr);
-        if(ret < 0){
+        // 返回 0 = 格式非法：若不拦截会落到 sin_addr.s_addr=0，等于意外监听 0.0.0.0
+        if(ret != 1){
             fprintf(stderr,"[TCP] invalid listen ip %s\n", listen_ip.c_str());
             close(m_listen_fd);
             m_listen_fd = -1;
@@ -256,13 +262,21 @@ void TCPServer::handle_accept()
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
         }
 
+        // 真实 TCP 连接数硬上限：会话配额挡不住"接受连接后建会话失败/被淘汰"
+        // 的连接堆积（未认证 fd 同样占用内存与文件描述符）
+        if (m_conns.size() >= kMaxTcpConns) {
+            fprintf(stderr, "[TCP] TCP 连接数达上限 %zu，拒绝新连接\n", kMaxTcpConns);
+            close(fd);
+            continue;
+        }
+
         // 取/建会话：pending 配额 / 每 IP 上限 / 未认证快速清理对 TCP 同样生效
-        std::shared_ptr<Session> s = m_udp.get_or_create_session(peer);
+        std::shared_ptr<Session> s = m_udp.get_or_create_session(peer, true);
         if (!s) {
             close(fd);         // 会话表满：丢弃连接
             continue;
         }
-        s->tcp_fd = fd;
+        s->tcp_fd.store(fd);
         s->tcp_drop.store(false);
 
         epoll_event ev{};
@@ -270,7 +284,7 @@ void TCPServer::handle_accept()
         ev.data.fd = fd;
         if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
             fprintf(stderr, "[TCP] epoll_ctl(ADD) failed: %s\n", strerror(errno));
-            s->tcp_fd = -1;
+            s->tcp_fd.store(-1);
             m_udp.release_session(s->peer_key);
             close(fd);
             continue;
@@ -339,7 +353,10 @@ bool TCPServer::read_conn(int fd, Conn& c)
 }
 
 // 断开收尾：本线程是 fd 唯一 owner。epoll 移除 + close + 会话释放（幂等：
-// 会话可能已被其他路径释放，release_session 内部查表为空直接返回）
+// 会话可能已被其他路径释放，release_session 内部查表为空直接返回）。
+// close 与发送互斥：send_packet（send_work/heartbeat 线程）持 send_mutex
+// 读 tcp_fd 后整帧写入——close 必须先拿到同一把锁再摘除 fd，杜绝
+// "发送线程拿旧 fd 写到被系统复用的新连接"的竞争
 void TCPServer::drop_conn(int fd, const char* reason)
 {
     auto it = m_conns.find(fd);
@@ -348,10 +365,13 @@ void TCPServer::drop_conn(int fd, const char* reason)
     const std::shared_ptr<Session> s = std::move(it->second.session);
     m_conns.erase(it);
     epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-    close(fd);
-    if (!s)
-        return;
-    s->tcp_fd = -1;   // fd 已关闭：send_packet/send_all 不再使用
-    fprintf(stderr, "[TCP] 连接断开 fd=%d (%s): %s\n", fd, s->peer_key.c_str(), reason);
-    m_udp.release_session(s->peer_key);
+    if (s) {
+        std::lock_guard<std::mutex> lock(s->send_mutex);
+        s->tcp_fd.store(-1);   // fd 已关闭：send_packet/send_all 不再使用
+        close(fd);
+        fprintf(stderr, "[TCP] 连接断开 fd=%d (%s): %s\n", fd, s->peer_key.c_str(), reason);
+    } else {
+        close(fd);
+    }
+    m_udp.release_session(s ? s->peer_key : std::string());
 }

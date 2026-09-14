@@ -29,10 +29,12 @@ public:
 
     bool is_running() const { return m_running.load(); }
 
-    // tun_ip / tun_prefix：虚拟 IP 池基准；max_clients：最大并发会话数（0=默认 64）
+    // tun_ip / tun_prefix：虚拟 IP 池基准；max_clients：最大并发会话数（0=默认 64）；
+    // udp_enabled=false（--transport tcp）：不绑定 UDP socket，仅服务 TCP 会话
+    // （recv 线程空转待命，会话/认证/加密机制全部照常工作）
     bool start(const std::string& local_ip, uint16_t local_port,
                const std::string& tun_ip, int tun_prefix,
-               size_t max_clients = 64);
+               size_t max_clients = 64, bool udp_enabled = true);
     void stop();
     void close();
 
@@ -59,8 +61,9 @@ public:
                        const uint8_t* payload, size_t pay_len);
     // 从表移除 + 释放虚拟 IP + 标记下线（TCPServer 连接断开时也调用）
     void release_session(const std::string& key);
-    // 取/建会话（TCPServer accept 后也调用；pending 配额/每源上限对 TCP 同样生效）
-    std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr);
+    // 取/建会话（TCPServer accept 后也调用；pending 配额/每源上限对 TCP 同样生效）。
+    // 会话键含传输协议（"ip:port/tcp|udp"），TCP/UDP 不会混用同一会话
+    std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr, bool tcp);
 
 private:
     void send_work();

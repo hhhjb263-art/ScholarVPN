@@ -236,15 +236,27 @@ bool UDP::start(const std::string& local_ip, uint16_t local_port,
         if (setsockopt(m_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
             fprintf(stderr, "[UDP] setsockopt(SO_REUSEADDR) failed: %s\n", strerror(errno));
         }
-        // 放大收发缓冲：默认 8KB 在突发/高带宽下丢包（UDP 无重传，丢包由上层 TCP
-        // 重传兜底但会严重降速）；4MB 缓冲对突发有足够吸收能力
+        // 放大收发缓冲：普通 SO_RCVBUF/SO_SNDBUF 会被内核静默钳制到
+        // net.core.rmem_max / wmem_max（默认仅 ~208KB，写的 4MB 根本不生效）！
+        // 服务端以 root 运行：优先用 *_FORCE 强制生效，失败再退回普通调用。
+        // 8MB 足以吸收 1Gbps×~50ms RTT 的带宽延迟积
         {
-            const int bufsize = 4 * 1024 * 1024;
-            if (setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0) {
-                fprintf(stderr, "[UDP] setsockopt(SO_RCVBUF) failed: %s\n", strerror(errno));
+            const int bufsize = 8 * 1024 * 1024;
+            if (setsockopt(m_sock, SOL_SOCKET, SO_RCVBUFFORCE, &bufsize, sizeof(bufsize)) < 0) {
+                if (setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0) {
+                    fprintf(stderr, "[UDP] setsockopt(SO_RCVBUF) failed: %s\n", strerror(errno));
+                } else {
+                    fprintf(stderr, "[UDP] 提示: SO_RCVBUF 可能被 net.core.rmem_max 钳制，"
+                            "建议 sysctl -w net.core.rmem_max=8388608\n");
+                }
             }
-            if (setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0) {
-                fprintf(stderr, "[UDP] setsockopt(SO_SNDBUF) failed: %s\n", strerror(errno));
+            if (setsockopt(m_sock, SOL_SOCKET, SO_SNDBUFFORCE, &bufsize, sizeof(bufsize)) < 0) {
+                if (setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0) {
+                    fprintf(stderr, "[UDP] setsockopt(SO_SNDBUF) failed: %s\n", strerror(errno));
+                } else {
+                    fprintf(stderr, "[UDP] 提示: SO_SNDBUF 可能被 net.core.wmem_max 钳制，"
+                            "建议 sysctl -w net.core.wmem_max=8388608\n");
+                }
             }
         }
         sockaddr_in server_addr{};
@@ -616,24 +628,28 @@ void UDP::send_work()
         for (auto& s : sessions) {
             if (!s->handshaked.load() || !s->enc_ready.load())
                 continue;
-            if (!s->send_queue.pop(buf))
-                continue;
-            if (buf.is_empty())
-                continue;
-            const size_t pay_size = buf.data_size();
-            if (pay_size > KMax_data_payload) {
+            // 每会话本轮最多排空 64 包：持续下载时不再"每轮只发 1 包"
+            // （高负载下吞吐被遍历节奏限制），同时预算防热会话饿死其他会话
+            for (int n = 0; n < 64 && s->send_queue.pop(buf); ++n) {
+                if (buf.is_empty()) {
+                    buf.clear();
+                    continue;
+                }
+                const size_t pay_size = buf.data_size();
+                if (pay_size > KMax_data_payload) {
+                    buf.clear();
+                    continue;
+                }
+                if (g_packet_log) {
+                    fprintf(stderr, "[UDP][TX] 发送数据 len=%zu to %s\n", pay_size, s->peer_key.c_str());
+                }
+                if (!send_packet(*s, static_cast<uint8_t>(m_data), buf.get_data(), pay_size, sendbuf)) {
+                    // TCP 连接级失败已在 send_packet 内标记 tcp_drop（epoll 线程断开）
+                    fprintf(stderr, "[UDP] 发送数据失败: %s\n", s->peer_key.c_str());
+                }
                 buf.clear();
-                continue;
+                any = true;
             }
-            if (g_packet_log) {
-                fprintf(stderr, "[UDP][TX] 发送数据 len=%zu to %s\n", pay_size, s->peer_key.c_str());
-            }
-            if (!send_packet(*s, static_cast<uint8_t>(m_data), buf.get_data(), pay_size, sendbuf)) {
-                // TCP 连接级失败已在 send_packet 内标记 tcp_drop（epoll 线程断开）
-                fprintf(stderr, "[UDP] 发送数据失败: %s\n", s->peer_key.c_str());
-            }
-            buf.clear();
-            any = true;
         }
         if (!any) {
             // 无下行数据：条件等待 TUN 入队唤醒（事件驱动，替代 1ms sleep 轮询）；
@@ -680,45 +696,49 @@ void UDP::recv_work()
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
             continue;
 
-        recvbuf.resize(KMax_packet_size);
-        socklen_t peer_addr_size = sizeof(peer_addr);
+        // 批处理：一次 poll 唤醒后排空内核接收缓冲（突发流量下把 N 次
+        // poll+recvfrom 压成 1 次 poll + N 次 recvfrom，降低系统调用开销）。
+        // 每轮上限 64 包：给心跳/停止检查留节奏，也防止单连接长期独占收包线程
+        for (int budget = 0; budget < 64 && is_running(); ++budget) {
+            recvbuf.resize(KMax_packet_size);
+            socklen_t peer_addr_size = sizeof(peer_addr);
 
-        int ret = recvfrom(m_sock, recvbuf.data(), recvbuf.size(), 0,
-                           reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_addr_size);
-        if (ret == 0) {
-            // 零长度 UDP 数据报是合法报文：攻击者发一个空包不应打死收包线程
-            continue;
-        }
-        if (ret < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // 与 poll 结果的竞态窗口内数据被取走：立即回 poll，不 sleep
+            int ret = recvfrom(m_sock, recvbuf.data(), recvbuf.size(), 0,
+                               reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_addr_size);
+            if (ret == 0) {
+                // 零长度 UDP 数据报是合法报文：攻击者发一个空包不应打死收包线程
                 continue;
             }
-            // 瞬时错误（ENETUNREACH/ENOBUFS 等）：记日志后继续。
-            // 绝不能 break——recv 线程退出后认证/转发/心跳全部停摆且 watchdog 无法感知
-            fprintf(stderr, "[UDP] recvfrom() failed: %s\n", strerror(errno));
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
+            if (ret < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;   // 内核缓冲已排空：回 poll 等下一批
+                }
+                // 瞬时错误（ENETUNREACH/ENOBUFS 等）：记日志后继续。
+                // 绝不能 break——recv 线程退出后认证/转发/心跳全部停摆且 watchdog 无法感知
+                fprintf(stderr, "[UDP] recvfrom() failed: %s\n", strerror(errno));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                break;
+            }
+            if (ret < static_cast<int>(Ktunnel_header))
+                continue;   // 包太短
+
+            tunnel_header hdr{};
+            memcpy(&hdr, recvbuf.data(), Ktunnel_header);
+            // 注意：版本字段在此不校验——TCP 帧标 v_tcp、UDP 标 v_udp，
+            // 由 handle_framed 按会话传输类型（expect_ver）统一校验
+            if (hdr.magic != Kmagic)
+                continue;
+            size_t pay_len = ntohs(hdr.payload_len);
+            if (pay_len > Max_payload_len || pay_len + Ktunnel_header > static_cast<size_t>(ret))
+                continue;
+
+            // 按源地址取/建会话（新来源创建 pending 会话；达到上限则丢弃）
+            std::shared_ptr<Session> s = get_or_create_session(peer_addr, false);
+            if (!s)
+                continue;
+            // 任何合法报文都视为对端存活 + 解密分发/阶段1握手：UDP 与 TCP 两条路径共用
+            handle_framed(*s, hdr, recvbuf.data() + Ktunnel_header, pay_len);
         }
-        if (ret < static_cast<int>(Ktunnel_header))
-            continue;   // 包太短
-
-        tunnel_header hdr{};
-        memcpy(&hdr, recvbuf.data(), Ktunnel_header);
-        // 注意：版本字段在此不校验——TCP 帧标 v_tcp、UDP 标 v_udp，
-        // 由 handle_framed 按会话传输类型（expect_ver）统一校验
-        if (hdr.magic != Kmagic)
-            continue;
-        size_t pay_len = ntohs(hdr.payload_len);
-        if (pay_len > Max_payload_len || pay_len + Ktunnel_header > static_cast<size_t>(ret))
-            continue;
-
-        // 按源地址取/建会话（新来源创建 pending 会话；达到上限则丢弃）
-        std::shared_ptr<Session> s = get_or_create_session(peer_addr, false);
-        if (!s)
-            continue;
-        // 任何合法报文都视为对端存活 + 解密分发/阶段1握手：UDP 与 TCP 两条路径共用
-        handle_framed(*s, hdr, recvbuf.data() + Ktunnel_header, pay_len);
     }
 }
 

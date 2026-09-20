@@ -519,9 +519,12 @@ bool UDP::send_packet(Session& s, uint8_t type, const uint8_t* data, size_t len,
         }
         // AAD = 实际发出的头部：先按密文长度更新 payload_len 再加密。
         // 零临时 vector：内层 type 字节作第一段明文、载荷作第二段直接加密，
-        // 输出（nonce||ct||tag）直写 tmp_buf 帧头之后
+        // 输出（nonce||ct||tag）直写 tmp_buf 帧头之后。
+        // 注意必须先按密文尺寸扩容：out_cap = 明文长度会把 seal 撑爆
+        // （曾因此所有密文发送抛 length_error，客户端永远收不到 identity_ok）
         hdr.payload_len = htons(static_cast<uint16_t>(len + 1 + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN));
         memcpy(tmp_buf.data(), &hdr, Ktunnel_header);
+        tmp_buf.resize(Ktunnel_header + len + 1 + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN);
         const uint8_t inner_type = type;
         size_t sealed_len = 0;
         try {

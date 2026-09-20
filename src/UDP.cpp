@@ -311,7 +311,10 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 		header.payload_len = htons(static_cast<uint16_t>(enc_len));
 		memcpy(sendbuf.data(), &header, Ktunnel_header);
 		// 零临时 vector：内层 type 字节作第一段明文、载荷作第二段直接加密，
-		// 输出（nonce||ct||tag）直写 sendbuf 帧头之后
+		// 输出（nonce||ct||tag）直写 sendbuf 帧头之后。
+		// 注意必须先按密文尺寸扩容：out_cap = 明文长度会把 seal 撑爆
+		// （曾因此所有密文发送抛 length_error，服务端永远收不到身份报文）
+		sendbuf.resize(Ktunnel_header + enc_len);
 		size_t sealed_len = 0;
 		try
 		{

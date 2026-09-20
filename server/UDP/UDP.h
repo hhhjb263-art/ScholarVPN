@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -65,6 +66,12 @@ public:
     // 会话键含传输协议（"ip:port/tcp|udp"），TCP/UDP 不会混用同一会话
     std::shared_ptr<Session> get_or_create_session(const sockaddr_in& addr, bool tcp);
 
+    // TCPServer 注册的唤醒钩子：send_packet 把 TCP 已加密整帧提交进会话
+    // tcp_tx 队列后调用（写 eventfd），事件线程立即排空队列写 socket。
+    // 未注册时（TCP 未启用/停止中）由事件线程 200ms 周期兜底扫描
+    void set_tcp_tx_wake(std::function<void()> wake);
+    void tcp_tx_wake() const;   // 有 TCP 帧入队后调用（读钩子并执行，可空）
+
 private:
     void send_work();
     void recv_work();
@@ -105,6 +112,11 @@ private:
 
     std::shared_ptr<EVP_PKEY> m_sig_priv;
     std::string m_keys_dir;
+
+    // TCP 发送唤醒钩子（TCPServer::start 注册；互斥保护，
+    // 注册/注销与发送线程并发安全）
+    mutable std::mutex m_tcp_tx_wake_mutex;
+    std::function<void()> m_tcp_tx_wake;
 
     // 全局接收队列（各会话解密后的 IP 包 → TUN）
     PacketQueue m_queue_recv{ 4096 };

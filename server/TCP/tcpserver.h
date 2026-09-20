@@ -40,17 +40,32 @@ public:
     bool is_running() const { return m_running.load(); }
 
 private:
-    // 每连接状态：会话 + 接收累积缓冲（分帧状态机）。仅事件线程访问
+private:
+    // 每连接状态：会话 + 接收累积缓冲（分帧状态机）+ 发送缓冲。
+    // 全部仅事件线程访问（跨线程提交的帧先落在 Session.tcp_tx，
+    // 由事件线程 pump_tx/flush_conn_tx 搬运到 txBuf 再写 socket）
     struct Conn
     {
         std::shared_ptr<Session> session;
         std::vector<uint8_t> rxBuf;
+        // 待发缓冲：跨线程入队的已加密整帧 + 尚未写完的部分帧；
+        // txOff = 已写出偏移。socket 满（EAGAIN）时订阅 EPOLLOUT 续写
+        std::vector<uint8_t> txBuf;
+        size_t txOff = 0;
+        bool want_epollout = false;
     };
 
     void event_loop();
     void handle_accept();
     // 读事件：排空内核缓冲并处理所有完整帧；返回 false = 连接作废（调用方 drop）
     bool read_conn(int fd, Conn& c);
+    // 发送：把 Session.tcp_tx 的跨线程提交帧搬进 txBuf 并非阻塞写出；
+    // 未写完订阅 EPOLLOUT。返回 false = 连接作废（调用方 drop）
+    bool flush_conn_tx(int fd, Conn& c);
+    // 每轮事件循环末尾：排空所有连接的待发队列（唤醒兜底）
+    void pump_tx();
+    // eventfd 唤醒（stop 与跨线程"有帧待发"共用；未运行时静默）
+    void wake();
     // 断开收尾：epoll 移除 + close（唯一 owner）+ 会话释放。幂等
     void drop_conn(int fd, const char* reason);
 

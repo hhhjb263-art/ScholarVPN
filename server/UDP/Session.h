@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <netinet/in.h>
 #include <set>
@@ -94,6 +95,11 @@ enum HandshakeStage : int
     HS_STAGE_KEYS = 2,       // 会话密钥已派生（ECDH 完成，临时私钥已销毁）
     HS_STAGE_AUTHED = 3,     // 身份认证通过（会话完全建立）
 };
+
+// TCP 会话发送积压上限（字节）：加密整帧先入本会话队列，事件线程经 socket
+// 尽力写出；慢客户端（对端不收/链路劣化）积压到此即断开，防无界内存。
+// 帧上限 1441 字节，2MB ≈ 1400 帧，远大于内核 SNDBUF 已吸收的部分
+constexpr size_t kMaxTcpTxBufBytes = 2 * 1024 * 1024;
 
 // ===================================================================
 // 多用户架构导读：
@@ -188,9 +194,16 @@ struct Session
     std::atomic<bool> authenticated{ false };
     std::atomic<bool> handshaked{ false };
 
-    PacketQueue send_queue;           // 本会话待发数据（TUN 下行）
+    PacketQueue send_queue;           // 本会话待发数据（TUN 下行，明文 IP 包）
     std::mutex send_mutex;            // 发送串行化（多个线程可能同时发送）；
                                       // TCP 连接 close 也必须持有它（与发送互斥）
+    // TCP 跨线程发送队列：非事件线程（send_work/heartbeat）把【已加密整帧】
+    // 提交到这里，TCPServer 事件线程是 socket 唯一写者（flush_conn_tx 搬运
+    // + EPOLLOUT）。事件线程自己（recv 路径回心跳/identity_ok）也走同一队列，
+    // 保证同会话帧序与"单线程写 socket"的所有权模型。
+    std::mutex tcp_tx_mutex;
+    std::deque<std::vector<uint8_t>> tcp_tx;
+    size_t tcp_tx_bytes = 0;          // 仅在 tcp_tx_mutex 内读写
     std::atomic<uint32_t> seq{ 0 };
     ReplayWindow replay;              // 上行密文帧反重放滑窗（验签成功后提交）
 

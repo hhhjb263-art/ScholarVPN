@@ -27,6 +27,11 @@ object TunnelCrypto {
     /** 加密时承载"内层 type"字节的线程本地暂存（避免热路径每包分配） */
     private val typeScratch = ThreadLocal.withInitial { ByteArray(1) }
 
+    // 每包热路径的密码对象线程本地复用：Cipher.getInstance/Mac.getInstance
+    // 涉及 Provider 查找，逐包调用在弱核手机上开销显著（Android 侧主要分配点）
+    private val cipherCache = ThreadLocal.withInitial { Cipher.getInstance("AES/GCM/NoPadding") }
+    private val macCache = ThreadLocal.withInitial { Mac.getInstance("HmacSHA256") }
+
     // ---------- 随机数 ----------
 
     fun randomBytes(n: Int): ByteArray = ByteArray(n).also { random.nextBytes(it) }
@@ -50,7 +55,8 @@ object TunnelCrypto {
         val nonce = ByteArray(Protocol.GCM_NONCE_LEN)
         random.nextBytes(nonce)
         System.arraycopy(nonce, 0, output, outOff, Protocol.GCM_NONCE_LEN)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        // Cipher 线程本地复用：每包重新 init（换 nonce/密钥），避免逐包 getInstance
+        val cipher = cipherCache.get()
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(Protocol.GCM_TAG_LEN * 8, nonce))
         cipher.updateAAD(aadBuf, aadOff, Protocol.HEADER_SIZE)
         val scratch = typeScratch.get()
@@ -77,7 +83,7 @@ object TunnelCrypto {
         if (srcLen < Protocol.GCM_NONCE_LEN + Protocol.GCM_TAG_LEN) return null
         val nonce = sealed.copyOfRange(srcOff, srcOff + Protocol.GCM_NONCE_LEN)
         return try {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            val cipher = cipherCache.get()
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(Protocol.GCM_TAG_LEN * 8, nonce))
             cipher.updateAAD(aadBuf, aadOff, Protocol.HEADER_SIZE)
             val out = ByteArray(srcLen - Protocol.GCM_NONCE_LEN - Protocol.GCM_TAG_LEN)
@@ -120,7 +126,7 @@ object TunnelCrypto {
     }
 
     private fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
-        val mac = Mac.getInstance("HmacSHA256")
+        val mac = macCache.get()
         mac.init(SecretKeySpec(if (key.isEmpty()) ByteArray(32) else key, "HmacSHA256"))
         return mac.doFinal(data)
     }

@@ -162,10 +162,12 @@ void VpnCore::stop()
     if(m_thread_u2t.joinable()){
         m_thread_u2t.join();
     }
-    // 停止 TCP 监听（epoll 事件线程退出并统一关闭全部连接）
-    m_tcp.stop();
-    // 停止 UDP 收发线程
+    // 先停 UDP 收发线程：send_work/heartbeat 是 TCP 发送唤醒钩子的生产者
+    // （tcp_tx_wake → TCPServer eventfd），生产者先停，事件线程与钩子
+    // 注销的生命周期才无竞争
     m_udp.stop();
+    // 再停止 TCP 监听（epoll 事件线程退出并统一关闭全部连接 + 注销唤醒钩子）
+    m_tcp.stop();
     // 清理路由与网卡（仅在 TUN 创建成功后才做网卡操作）
     if(m_cfg.add_default_route){
         m_adapter.route_del("0.0.0.0", 0);

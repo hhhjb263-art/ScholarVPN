@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include "Crypt.h"
 #include <openssl/rand.h>
@@ -309,30 +310,28 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 			return false;
 		header.payload_len = htons(static_cast<uint16_t>(enc_len));
 		memcpy(sendbuf.data(), &header, Ktunnel_header);
-		std::vector<uint8_t> inner;
-		inner.reserve(1 + len);
-		inner.push_back(type);
-		if (len)
-			inner.insert(inner.end(), data, data + len);
-		std::vector<uint8_t> enc;
+		// 零临时 vector：内层 type 字节作第一段明文、载荷作第二段直接加密，
+		// 输出（nonce||ct||tag）直写 sendbuf 帧头之后
+		size_t sealed_len = 0;
 		try
 		{
-			// 客户端发送方向 = key_tx（m_key_c2s）
-			enc = aes256_gcm_encrypt(
+			// 客户端发送方向 = key_tx（m_key_c2s）；AAD = 帧头
+			sealed_len = aes256_gcm_seal(
 				m_key_c2s,
-				inner.data(), inner.size(),
-				sendbuf.data(), Ktunnel_header);
+				&type, 1,
+				len ? data : nullptr, len,
+				sendbuf.data(), Ktunnel_header,
+				sendbuf.data() + Ktunnel_header, sendbuf.size() - Ktunnel_header);
 		}
 		catch (const std::exception& e)
 		{
 			LOG_ERR("[UDP] 加密失败: %s\n", e.what());
 			return false;
 		}
-		if (enc.size() != enc_len)
+		if (sealed_len != enc_len)
 			return false;
-		sendbuf.resize(Ktunnel_header + enc.size());
-		memcpy(sendbuf.data() + Ktunnel_header, enc.data(), enc.size());
-		total_len = Ktunnel_header + enc.size();
+		sendbuf.resize(Ktunnel_header + sealed_len);
+		total_len = Ktunnel_header + sealed_len;
 		// 发送差异走钩子：UDP = sendto（数据报）；TCP = send_all（流式循环写）。
 		// 这里绝不能硬编码 sendto——TCP 子类覆写的 raw_send 才是流式发送：
 		// 否则阶段3身份报文/心跳/数据面等密文帧在 TCP socket 上 sendto 失败
@@ -785,21 +784,25 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			if (m_replay.too_old(seq_host)) {
 				return;
 			}
-			std::vector<uint8_t> enc(payload, payload + payload_len);
-			std::optional<std::vector<uint8_t>> plain;
+			// 零临时 vector：密文段（nonce||ct||tag）直接从接收缓冲解密到栈上
+			// 明文缓冲（内层明文 = type(1)+载荷 ≤ KMax_data_payload）
+			uint8_t plain[KMax_data_payload + 1];
+			size_t plain_len = 0;
 			try
 			{
 				// 客户端接收方向 = key_rx（m_key_s2c）；AAD = 帧头
-				plain = aes256_gcm_decrypt(
+				plain_len = aes256_gcm_open(
 					m_key_s2c,
-					enc, aad, Ktunnel_header);
+					payload, payload_len,
+					aad, Ktunnel_header,
+					plain, sizeof(plain));
 			}
 			catch (const std::exception& e)
 			{
 				LOG_ERR("[UDP] 解密异常: %s\n", e.what());
 				return;
 			}
-			if (!plain)
+			if (plain_len == 0)
 			{
 				return; // 认证失败，静默丢弃（不推进窗口、不刷新存活）
 			}
@@ -808,12 +811,22 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 				return;   // 重放帧：静默丢弃
 			}
 			m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-			uint8_t inner_type = 0;
-			std::vector<uint8_t> inner_payload;
-			if (!parse_inner_packet(*plain, inner_type, inner_payload))
+			if (plain_len < 1)
+				return;
+			const uint8_t inner_type = plain[0];
+			// 数据面（热路径）直接从栈缓冲零拷贝入队；其余小载荷（心跳/身份）
+			// 拷进临时 vector 走原有分发逻辑
+			if (inner_type == static_cast<uint8_t>(m_data))
 			{
+				if (plain_len <= 1)
+					return;
+				{
+					packet_buffer pbuf(plain + 1, plain_len - 1);
+					m_recvqueue.push(std::move(pbuf));
+				}
 				return;
 			}
+			std::vector<uint8_t> inner_payload(plain + 1, plain + plain_len);
 			switch (inner_type)
 			{
 			case m_data:

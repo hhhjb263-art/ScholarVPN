@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="popup.css" />
+  <title>ScholarVPN 浏览器代理</title>
+</head>
+<body>
+  <header class="head">
+    <div class="logo">S</div>
+    <div class="titles">
+      <div class="title">ScholarVPN</div>
+      <div class="subtitle">浏览器代理（仅本浏览器生效）</div>
+    </div>
+    <label class="switch" title="启用/停用">
+      <input type="checkbox" id="enabled" />
+      <span class="slider"></span>
+    </label>
+  </header>
+
+  <main>
+    <label class="field">
+      <span>代理协议</span>
+      <select id="protocol">
+        <option value="https">HTTPS 代理（TLS 加密，推荐）</option>
+        <option value="socks5">SOCKS5（明文，最快）</option>
+        <option value="http">HTTP 代理（明文，仅内网/SSH 隧道后）</option>
+      </select>
+    </label>
+
+    <div class="row">
+      <label class="field grow">
+        <span>服务器地址</span>
+        <input type="text" id="host" placeholder="例如 1.2.3.4 或 vpn.example.com" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="field port">
+        <span id="portLabel">端口</span>
+        <input type="text" id="port" inputmode="numeric" placeholder="8443" autocomplete="off" />
+      </label>
+    </div>
+
+    <div class="row">
+      <label class="field grow">
+        <span>用户名（可选）</span>
+        <input type="text" id="user" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="field grow">
+        <span>密码（可选）</span>
+        <input type="password" id="pass" autocomplete="off" />
+      </label>
+    </div>
+
+    <label class="field">
+      <span>代理范围</span>
+      <select id="mode">
+        <option value="global">全部流量走代理（下方列表 = 直连例外）</option>
+        <option value="whitelist">只有下方列表的域名走代理</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span id="listLabel">域名列表（每行一个，可留空）</span>
+      <textarea id="list" rows="4" placeholder="example.com&#10;*.google.com 的子域会自动匹配" spellcheck="false"></textarea>
+    </label>
+
+    <div class="actions">
+      <button id="test" class="ghost">检测出口 IP</button>
+      <span id="status" class="status"></span>
+    </div>
+
+    <p class="hint">
+      仅代理本浏览器流量，不改系统网络。服务端对应入口：
+      <code>--https-proxy-port</code>（TLS 加密，需证书）/
+      <code>--socks5-port</code> /
+      <code>--http-proxy-port</code>；
+      认证用 <code>--proxy-user/--proxy-pass</code>。
+      HTTPS 代理要求证书被系统信任（自签证书需先导入信任存储）。
+    </p>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

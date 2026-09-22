@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "ScholarVPN 浏览器代理",
+  "version": "1.0.0",
+  "description": "只在浏览器里生效的代理客户端：把浏览器流量走 ScholarVPN 服务端的 SOCKS5 出口，不安装系统级 VPN、不改系统路由。",
+  "permissions": [
+    "proxy",
+    "storage",
+    "webRequest",
+    "webRequestAuthProvider"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ScholarVPN 浏览器代理",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

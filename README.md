@@ -25,251 +25,142 @@
 
 ## 项目介绍
 
-### 架构
+用于学习 VPN / 隧道 / 加密协议原理的完整示例，包含四个部分：
 
-客户端与服务端通过 **UDP/TCP 双传输**建立隧道：客户端创建 Wintun 虚拟网卡，把本机流量封装进自定义报文发往服务器；服务器从 TUN 网卡转发到真实网络，回程流量再反向封装回客户端。默认走 UDP；运营商丢 UDP 时可在客户端切换 TCP（服务端同端口双栈同时监听，`--transport` 可控制开/关）。两端使用同一套自研隧道协议（自定义报文头 + 三阶段身份认证 + 心跳保活），加密层基于 OpenSSL 标准算法，**加密与传输方式无关**。
+| 组成部分 | 说明 |
+| --- | --- |
+| **Linux 服务端** | 多用户并发（自动分配虚拟 IP、同身份互踢、失联自动清理），一键部署脚本 |
+| **Windows 客户端** | Qt 图形界面，虚拟网卡接管本机流量，实时速率曲线，多服务器管理 |
+| **Android 客户端** | VpnService 客户端（Kotlin），功能与 Windows 端一致 |
+| **浏览器插件** | Chrome/Edge 扩展，**只在浏览器里生效**：不改系统网络、不装系统组件 |
 
-- **客户端传输层**：`UDP` 为基类（三阶段认证 / AES-256-GCM / 心跳 / 收发队列全部在基类实现），`TCP` 子类只覆写 4 个传输钩子（建连 / 发送 / 分帧接收）+ 协议版本字节（UDP 帧标 `v_udp=1`，TCP 帧标 `v_tcp=2`，错传报文在版本校验处丢弃）。TCP 侧 socket 非阻塞：读侧「先吃接收缓冲、不够再 poll+recv」连续处理粘包帧，写侧 poll 等可写（总上限 5s，对端持续不收则丢帧交上层重传），无 sleep 轮询。
-- **服务端传输层**：UDP 会话表 / 认证 / 加密 / 心跳与 TCP 完全共用；TCP 监听为 **epoll 事件驱动**（单线程管理全部连接，替代每连接一线程），读事件排空内核缓冲并按**单连接每轮 64 帧预算**处理（防单连接独占事件线程），接收缓冲超 512KB 即断开（防只发帧头的恶意流）。TCP 发送为**队列化 + EPOLLOUT**：其他线程只把已加密整帧提交进会话队列（积压上限 2MB，超限断开），事件线程是 socket 唯一写者，慢客户端不再阻塞任何发送/心跳线程。
+整机客户端走自研加密隧道（UDP/TCP 双传输、三阶段身份认证、AES-256-GCM 认证加密、
+前向安全会话密钥、心跳保活与自动重连）；浏览器插件则把浏览器流量指向服务端代理入口，
+可选 **HTTPS 代理（TLS 加密，推荐）** / SOCKS5 / HTTP 三种方式。
 
-### 浏览器插件（可选，仅浏览器生效）
+## 快速开始
 
-`browser-extension/` 是 **Chrome/Edge (MV3) 扩展**：用 `chrome.proxy` 把浏览器流量指向服务端的代理入口。不安装系统级 VPN、不改系统路由，可与整机版客户端并存。
+### 服务端（Linux）
 
-服务端提供三个入口（默认全关，环境变量见 `server/start.sh`）：
+依赖：CMake ≥ 3.16、C++17 编译器、OpenSSL、pthread。
 
-| 入口 | 参数 | 链路加密 |
-| --- | --- | --- |
-| HTTPS 代理 | `--https-proxy-port` + `--https-proxy-cert/--https-proxy-key` | ✅ TLS（浏览器↔代理全程，推荐） |
-| SOCKS5 | `--socks5-port` | ❌ 明文（最快，仅内网/可信链路） |
-| HTTP 代理 | `--http-proxy-port` | ❌ 明文（内网或前置 stunnel/SSH） |
+```bash
+cd server
+cmake -S . -B build && cmake --build build
 
-三者共用 `--proxy-user/--proxy-pass` 认证；扩展内可切换协议，并支持"全局代理（域名可例外）"与"仅代理指定域名"两种范围。HTTPS 代理要求证书被系统信任（Let's Encrypt 证书或导入自签证书到信任存储）。
+# 一键部署（自动配置转发/NAT/防火墙，推荐装成系统服务）
+sudo ./start.sh install
+```
 
-安全默认值：代理**默认拒绝访问服务端内网/回环/TUN 网段目标**（防止浏览器侧借代理打内网，被拒时 SOCKS5 回 `0x02`、HTTP(S) 回 `403`），内网自用可加 `--proxy-allow-private` 放行。
+其他子命令：`./start.sh`（前台调试）、`-d`（后台守护，异常自动重启）、`status`、`logs`、
+`doctor`（环境诊断）、`uninstall`。
 
-> 详见 [browser-extension/README.md](browser-extension/README.md)。
+首次启动会生成服务器身份密钥 `keys/server_sig.key` / `.pub`：把 `.pub` 内容填入客户端
+（或在客户端服务器条目里粘贴），客户端据此验证服务器身份、防中间人。
 
-客户端为 **Qt 图形界面程序**：主界面显示当前服务器卡片（连接/断开/编辑）与实时上下行速率曲线；通过「Switch Server」覆盖层管理多台服务器，点击卡片即切换。断开/崩溃均自动恢复网卡 DNS（防泄漏守卫 + 崩溃看门狗）。
+### Windows 客户端
 
-### 隧道协议与加密（概述）
+环境：Visual Studio 2022 + Qt 6.9.1（msvc2022_64；Qt 装在别处需改 `VPN_.vcxproj` 路径）。
+用 VS 打开 `VPN_.sln` 生成 x64 配置即可，OpenSSL 与 Wintun 已内置，构建后自动拷贝运行所需 DLL。
 
-- 客户端与服务端通过自研隧道协议通信，支持 **UDP / TCP 双传输**（同端口双栈，按服务器条目切换；自定义报文头，含魔数、版本、类型、序号，版本字节即传输标识），具体线格式属于实现细节，不在此展开；
-- **三阶段身份认证**：包含防中间人校验（服务器身份签名验证）与客户端身份准入（注册/登录），**身份未验证通过前服务端禁止转发任何流量**；
-- **加密**：基于 OpenSSL 标准算法，会话密钥支持前向安全，数据面使用认证加密（AES-256-GCM）；
-- **心跳保活**：认证通过后周期发送心跳，对端失联时自动重连；
-- **密钥体系**：持久身份密钥为 Ed25519（服务器公钥内置于客户端；客户端私钥经 Windows DPAPI 加密存储，磁盘不落明文）。
+### Android 客户端
 
-### 多用户支持（服务端）
+直接安装仓库内的 `android/ScholarVPN-v1.0-release.apk`；源码在 `android/`，用 Gradle 构建。
 
-服务端基于 **Session（会话）模型** 支持多客户端并发：
+### 浏览器插件
 
-- 每个客户端（按 UDP 源 IP+端口 识别）对应一个独立 `Session`，认证状态、会话密钥、发送队列与心跳完全隔离；
-- **虚拟 IP 自动分配**：客户端认证通过后，服务端在 TUN 网段内自动分配唯一地址并通告给客户端，客户端连接成功后自动采用；
-- **epoll 事件驱动**：TCP 连接由单线程 epoll 事件循环统一 accept / 读 / 断开收尾（连接 fd 非阻塞，其他线程通过断开标志请求关闭，无跨线程 close 竞争），并发连接数不再受线程数限制；
-- **同身份互踢**：同一 `ClientID` 重复登录时旧的在线会话自动下线；
-- **会话上限与清理**：`--max-clients` 限制并发数（默认 64），未认证会话与失联会话按超时自动清理；
-- TUN 下行按**目的虚拟 IP** 查表转发到对应客户端。
+把 `browser-extension/` 目录在 Chrome/Edge 里「加载已解压的扩展程序」加载即可，**无需编译**。
+服务端需先开启对应入口（`--https-proxy-port` 等），证书与配置步骤见
+[browser-extension/README.md](browser-extension/README.md)。
 
-> **多用户部署（NAT 模式）**：多客户端共享服务端出口时，开启内核转发 + NAT（请仅在自有实验环境中使用）：
->
-> ```bash
-> # 1. 开启 IPv4 转发（持久化写入 /etc/sysctl.conf）
-> sysctl -w net.ipv4.ip_forward=1
-> # 2. NAT：客户端网段访问外网（按实际外网网卡调整 eth0）
-> iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
-> # 3. 启动服务端（默认即多用户，自动分配 10.8.0.2、10.8.0.3 ...）
-> sudo ./build/vpn_server -a 10.8.0.1 -p 51820 --max-clients 100
-> ```
->
-> `start.sh` 可通过环境变量 `MAX_CLIENTS=100` 传入 `--max-clients`。
+## 使用
 
-### 配置
+### 首次注册
 
-客户端参数通过 INI 文件配置，**推荐全部在 GUI 内操作**（添加/编辑/删除/切换服务器自动维护该文件），首次运行自动生成：
+1. 客户端首次运行会生成身份密钥，把 `%APPDATA%\ScholarVPN\client.id.pub` 交给服务器管理员；
+2. 管理员生成一次性注册令牌：`sudo ./build/vpn_server --gen-token 5`（输出形如
+   `register_token: <64 位十六进制>`）；
+3. 客户端「+ 添加服务器」填 IP / 端口 / ClientID / 令牌，点「连接」即完成注册；
+   令牌一次性使用，注册成功后客户端自动清空，之后即为登录模式。
 
-- 路径：`%APPDATA%\ScholarVPN\config.ini`
-- 多服务器：`[Server] Count=N` + 每台一个 `[ServerN]` 节（编号连续，程序自动重排）
+### 日常使用
+
+- 主界面卡片显示服务器与连接状态，点「连接」/「断开」；断线自动重连，无需手动干预；
+- 卡片下方为实时速率曲线；底部「Switch Server」管理多台服务器，点击卡片即切换；
+- 「编辑」可修改名称 / IP / ClientID / 令牌 / 公钥，也可删除服务器。
+
+### 浏览器插件
+
+1. 扩展内选择协议（`HTTPS 代理` = TLS 加密，推荐）、填服务器地址、端口、账号密码；
+2. 打开开关，图标角标显示 `ON` 即生效；
+3. 代理范围可选「全部流量走代理（域名可例外）」或「仅代理指定域名」。
+
+## 配置
+
+### 客户端
+
+配置由图形界面自动维护（`%APPDATA%\ScholarVPN\config.ini`），也可手动编辑：
 
 ```ini
 [Server]
-Count=2
+Count=1
 
 [Server1]
-Name=公司服务器            # 显示名（留空默认 computer+N）
+Name=公司服务器            # 显示名（留空自动命名）
 ServerIP=1.2.3.4
 ServerPort=51820
-Transport=0                # 传输方式：0=UDP（默认） 1=TCP（运营商丢 UDP 时用，可配合 443 端口）
-ClientID=user1             # 该服务器的客户端标识（登录/注册用）
-RegisterToken=             # 首次注册填管理员下发的令牌，注册成功自动清空即登录模式
-ServerPubKey=              # 可选：该服务器 Ed25519 公钥 base64（44 字符）；留空=用内置公钥
-
-[Server2]
-Name=home
-ServerIP=5.6.7.8
-ServerPort=51820
-ClientID=user1
-RegisterToken=
-ServerPubKey=
+Transport=0                # 0=UDP（默认） 1=TCP（运营商丢 UDP 时用）
+ClientID=user1             # 该服务器上的身份标识
+RegisterToken=             # 首次注册填令牌；注册成功后留空即登录模式
+ServerPubKey=              # 可选：该服务器公钥；留空用客户端内置公钥
 
 [Network]
-VirtualIP=                 # 可选：留空 = 自动采用服务端分配的虚拟 IP（推荐）
+VirtualIP=                 # 留空 = 自动采用服务端分配的虚拟 IP（推荐）
 VirtualPrefix=24
 DNS=8.8.8.8,1.1.1.1
 MTU=1400
 Metric=5
 ```
 
-> 服务器选择规则：多服务器模式下按 `[ServerN]` 节连接；**Debug 构建**在无任何 `[ServerN]` 节时回退到默认 `192.168.1.12`（本地测试），**Release 构建**回退为空（必须先添加服务器）。
+### 服务端
 
-## 项目依赖
+常用参数：
 
-### 客户端（Windows）
+| 参数 | 说明 |
+| --- | --- |
+| `-l/--listen`、`-p/--port` | 监听地址与端口（默认 `0.0.0.0:51820`） |
+| `-a/--addr`、`--prefix`、`--mtu` | 隧道内网地址 / 网段前缀 / MTU（默认 `10.8.0.1` / 24 / 1400） |
+| `--max-clients` | 最大并发客户端数（默认 64，自动分配虚拟 IP） |
+| `--transport both\|udp\|tcp` | 传输开关（默认 both：同端口双栈） |
+| `-g/--gen-token [n]` | 生成 n 个一次性注册令牌后退出 |
+| `--quiet` | 精简日志（公网服务器推荐） |
+| `--https-proxy-port` / `--socks5-port` / `--http-proxy-port` | 浏览器插件的三个代理入口（默认全关） |
+| `--proxy-user` / `--proxy-pass-file` | 代理入口的账号与密码（密码放 0600 文件更安全） |
 
-| 依赖 | 说明 |
-|------|------|
-| Visual Studio 2022（v143）+ Windows SDK 10.0 | 构建环境，C++20 |
-| Qt 6.9.1（msvc2022_64） | GUI 框架；工程默认引用 `D:\Qt\6.9.1\msvc2022_64`，路径不同需改 `VPN_.vcxproj` |
-| OpenSSL 3.5.6 | 已内置 `third_party/openssl`；链接 `libcrypto.lib`，运行需要 `libcrypto-3-x64.dll` |
-| Wintun 0.14.1 | 已内置 `third_party/wintun-0.14.1`；运行需要 `wintun.dll` |
-| Windows API | WinSock2（ws2_32）、IP Helper（iphlpapi）、DNS API（dnsapi）等 |
+`start.sh` 支持用环境变量覆盖这些配置（如 `VPN_PORT`、`MAX_CLIENTS`、`HTTPS_PROXY_PORT`、
+`PROXY_USER`、`PROXY_PASS_FILE` 等），`install` 会把当前配置固化到 `/etc/default/vpn-server`，
+之后编辑该文件再 `systemctl restart vpn-server` 即可。
 
-### 服务端（Linux）
+## 常见问题
 
-| 依赖 | 说明 |
-|------|------|
-| Linux 内核头文件 | `linux/if_tun.h`、`linux/route.h` 等，仅支持 Linux |
-| CMake >= 3.16 + C++17 编译器 | GCC / Clang 均可 |
-| Threads（pthread） | 收发线程、重连状态机 |
-| OpenSSL | X25519 / HKDF / AES-256-GCM（`OpenSSL::Crypto`） |
-
-> 许可注意：Wintun 源码为 GPLv2，预编译二进制使用单独许可（见 `third_party/wintun-0.14.1/prebuilt-binaries-license.txt`）；OpenSSL 许可见 `third_party/openssl/LICENSE`。分发前请确认许可证兼容性。
-
-## 项目构建
-
-### 客户端（Windows）
-
-1. 环境要求：Visual Studio 2022 + **Qt 6.9.1（msvc2022_64）**，Qt 装在其他路径时需修改 `VPN_.vcxproj` 中的包含/库目录与 PostBuild 拷贝路径；
-2. 用 Visual Studio 2022 打开 `VPN_.sln`，选择 **x64** 与 **Debug / Release** 配置；
-3. 直接生成解决方案即可，构建后会自动把运行所需文件复制到输出目录：`libcrypto-3-x64.dll`、`wintun.dll`、`style.qss`、Qt6 系列 DLL（Widgets/Gui/Core/PrintSupport）与 `platforms` 插件；
-4. 命令行构建：
-
-```powershell
-msbuild VPN_.sln /p:Configuration=Debug /p:Platform=x64
-```
-
-> 构建配置区分服务器身份公钥：**Debug** 用本地测试服务器公钥，**Release** 用正式服务器公钥（见 `src/client/ClientApp.cpp` 的 `kServerSigPubPem` 常量，请自行更换）。每台服务器也可在 GUI 中单独填写公钥（`ServerPubKey`），留空则用内置公钥。
-
-### 服务端（Linux）
-
-```bash
-cd server
-cmake -S . -B build
-cmake --build build
-```
-
-生成 `build/vpn_server`，以 root 运行（创建 TUN 网卡需要权限）：
-
-```bash
-sudo ./build/vpn_server -a 10.8.0.1 -p 51820
-```
-
-服务端常用参数：`-l/--listen`（监听 IP）、`-p/--port`（端口）、`-a/--addr`（隧道内网 IP）、`--prefix`（网段前缀）、`--mtu`、`-k/--key`（Ed25519 身份私钥，默认 `keys/server_sig.key`）、`--max-clients`（最大并发客户端数，默认 64，自动分配虚拟 IP）、`--transport both|udp|tcp`（TCP 监听开关，默认 both 同端口双栈）、`-g/--gen-token [n]`（生成 n 个一次性注册令牌）、`--quiet`（精简日志）。
-
-**一键部署（start.sh / systemd）**：兼容 Debian/Ubuntu/CentOS/RHEL/Fedora/Arch/OpenWrt，自动选择 iptables / nftables 并配合 ufw / firewalld 放行端口：
-
-```bash
-cd server
-sudo ./start.sh            # 前台运行（Ctrl+C 退出，便于调试）
-sudo ./start.sh -d         # 后台守护运行（异常自动重启 watchdog，重点日志存 logs/）
-sudo ./start.sh install    # 安装为 systemd 服务（推荐，关闭终端不断开）
-sudo ./start.sh status     # 查看运行状态
-sudo ./start.sh logs       # 实时查看重点日志
-sudo ./start.sh uninstall  # 卸载 systemd 服务
-sudo ./start.sh doctor     # 诊断环境，排查断开问题
-```
-
-- 脚本内关键项可用环境变量覆盖：`TUN_IP`、`TUN_PREFIX`、`TUN_MTU`、`VPN_PORT`、`LISTEN_IP`、`KEY_PATH`（默认 `keys/server_sig.key`）、`MAX_CLIENTS`（最大并发客户端数，0=默认 64）、`QUIET`（1=精简日志）等；
-- **systemd 运行参数透传**：`install` 会把当前配置固化为 `/etc/default/vpn-server`（systemd `EnvironmentFile`），使 `--max-clients` 等参数在 systemd 模式下同样生效；可直接编辑该文件后 `systemctl restart vpn-server`；
-- 日志：`logs/vpn-server-YYYYMMDD.log`（按天轮转）；systemd 模式下写 `logs/systemd.log`，也可 `journalctl -u vpn-server -f` 查看。
-
-首次启动会自动生成服务器身份密钥对 `keys/server_sig.key` / `keys/server_sig.pub`，请把 `server_sig.pub` 内容硬编码进客户端 `src/main.cpp` 的 `kServerSigPubPem` 常量（客户端用它验证服务器签名，防中间人）。密钥与客户端准入数据库（`register_tokens.txt` / `registered_clients.txt`）说明见 `server/keys/README.txt`。
-
-### 身份认证与注册
-
-- 给新用户发注册令牌（服务端管理员操作）：
-
-```bash
-sudo ./build/vpn_server --gen-token 5
-# 输出形如 register_token: <64位十六进制>，并追加到 keys/register_tokens.txt
-```
-
-- 客户端把令牌填入**添加/编辑服务器窗口的 RegisterToken 字段**（多服务器模式下每台服务器独立注册）并设置 `ClientID` 后首次连接即完成注册（令牌一次性使用，作废后即从令牌文件移除）；注册成功客户端自动清空令牌，之后即为登录模式；
-- 已注册客户端公钥保存在 `keys/registered_clients.txt`（每行一个 64 位十六进制 Ed25519 公钥），**私钥/令牌/注册表文件均不得提交到 Git**（`keys/*` 已在 .gitignore 忽略）；
-- 身份验证通过前，`VpnCore` 不会把 TUN 流量转发进隧道（防止未注册客户端接入）。
-
-## 使用方法（客户端）
-
-### 首次运行
-
-1. **以管理员身份运行** `ScholarVPN.exe`（程序清单已要求管理员权限：创建 Wintun 虚拟网卡、改路由、改 DNS 均需要）；
-2. 首次运行自动生成 Ed25519 身份密钥（位于 `%APPDATA%\ScholarVPN\`）：
-   - `client.id.pub`：明文公钥（交给服务器管理员登记）
-   - `client.id.enc`：私钥（Windows DPAPI 加密，绑定当前 Windows 用户，磁盘不落明文）
-3. 把 `client.id.pub` 交给服务器管理员，管理员执行 `./build/vpn_server --gen-token` 生成一次性注册令牌发给你。
-
-### 添加服务器
-
-1. 点击主界面右上角 **「+ 添加服务器」**；
-2. 填写字段：
-
-| 字段 | 说明 |
-|------|------|
-| 名称 | 可选，留空自动命名 `computer+N`（显示在卡片与头像上） |
-| 服务器 IP | 必填，如 `1.2.3.4` |
-| 传输方式 | 下拉选择 UDP（默认）/ TCP；TCP 用于运营商丢 UDP 的网络，可配合 443 端口（服务端需 `--transport both|tcp`） |
-| ClientID | 必填，你在该服务器上的身份标识 |
-| RegisterToken | 首次注册填管理员下发的令牌；之后留空即登录模式 |
-| 服务器公钥 | 可选，粘贴该服务器 `server_sig.pub` 完整内容；留空用客户端内置公钥 |
-
-3. 确认后写入 `config.ini`，卡片加入服务器列表。
-
-### 注册与登录
-
-- **注册**：令牌填入 RegisterToken 后连接，认证通过即注册成功（令牌一次性，客户端自动清空）；
-- **登录**：之后连接令牌留空，直接以 ClientID + 本机身份密钥登录；
-- 每台服务器独立注册，互不影响。
-
-### 连接 / 断开
-
-1. 主界面卡片显示当前选中的服务器：名称、IP、服务端分配的**内网 IP**、连接状态（未连接 / 连接中... / 已连接）；
-2. 点击 **「连接」**：三阶段认证通过后自动采用服务端分配的虚拟 IP，并接管默认路由与 DNS（防泄漏）；
-3. 连接后按钮变为红色 **「断开」**，点击即断开：自动恢复路由与物理网卡 DNS；
-4. 断线自动重连（指数退避），无需手动干预；
-5. 卡片下方为**实时速率曲线**（60 秒窗口，下载蓝线 / 上传绿线，自动量程）。
-
-### 切换服务器
-
-1. 点击底部 **「⇄ Switch Server」**，展开服务器列表覆盖层；
-2. 顶部半透明区显示当前服务器的名称 / IP / 内网 IP / 连接状态；列表中当前服务器带蓝色描边；
-3. **点击任一卡片**即选中并返回主界面（连接中需先断开再连新服务器）；点击顶部半透明区域可直接收起覆盖层。
-
-### 编辑 / 删除服务器
-
-- 主界面卡片右上 **「编辑」**：修改名称 / IP / ClientID / 令牌 / 公钥，确认即写回 `config.ini`；
-- 编辑窗口 **「删除」**：二次确认后从配置移除该服务器（正在连接的服务器建议先断开再删）。
+- **客户端连不上**：确认服务端在运行、端口在云安全组与防火墙都已放行；运营商丢 UDP 时可改用
+  TCP 传输（`Transport=1`，服务端需 `--transport both|tcp`）。
+- **浏览器插件报证书不受信任**：把服务端生成的 `ca.cert.pem` 导入系统"受信任的根证书颁发机构"，
+  然后**完全退出并重开浏览器**。
+- **日志在哪看**：前台运行看终端输出；`./start.sh -d` 写入 `logs/vpn-server-YYYYMMDD.log`；
+  systemd 模式用 `journalctl -u vpn-server -f`。
+- **多客户端共享服务端出口**：需要内核转发 + NAT，`start.sh` 会自动配置。
 
 ## 待完善
 
-- **客户端 IOCP 模型**：客户端收发目前为线程模型（收发等待已事件驱动），后续可引入 I/O 完成端口（IOCP），提升高并发、高吞吐场景下的性能
-- **智能分流**：按规则分流流量，如国内直连、国外走隧道，避免全局代理
-- **日志窗口与流量统计**：GUI 内查看连接日志；累计流量统计与限速（实时速率曲线已完成）
-- **系统托盘**：最小化到托盘、开机自启等
+- **智能分流**：按规则分流流量（如国内直连、国外走隧道），避免全局代理；
+- **日志窗口与流量统计**：界面内查看连接日志、累计流量统计与限速；
+- **系统托盘**：最小化到托盘、开机自启；
+- **性能**：客户端收发后续可引入 I/O 完成端口（IOCP）模型，提升高并发场景吞吐。
 
 ## 许可证
 
-MIT License（见 `LICENSE`）。第三方组件许可见 `docs/LICENSE.txt` 与 `third_party/` 下对应文件。
+MIT License（见 `LICENSE`）。第三方组件许可见 `docs/LICENSE.txt` 与 `third_party/` 下对应文件
+（注意 Wintun 源码为 GPLv2、预编译二进制使用单独许可）。
 
 ---
-
-> ⚠️ 再次提醒：本项目**仅限学习研究**，**禁止私自搭建/运营 VPN 服务**。请遵守所在地法律法规，合法合规地使用。

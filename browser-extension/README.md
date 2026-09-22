@@ -46,7 +46,9 @@ sudo ./build/vpn_server -a 10.8.0.1 -p 51820 \
 | `--http-proxy-port <n>` | HTTP CONNECT 端口（明文；内网或前置 stunnel 用） |
 | `--proxy-user <u>` | 三个入口共用的用户名/密码认证（公网强烈建议） |
 | `--proxy-pass <p>` | 与 `--proxy-user` 配套（`--socks5-user/pass` 为历史别名） |
-| `--proxy-allow-private` | 允许代理连接服务端内网/回环目标（**默认禁止**，仅内网自用开启） |
+| `--proxy-pass-file <p>` | 从 0600 文件读密码（**推荐**：密码不进 `ps`/history/环境文件） |
+| `--proxy-allow-private` | 允许代理连接服务端内网/回环目标（默认禁止，仅内网自用开启） |
+| `--proxy-allow-noauth` | 允许无认证代理监听非回环地址（默认拒绝，防误开开放代理） |
 
 也可以走环境变量（`start.sh` 会自动放行防火墙端口并写入 systemd 环境文件）：
 
@@ -58,28 +60,36 @@ sudo SOCKS5_PORT=1080 HTTPS_PROXY_PORT=8443 \
 
 ### 证书要点（HTTPS 代理）
 
-浏览器会校验代理证书，二选一：
+浏览器会校验代理证书，两种方式：
 
 1. **有域名**：用 Let's Encrypt 最省事，例如
    `certbot certonly --standalone -d vpn.example.com`，证书在
    `/etc/letsencrypt/live/<域名>/`（用 `fullchain.pem` + `privkey.pem`）。
-2. **自签**：必须把证书**导入操作系统信任存储**，否则 Chrome 报
-   `ERR_PROXY_CERTIFICATE_INVALID`。生成与导入示例：
+2. **没有域名（只有 IP）**：用仓库脚本生成 **CA + 叶证书**（推荐）：
 
 ```bash
-openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
-  -keyout key.pem -out cert.pem -subj "/CN=vpn.example.com" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "subjectAltName=DNS:vpn.example.com,IP:1.2.3.4"
+cd server
+./gen-self-signed-cert.sh 1.2.3.4                          # ca.cert.pem + proxy.cert.pem/key.pem
+./gen-self-signed-cert.sh vpn.example.com /etc/scholargvpn --name-constraints
 ```
 
-Windows 端导入：`certmgr.msc` → 受信任的根证书颁发机构 → 导入 `cert.pem`
-（或 `certutil -addstore -f Root cert.pem`），重启浏览器生效。
+脚本默认生成 **CA + 叶证书**（服务器只放叶证书，客户端导入 CA），也可用
+`--self-signed` 生成单张自签证书。
+
+**客户端导入的是 `ca.cert.pem`**（不是服务器在用的 `proxy.cert.pem`）：
+
+```powershell
+certutil -addstore -f Root ca.cert.pem     # 管理员；导入后完全重启浏览器
+```
+
+脚本会做链校验自检（`openssl verify -verify_ip …`）并打印续期方法：叶证书
+到期只需重新签发叶证书，CA 不变、客户端**无需重新导入**。此前导入过旧自签
+证书的，建议从信任存储删除（`certutil -delstore Root ScholarVPN`）。
 
 ### 其他要点
 
-- 监听地址跟随 `--listen`（默认 `0.0.0.0`）；出口为**服务端主机直连**目标（不经 TUN）；
-- 每入口并发上限 256，空闲 5 分钟回收；目标连接失败回 HTTP 502 / SOCKS5 错误码；
+- 监听地址跟随 `--listen`（默认 `0.0.0.0`）；出口为服务端主机直连（不经 TUN）；
+- 目标连接失败时返回明确错误（HTTP 502 / SOCKS5 错误码）；
 - **目标 ACL（默认开启）**：代理默认拒绝访问"服务端内网"目标——回环 `127.0.0.1`、
   私网 `10/8`、`172.16/12`、`192.168/16`、链路本地、CGNAT、组播/保留段，以及
   IPv6 的 `::1`/ULA/链路本地等。这样浏览器侧无法借代理访问服务端本机管理服务、
@@ -88,6 +98,8 @@ Windows 端导入：`certmgr.msc` → 受信任的根证书颁发机构 → 导�
   **内网自用**需要放行时加 `--proxy-allow-private`（或 `PROXY_ALLOW_PRIVATE=1`）；
 - 明文入口（SOCKS5/HTTP）不加密且凭据可被嗅探重放：公网务必配认证 + 防火墙来源限制，
   或只绑内网（`--listen 127.0.0.1`）配合 SSH 隧道；
+- 密码连续猜错会被临时拒绝；证书过期服务端会拒绝启动并给出告警；
+- 密码建议放 0600 文件（`--proxy-pass-file`）而不是写在命令行参数里；
 - 服务端日志会记录目标 `host:port`（运维可审计，注意隐私留存策略）。
 
 ## 二、浏览器安装（Chrome / Edge，MV3）
@@ -116,17 +128,9 @@ Windows 端导入：`certmgr.msc` → 受信任的根证书颁发机构 → 导�
 ## 四、目录结构
 
 ```
-browser-extension/
-├── manifest.json      # MV3 清单（proxy / storage / webRequest 权限）
-├── background.js      # service worker：chrome.proxy 落配置 + 代理认证回调
-├── popup.html/.css/.js# 弹窗界面（协议、服务器、认证、范围、域名列表）
-├── icons/             # 16/48/128 图标（make_icons.py 生成）
-├── make_icons.py      # 图标生成脚本（无需 Pillow）
-└── tests/verify.mjs   # Node 测试：三种协议的代理配置/PAC/认证回调
+browser-extension/   扩展本体（manifest / background / popup / 图标 / 测试）
 ```
-
-服务端三个入口的运行期自测（Windows 开发机即可跑，含真实 TLS 握手用例）见
-[../server/tests/README.md](../server/tests/README.md)。
+服务端三个入口的说明见仓库根 README 与 `server/`。
 
 ## 五、无人值守配置（config.json，可选）
 
@@ -156,23 +160,9 @@ browser-extension/
 生效方式：改完 `config.json` 后**重启浏览器**（或到 `chrome://extensions`/`edge://extensions`
 点该扩展的「重新加载」）。
 
-**启动诊断**：扩展每次启动会把状态写进 `chrome.storage.local.diag`
-（`SW 已启动` → `已应用 config.json（HTTP 200）` 或失败原因），
-用浏览器控制台或扩展页面即可查看，便于远程排障；弹窗状态行也会显示**实际生效的代理**
-和失败的 `net::ERR_*` 错误码与处置建议。
+弹窗状态行会显示**实际生效的代理**；检测失败时会给出具体错误码与处置建议。
 
-## 六、自测
-
-```bash
-node tests/verify.mjs     # 全部通过会打印「全部通过」
-python make_icons.py      # 需要重新生成图标时
-```
-
-测试覆盖：清单合法性、未启用即清除代理、三种协议各写入正确的
-`fixed_servers(socks5|http|https)` 配置、仅列表模式 PAC 行为
-（精确/子域/大小写/后缀边界）、缺省协议按 https（TLS）处理、认证回调回填凭据。
-
-## 七、故障排查
+## 六、故障排查
 
 | 现象 | 检查 |
 | --- | --- |

@@ -171,6 +171,7 @@ python package.py            # 产物: ../dist/ScholarVPN-browser-extension-v<�
 
 zip 内含：扩展本体 + [安装说明.md](安装说明.md)（给使用者的四步图文说明）+
 `config.json.example` + `导入证书(管理员运行).bat`（一键导入服务器证书）。
+产物在 `dist/`（已在 `.gitignore` 中：仓库只提交代码，zip 等二进制不入库，请自行打包分发）。
 **打包脚本会显式排除 `config.json`**（含代理密码，绝不入包），并做安全自检。
 
 分发给别人时，除了 zip 还要一并给出：**服务器地址/端口、代理账号密码**；

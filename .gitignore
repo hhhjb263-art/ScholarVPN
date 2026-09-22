@@ -376,3 +376,29 @@ browser-extension/config.json
 
 # 分发打包产物（zip 为构建输出）
 dist/
+
+# ============================================================
+# 仓库只提交代码：构建产物 / 二进制分发件一律不入库
+# （APK / EXE / 压缩包 / 动态库等；发布走 GitHub Releases 或本地打包）
+# ============================================================
+*.apk
+*.aab
+*.exe
+*.msi
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+*.dmg
+*.iso
+*.dll
+*.lib
+*.so
+*.dylib
+
+# 例外：Windows 构建/运行所需的第三方依赖（体积小且随仓库分发；
+# 若改为外部获取，删掉下面三行即可）
+!third_party/openssl/bin/libcrypto-3-x64.dll
+!third_party/openssl/lib/libcrypto.lib
+!third_party/wintun-0.14.1/wintun/bin/amd64/wintun.dll

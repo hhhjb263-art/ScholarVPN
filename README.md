@@ -65,7 +65,8 @@ sudo ./start.sh install
 
 ### Android 客户端
 
-直接安装仓库内的 `android/ScholarVPN-v1.0-release.apk`；源码在 `android/`，用 Gradle 构建。
+源码在 `android/`，用 Gradle 构建：`cd android && ./gradlew assembleRelease`，产物在
+`android/app/build/outputs/apk/release/app-release.apk`（仓库只提交代码，不存放 APK 等二进制）。
 
 ### 浏览器插件
 

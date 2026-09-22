@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ScholarVPN 浏览器代理",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "只在浏览器里生效的代理客户端：把浏览器流量走 ScholarVPN 服务端的 SOCKS5 出口，不安装系统级 VPN、不改系统路由。",
   "permissions": [
     "proxy",

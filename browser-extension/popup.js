@@ -110,15 +110,55 @@ els.mode.addEventListener("change", () => {
 });
 els.enabled.addEventListener("change", scheduleSave);
 
+// net::ERR_* → 中文处置建议
+function hintForNetError(code) {
+  if (code.indexOf("CERT") !== -1 || code.indexOf("certificate") !== -1)
+    return "（证书未被信任：在客户端导入 proxy.cert.pem 后【完全退出并重开浏览器】）";
+  if (code.indexOf("TIMED_OUT") !== -1 || code.indexOf("CONNECTION") !== -1 ||
+      code.indexOf("REFUSED") !== -1 || code.indexOf("TUNNEL") !== -1)
+    return "（代理端口不可达：确认服务端已启动该端口、云安全组/防火墙已放行）";
+  if (code.indexOf("AUTH") !== -1 || code.indexOf("407") !== -1)
+    return "（认证失败：用户名/密码与服务端 --proxy-user/--proxy-pass 不一致）";
+  if (code.indexOf("NAME_NOT_RESOLVED") !== -1)
+    return "（域名解析失败：服务器地址填错或本地 DNS 被劫持）";
+  return "";
+}
+
+// 当前 chrome.proxy 的生效状态（诊断用）：direct / fixed_servers(scheme host:port) / pac
+async function describeProxy() {
+  try {
+    const st = await chrome.proxy.settings.get({});
+    const v = st && st.value ? st.value : {};
+    if (v.mode === "fixed_servers" && v.rules && v.rules.singleProxy) {
+      const p = v.rules.singleProxy;
+      return `已生效 ${p.scheme} ${p.host}:${p.port}`;
+    }
+    if (v.mode === "pac_script") return "已生效 PAC";
+    return "未生效（direct）";
+  } catch (e) {
+    return "状态未知: " + (e && e.message ? e.message : e);
+  }
+}
+
 // 检测出口 IP：请求经当前代理发出（未启用 = 本地 IP）
 els.test.addEventListener("click", async () => {
   setStatus("检测中…");
+  const proxy_desc = await describeProxy();
   try {
     const res = await fetch("https://api.ipify.org?format=json", { cache: "no-store" });
     const j = await res.json();
-    setStatus("当前出口 IP: " + (j.ip || "未知"), "ok");
+    setStatus(`出口 IP: ${j.ip || "未知"} · ${proxy_desc}`, "ok");
   } catch (e) {
-    setStatus("检测失败（网络或代理不可达）", "err");
+    // fetch 只看得到 "Failed to fetch"；真实 net::ERR_* 由 background 从
+    // webRequest.onErrorOccurred 记录，这里读出来并给出对应处置建议
+    let detail = e && e.message ? e.message : String(e);
+    try {
+      const { lastNetError } = await chrome.storage.local.get({ lastNetError: null });
+      if (lastNetError && Date.now() - lastNetError.ts < 10_000 && lastNetError.error) {
+        detail = lastNetError.error + hintForNetError(lastNetError.error);
+      }
+    } catch (_) { /* 读不到就用兜底文案 */ }
+    setStatus(`检测失败: ${detail} · ${proxy_desc}`, "err");
   }
 });
 
@@ -126,12 +166,9 @@ els.test.addEventListener("click", async () => {
 (async () => {
   const s = await chrome.storage.local.get(DEFAULTS);
   writeForm(s);
-  const st = await chrome.proxy.settings.get({});
-  if (st && st.value && st.value.mode && st.value.mode !== "direct") {
-    setStatus("代理已生效", "ok");
-  } else if (s.enabled && s.host) {
-    setStatus("已保存，等待生效", "");
+  if (s.enabled && s.host) {
+    setStatus(await describeProxy(), "ok");
   } else {
-    setStatus("未启用");
+    setStatus("未启用（右上角开关关闭）");
   }
 })();

@@ -1,0 +1,12 @@
+{
+  "_说明": "复制为 config.json 使用。无人值守配置：applyOnStartup=true 表示每次启动浏览器都按这里的值应用（无需点弹窗）；日常手动控制可删掉本文件或改为 false。config.json 含密码，已被 .gitignore 忽略，不会提交。",
+  "applyOnStartup": true,
+  "enabled": true,
+  "protocol": "https",
+  "host": "1.2.3.4",
+  "port": 8443,
+  "user": "alice",
+  "pass": "换成你的代理密码",
+  "mode": "global",
+  "list": []
+}

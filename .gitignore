@@ -371,3 +371,5 @@ FodyWeavers.xsd
 !third_party/openssl/bin/
 !third_party/wintun-0.14.1/wintun/bin/
 !third_party/wintun-0.14.1/wintun/bin/amd64/
+# 浏览器扩展的本地配置（含代理密码，不入库）
+browser-extension/config.json

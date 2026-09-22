@@ -128,7 +128,40 @@ browser-extension/
 服务端三个入口的运行期自测（Windows 开发机即可跑，含真实 TLS 握手用例）见
 [../server/tests/README.md](../server/tests/README.md)。
 
-## 五、自测
+## 五、无人值守配置（config.json，可选）
+
+不想每次点弹窗配置，可在扩展目录放一份 `config.json`（含密码，已在 `.gitignore` 中，
+不会提交；模板见 `config.json.example`）：
+
+```json
+{
+  "applyOnStartup": true,
+  "enabled": true,
+  "protocol": "https",
+  "host": "1.2.3.4",
+  "port": 8443,
+  "user": "alice",
+  "pass": "你的代理密码",
+  "mode": "global",
+  "list": []
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `applyOnStartup` | `true` = 每次浏览器启动都把上面配置写回并生效（固定部署；避免误关） |
+| `applyOnce` | `true` = 仅在从未保存过设置时应用一次（日常手动控制用） |
+| 其余字段 | 与弹窗一一对应：`protocol` = `https`/`socks5`/`http`；`mode` = `global`/`whitelist`；`list` = 域名数组 |
+
+生效方式：改完 `config.json` 后**重启浏览器**（或到 `chrome://extensions`/`edge://extensions`
+点该扩展的「重新加载」）。
+
+**启动诊断**：扩展每次启动会把状态写进 `chrome.storage.local.diag`
+（`SW 已启动` → `已应用 config.json（HTTP 200）` 或失败原因），
+用浏览器控制台或扩展页面即可查看，便于远程排障；弹窗状态行也会显示**实际生效的代理**
+和失败的 `net::ERR_*` 错误码与处置建议。
+
+## 六、自测
 
 ```bash
 node tests/verify.mjs     # 全部通过会打印「全部通过」
@@ -139,7 +172,7 @@ python make_icons.py      # 需要重新生成图标时
 `fixed_servers(socks5|http|https)` 配置、仅列表模式 PAC 行为
 （精确/子域/大小写/后缀边界）、缺省协议按 https（TLS）处理、认证回调回填凭据。
 
-## 六、故障排查
+## 七、故障排查
 
 | 现象 | 检查 |
 | --- | --- |

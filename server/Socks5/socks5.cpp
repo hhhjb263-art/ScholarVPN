@@ -19,6 +19,7 @@ namespace {
 
 using proxy_common::constant_time_eq;
 using proxy_common::read_full;
+using proxy_common::sanitize_for_log;
 using proxy_common::write_full;
 
 // SOCKS5 常量（RFC 1928 / RFC 1929）
@@ -60,6 +61,12 @@ uint8_t rep_from_errno(int e)
 
 } // namespace
 
+Socks5Proxy::Socks5Proxy()
+    : m_auth_throttle(new proxy_common::AuthThrottle()),
+      m_log_limiter(new proxy_common::LogLimiter())
+{
+}
+
 Socks5Proxy::~Socks5Proxy()
 {
     stop();
@@ -80,6 +87,31 @@ bool Socks5Proxy::start(const std::string& bind_ip, uint16_t port,
     m_user = user;
     m_pass = pass;
     m_max_conns = (max_conns > 0) ? max_conns : 256;
+
+    // ---- 认证安全校验（防开放代理）----
+    // 1) 配置了用户名却没给密码：等价于"空密码"，等于没有认证 → 拒绝
+    if (!m_user.empty() && m_pass.empty()) {
+        fprintf(stderr, "[SOCKS5] 拒绝启动：设置了 --proxy-user 但密码为空"
+                        "（空密码等于无认证，请设置 --proxy-pass 或用 --proxy-pass-file）\n");
+        return false;
+    }
+    // 2) 无认证 + 非回环监听：默认拒绝，避免把开放代理挂到公网
+    const bool loopback = (m_bind_ip == "127.0.0.1" || m_bind_ip == "::1" ||
+                           m_bind_ip == "localhost");
+    if (m_user.empty() && !loopback && !m_allow_noauth) {
+        fprintf(stderr, "[SOCKS5] 拒绝启动：监听 %s 但未配置认证。\n"
+                        "         请加 --proxy-user/--proxy-pass；确需无认证（仅内网/前置 TLS）"
+                        "再加 --proxy-allow-noauth\n", m_bind_ip.c_str());
+        return false;
+    }
+    if (m_user.empty() && !loopback) {
+        fprintf(stderr, "[SOCKS5] 警告：无认证代理监听 %s（已由 --proxy-allow-noauth 显式放行）\n",
+                m_bind_ip.c_str());
+    }
+    if (!m_user.empty() && m_pass.size() < 8) {
+        fprintf(stderr, "[SOCKS5] 警告：代理密码长度仅 %zu，公网暴露建议 ≥8 位随机密码\n",
+                m_pass.size());
+    }
 
     m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0) {
@@ -112,6 +144,19 @@ bool Socks5Proxy::start(const std::string& bind_ip, uint16_t port,
         ::close(m_listen_fd);
         m_listen_fd = -1;
         return false;
+    }
+
+    // 目标 ACL：内网/回环判定 + 本机接口地址（防经公网 IP 回连本机服务）
+    m_acl.reset(new proxy_common::TargetAcl());
+    m_acl->allow_internal = m_allow_private;
+    proxy_common::collect_local_addresses(*m_acl);
+    // 每来源连接限制
+    {
+        proxy_common::ConnLimits lim;
+        lim.max_concurrent = m_max_per_source;
+        lim.rate_per_sec = m_conn_rate_per_sec;
+        lim.rate_burst = m_conn_rate_per_sec * 30;
+        m_conn_limiter.reset(new proxy_common::ConnLimiter(lim));
     }
 
     m_running.store(true);
@@ -219,15 +264,28 @@ void Socks5Proxy::accept_work()
 
         char ipbuf[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf));
+        const std::string peer_ip = ipbuf;
+
+        // 每来源连接限制：并发超限或新建过快直接拒绝（防单来源占满连接槽）
+        if (!m_conn_limiter->try_acquire(peer_ip, proxy_common::now_ms())) {
+            size_t suppressed = 0;
+            if (m_log_limiter->allow(proxy_common::now_ms(), &suppressed)) {
+                fprintf(stderr, "[SOCKS5] %s 连接数/速率超限，拒绝（已抑制 %zu 条同类日志）\n",
+                        sanitize_for_log(peer_ip).c_str(), suppressed);
+            }
+            ::close(fd);
+            continue;
+        }
         const std::string peer_str =
-            std::string(ipbuf) + ":" + std::to_string(ntohs(peer.sin_port));
+            peer_ip + ":" + std::to_string(ntohs(peer.sin_port));
 
         m_conns.fetch_add(1);
         auto done = std::make_shared<std::atomic<bool>>(false);
         try {
             std::lock_guard<std::mutex> lock(m_workers_mutex);
-            m_workers.push_back(Worker{ std::thread([this, fd, peer_str, done] {
-                handle_conn(fd, peer_str);
+            m_workers.push_back(Worker{ std::thread([this, fd, peer_ip, peer_str, done] {
+                handle_conn(fd, peer_ip, peer_str);
+                m_conn_limiter->release(peer_ip);
                 done->store(true);
             }), done });
         } catch (const std::system_error& e) {
@@ -240,7 +298,7 @@ void Socks5Proxy::accept_work()
     join_finished();
 }
 
-void Socks5Proxy::handle_conn(int fd, const std::string& peer)
+void Socks5Proxy::handle_conn(int fd, const std::string& peer_ip, const std::string& peer)
 {
     // ---- 阶段1：方法协商 ----
     uint8_t hdr[2] = {0};
@@ -270,7 +328,7 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
     }
     const uint8_t method_reply[2] = { kVer5, chosen };
     if (chosen == kAuthNoAcceptable || !write_full(fd, method_reply, 2)) {
-        fprintf(stderr, "[SOCKS5] %s 无可用认证方式，拒绝\n", peer.c_str());
+        fprintf(stderr, "[SOCKS5] %s 无可用认证方式，拒绝\n", sanitize_for_log(peer).c_str());
         ::close(fd);
         m_conns.fetch_sub(1);
         return;
@@ -278,6 +336,16 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
 
     // ---- 阶段2：RFC1929 用户名/密码（如配置） ----
     if (chosen == kAuthUserPass) {
+        // 防暴力破解：失败过多的来源在锁定期内直接拒绝（对端表现与认证失败一致）
+        if (!m_auth_throttle->allow(peer_ip, proxy_common::now_ms())) {
+            const uint8_t denied[2] = { kVer5, kAuthNoAcceptable };
+            write_full(fd, denied, 2);
+            fprintf(stderr, "[SOCKS5] %s 认证失败次数过多，暂时拒绝\n",
+                    sanitize_for_log(peer_ip).c_str());
+            ::close(fd);
+            m_conns.fetch_sub(1);
+            return;
+        }
         uint8_t ah[2] = {0};
         if (!read_full(fd, ah, 2, kHandshakeTimeoutMs) || ah[0] != 0x01) {
             ::close(fd);
@@ -308,11 +376,20 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
         const bool ok = constant_time_eq(u, m_user) && constant_time_eq(p, m_pass);
         const uint8_t auth_reply[2] = { 0x01, static_cast<uint8_t>(ok ? 0x00 : 0x01) };
         if (!write_full(fd, auth_reply, 2) || !ok) {
-            fprintf(stderr, "[SOCKS5] %s 认证失败\n", peer.c_str());
+            const uint64_t lock_ms = ok ? 0
+                : m_auth_throttle->on_failure(peer_ip, proxy_common::now_ms());
+            if (lock_ms > 0) {
+                fprintf(stderr, "[SOCKS5] %s 认证失败，已锁定 %llu 秒（防暴力破解）\n",
+                        sanitize_for_log(peer_ip).c_str(),
+                        static_cast<unsigned long long>(lock_ms / 1000));
+            } else {
+                fprintf(stderr, "[SOCKS5] %s 认证失败\n", sanitize_for_log(peer).c_str());
+            }
             ::close(fd);
             m_conns.fetch_sub(1);
             return;
         }
+        m_auth_throttle->on_success(peer_ip);
     }
 
     // ---- 阶段3：请求（仅 CONNECT） ----
@@ -325,7 +402,7 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
     if (req[1] != kCmdConnect) {
         const uint8_t rep[10] = { kVer5, kRepCmdNotSupported, 0x00, kAtypIpv4, 0,0,0,0, 0,0 };
         write_full(fd, rep, sizeof(rep));
-        fprintf(stderr, "[SOCKS5] %s 不支持的命令 0x%02X（仅 CONNECT）\n", peer.c_str(), req[1]);
+        fprintf(stderr, "[SOCKS5] %s 不支持的命令 0x%02X（仅 CONNECT）\n", sanitize_for_log(peer).c_str(), req[1]);
         ::close(fd);
         m_conns.fetch_sub(1);
         return;
@@ -377,7 +454,7 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
 
     // ---- 阶段4：连接目标（统一走 ACL：默认拒绝服务端内网/回环目标） ----
     const proxy_common::ConnectResult cr =
-        proxy_common::connect_target_checked(host, port_host, m_allow_private);
+        proxy_common::connect_target_checked(host, port_host, *m_acl);
     const int out_fd = cr.fd;
     if (out_fd < 0) {
         // ACL 拒绝回 0x02（connection not allowed by ruleset），与 RFC1928 语义一致
@@ -385,12 +462,17 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
         const uint8_t rep[10] = { kVer5, rep_code, 0x00, kAtypIpv4, 0,0,0,0, 0,0 };
         write_full(fd, rep, sizeof(rep));
         if (cr.blocked) {
-            fprintf(stderr, "[SOCKS5] %s → %s:%u 被目标 ACL 拒绝（服务端内网/回环；"
-                            "内网自用可加 --proxy-allow-private）\n",
-                    peer.c_str(), host, port_host);
+            // ACL 拒绝日志可被高频触发 → 限速（附抑制计数），避免刷屏打满磁盘
+            size_t suppressed = 0;
+            if (m_log_limiter->allow(proxy_common::now_ms(), &suppressed)) {
+                fprintf(stderr, "[SOCKS5] %s → %s:%u 被目标 ACL 拒绝（服务端内网/回环/本机；"
+                                "内网自用可加 --proxy-allow-private）（已抑制 %zu 条同类日志）\n",
+                        sanitize_for_log(peer).c_str(), sanitize_for_log(host).c_str(), port_host,
+                        suppressed);
+            }
         } else {
             fprintf(stderr, "[SOCKS5] %s → %s:%u 连接失败: %s\n",
-                    peer.c_str(), host, port_host, strerror(cr.last_errno));
+                    sanitize_for_log(peer).c_str(), sanitize_for_log(host).c_str(), port_host, strerror(cr.last_errno));
         }
         ::close(fd);
         m_conns.fetch_sub(1);
@@ -417,7 +499,7 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
             return;
         }
     }
-    fprintf(stderr, "[SOCKS5] %s → %s:%u 已建立\n", peer.c_str(), host, port_host);
+    fprintf(stderr, "[SOCKS5] %s → %s:%u 已建立\n", sanitize_for_log(peer).c_str(), sanitize_for_log(host).c_str(), port_host);
 
     // ---- 阶段6：双向中继（公共件：poll + 半关闭 + 空闲回收） ----
     proxy_common::Stream browser_stream{ fd, nullptr };
@@ -427,7 +509,7 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer)
     const auto relay_secs = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - relay_begin).count();
     if (relay_secs >= kIdleTimeoutMs / 1000) {
-        fprintf(stderr, "[SOCKS5] %s 空闲超时，回收\n", peer.c_str());
+        fprintf(stderr, "[SOCKS5] %s 空闲超时，回收\n", sanitize_for_log(peer).c_str());
     }
 
     ::close(out_fd);

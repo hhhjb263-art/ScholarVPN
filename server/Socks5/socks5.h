@@ -9,6 +9,13 @@
 #include <thread>
 #include <vector>
 
+namespace proxy_common {
+class AuthThrottle;   // 认证失败限速器
+class ConnLimiter;    // 每来源连接限制（并发 + 新建速率）
+class LogLimiter;     // 日志限速
+struct TargetAcl;     // 目标 ACL（含本机地址）
+}
+
 // ============================================================================
 // SOCKS5 代理（浏览器插件专用出口，可选启用）
 //
@@ -30,7 +37,7 @@
 class Socks5Proxy
 {
 public:
-    Socks5Proxy() = default;
+    Socks5Proxy();
     ~Socks5Proxy();
 
     Socks5Proxy(const Socks5Proxy&) = delete;
@@ -50,6 +57,17 @@ public:
     // true = 内网自用场景放行（--proxy-allow-private）
     void set_allow_private(bool allow) { m_allow_private = allow; }
 
+    // 显式允许"无认证"监听非回环地址（默认拒绝，防误开开放代理）。
+    // 仅在内网/前置 TLS 终结（stunnel）等场景才应开启
+    void set_allow_noauth(bool allow) { m_allow_noauth = allow; }
+
+    // 每来源连接限制（并发/速率）：防单来源占满连接槽或高频新建放大 CPU
+    void set_conn_limits(size_t max_per_source, size_t rate_per_sec)
+    {
+        m_max_per_source = (max_per_source > 0) ? max_per_source : 16;
+        m_conn_rate_per_sec = (rate_per_sec > 0) ? rate_per_sec : 2;
+    }
+
 private:
     // 工作线程登记（启动时记录，accept 循环里顺手回收已结束的线程对象）
     struct Worker
@@ -59,7 +77,7 @@ private:
     };
 
     void accept_work();
-    void handle_conn(int fd, const std::string& peer);
+    void handle_conn(int fd, const std::string& peer_ip, const std::string& peer);
     void join_finished();
 
     int m_listen_fd = -1;
@@ -71,6 +89,13 @@ private:
     std::string m_user;
     std::string m_pass;
     bool m_allow_private = false;    // 目标 ACL：默认拒绝内网/回环
+    bool m_allow_noauth = false;     // 默认拒绝无认证对外监听
+    std::unique_ptr<proxy_common::AuthThrottle> m_auth_throttle;   // 认证失败限速
+    std::unique_ptr<proxy_common::ConnLimiter> m_conn_limiter;     // 每来源连接限制
+    std::unique_ptr<proxy_common::LogLimiter> m_log_limiter;       // 日志限速
+    std::unique_ptr<proxy_common::TargetAcl> m_acl;                // 目标 ACL（含本机地址）
+    size_t m_max_per_source = 16;
+    size_t m_conn_rate_per_sec = 2;
     std::thread m_accept_thread;
     std::mutex m_workers_mutex;
     std::vector<Worker> m_workers;

@@ -25,6 +25,76 @@
 
 namespace {
 
+// ============================================================================
+// auth_hello 应答闸门（防 UDP 反射放大 / 签名 CPU 耗尽）
+//
+// 远程攻击面：auth_hello 是明文、无需认证的 28 字节请求，服务端会回 112 字节
+// 的签名 ServerHello（约 4 倍放大，且每次要做一次 Ed25519 签名）。攻击者伪造
+// 源 IP 即可把服务端当反射器，或用海量请求烧 CPU。这里做两级限速：
+//   - 每来源：令牌桶（突发 20，补充 5/s）
+//   - 全局  ：令牌桶（突发 1000，补充 500/s）
+// 超限即静默丢弃（不回包），并把抑制次数记入日志限速器，避免日志刷屏。
+// 正常客户端每次连接只发 1~数次 auth_hello，完全不受影响。
+// ============================================================================
+class TokenBucket
+{
+public:
+    TokenBucket(double burst, double per_sec) : m_burst(burst), m_per_sec(per_sec), m_tokens(burst) {}
+
+    bool take(uint64_t now_ms)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_last_ms != 0) {
+            const uint64_t elapsed = (now_ms > m_last_ms) ? (now_ms - m_last_ms) : 0;
+            m_tokens += static_cast<double>(elapsed) / 1000.0 * m_per_sec;
+            if (m_tokens > m_burst)
+                m_tokens = m_burst;
+        }
+        m_last_ms = now_ms;
+        if (m_tokens < 1.0)
+            return false;
+        m_tokens -= 1.0;
+        return true;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    double m_burst;
+    double m_per_sec;
+    double m_tokens;
+    uint64_t m_last_ms = 0;
+};
+
+// 每来源闸门表（条目有界，避免被大量伪造源撑爆内存）
+class PerSourceGate
+{
+public:
+    PerSourceGate(double burst, double per_sec) : m_burst(burst), m_per_sec(per_sec) {}
+
+    bool take(const std::string& ip, uint64_t now_ms)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_buckets.find(ip);
+        if (it == m_buckets.end()) {
+            if (m_buckets.size() >= kMaxEntries) {
+                // 满了：清掉最旧的一半（简单摊销，避免无界增长）
+                auto cut = m_buckets.begin();
+                for (size_t i = 0; i < kMaxEntries / 2 && cut != m_buckets.end(); ++i)
+                    cut = m_buckets.erase(cut);
+            }
+            it = m_buckets.emplace(ip, std::make_shared<TokenBucket>(m_burst, m_per_sec)).first;
+        }
+        return it->second->take(now_ms);
+    }
+
+private:
+    static constexpr size_t kMaxEntries = 4096;
+    mutable std::mutex m_mutex;
+    std::unordered_map<std::string, std::shared_ptr<TokenBucket>> m_buckets;
+    double m_burst;
+    double m_per_sec;
+};
+
 // 注册/登录数据库（registered_clients.txt / register_tokens.txt）的
 // 进程内互斥：UDP recv 线程与 TCP epoll 线程都可能执行注册/登录；
 // "令牌消费 + 客户端登记"必须作为整体串行（配合文件级 flock 防跨进程竞争）
@@ -915,8 +985,25 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
 // 阶段1 明文交换 nonce/临时DH 公钥并验签防中间人；阶段2 ECDH+HKDF 派生 key_tx/key_rx；
 // 阶段3 密文身份报文验签后按注册（令牌）/登录（公钥比对）放行 TUN 流量。
 
+// auth_hello 应答闸门实例（见文件头说明）
+static TokenBucket g_auth_hello_global(1000.0, 500.0);
+static PerSourceGate g_auth_hello_per_source(20.0, 5.0);
+
 void UDP::handle_auth_hello(Session& s, const uint8_t* payload, size_t len)
 {
+    // 反射放大/CPU 耗尽防护：超限静默丢弃（不回包，避免被当反射器）
+    {
+        const uint64_t now = now_ms();
+        if (!g_auth_hello_global.take(now) || !g_auth_hello_per_source.take(s.peer_ip, now)) {
+            static std::atomic<size_t> suppressed{0};
+            const size_t n = suppressed.fetch_add(1) + 1;
+            if (n == 1 || n % 1000 == 0) {
+                fprintf(stderr, "[UDP][AUTH] auth_hello 触发限速，已静默丢弃 %zu 个请求"
+                                "（防反射放大/签名 CPU 耗尽）\n", n);
+            }
+            return;
+        }
+    }
     if (len != KAuthNonceLen) {
         fprintf(stderr, "[UDP][AUTH] auth_hello 长度错误: %zu != %zu\n", len, KAuthNonceLen);
         return;

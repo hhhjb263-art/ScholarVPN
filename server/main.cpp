@@ -46,8 +46,13 @@ static void print_usage(const char *prog)
     printf("      --https-proxy-key <p>   TLS 私钥 PEM\n");
     printf("      --proxy-user <u>  三个代理入口共用的用户名/密码认证（公网强烈建议）\n");
     printf("      --proxy-pass <p>  与 --proxy-user 配套\n");
+    printf("      --proxy-pass-file <p>  从文件读取代理密码（建议 0600；避免密码进 ps/history）\n");
     printf("      --proxy-allow-private  允许代理连接服务端内网/回环目标\n");
     printf("                        （默认禁止；仅内网自用场景开启）\n");
+    printf("      --proxy-allow-noauth   显式允许无认证代理监听非回环地址\n");
+    printf("                        （默认拒绝，防误开开放代理；仅内网/前置 TLS 用）\n");
+    printf("      --proxy-max-per-source <n>  每来源并发连接上限（默认 16）\n");
+    printf("      --proxy-conn-rate <n>       每来源每秒新建连接上限（默认 2；突发额度 30 倍）\n");
     printf("  -h, --help            显示本帮助\n");
 }
 
@@ -172,8 +177,52 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
             const char *v = next("密码");
             if(!v) return false;
             cfg.proxy_pass = v;
+        }else if(arg == "--proxy-pass-file"){
+            // 从文件读密码：避免密码出现在进程命令行（ps 可见）与 shell history
+            const char *v = next("路径");
+            if(!v) return false;
+            FILE* f = std::fopen(v, "r");
+            if(f == nullptr){
+                fprintf(stderr, "无法读取密码文件: %s\n", v);
+                return false;
+            }
+            char buf[512] = {0};
+            if(std::fgets(buf, sizeof(buf), f) == nullptr){
+                std::fclose(f);
+                fprintf(stderr, "密码文件为空: %s\n", v);
+                return false;
+            }
+            std::fclose(f);
+            std::string pass(buf);
+            while(!pass.empty() && (pass.back() == '\n' || pass.back() == '\r'))
+                pass.pop_back();
+            if(pass.empty()){
+                fprintf(stderr, "密码文件去掉换行后为空: %s\n", v);
+                return false;
+            }
+            cfg.proxy_pass = pass;
         }else if(arg == "--proxy-allow-private"){
             cfg.proxy_allow_private = true;
+        }else if(arg == "--proxy-allow-noauth"){
+            cfg.proxy_allow_noauth = true;
+        }else if(arg == "--proxy-max-per-source"){
+            const char *v = next("数量");
+            if(!v) return false;
+            const long n = std::strtol(v, nullptr, 10);
+            if(n < 1 || n > 256){
+                fprintf(stderr, "参数错误: --proxy-max-per-source 必须是 1-256\n");
+                return false;
+            }
+            cfg.proxy_max_per_source = static_cast<size_t>(n);
+        }else if(arg == "--proxy-conn-rate"){
+            const char *v = next("每秒新建数");
+            if(!v) return false;
+            const long n = std::strtol(v, nullptr, 10);
+            if(n < 1 || n > 1000){
+                fprintf(stderr, "参数错误: --proxy-conn-rate 必须是 1-1000\n");
+                return false;
+            }
+            cfg.proxy_conn_rate = static_cast<size_t>(n);
         }else{
             fprintf(stderr, "未知选项: %s\n", arg.c_str());
             print_usage(argv[0]);

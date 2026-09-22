@@ -65,6 +65,11 @@ public:
         // 目标地址 ACL：默认（false）拒绝代理访问服务端内网/回环/链路本地/
         // 组播/TUN 网段目标；true = 内网自用场景放行（--proxy-allow-private）
         bool proxy_allow_private = false;
+        // 显式允许无认证代理监听非回环地址（默认拒绝，防开放代理）
+        bool proxy_allow_noauth = false;
+        // 每来源连接限制（并发上限 / 每秒新建速率）
+        size_t proxy_max_per_source = 16;
+        size_t proxy_conn_rate = 2;
     };
 
 public:

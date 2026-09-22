@@ -35,6 +35,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include "../Proxy/proxy_common.h"   // TargetAcl / ConnLimiter / LogLimiter 等
 #include "httpsproxy.h"
 #include "socks5.h"
 
@@ -571,56 +572,116 @@ void test_target_acl(uint16_t socks_port, uint16_t http_port, uint16_t echo_port
 
 #ifdef PROXY_TEST_TLS
 // ---------------------------------------------------------------------------
-// 生成自签证书（仅测试用）：返回 true 并输出 PEM 路径
+// 生成 CA + 叶证书（与生产脚本 gen-self-signed-cert.sh 的默认模型一致）：
+// 客户端只信任 CA，服务器只持有叶证书私钥（泄露也无法签其他名字）。
+// expired=true 时叶证书立即处于过期状态（验证启动时的有效期检查）
 // ---------------------------------------------------------------------------
-bool make_self_signed_cert(const std::string& cert_path, const std::string& key_path)
+bool write_pem_cert_key(X509* cert, EVP_PKEY* key,
+                        const std::string& cert_path, const std::string& key_path)
 {
-    EVP_PKEY* pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "RSA", 2048);
-    if (pkey == nullptr)
-        return false;
-    X509* x = X509_new();
-    if (x == nullptr) {
-        EVP_PKEY_free(pkey);
-        return false;
-    }
     bool ok = true;
-    X509_set_version(x, 2);
-    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-    X509_gmtime_adj(X509_getm_notBefore(x), 0);
-    X509_gmtime_adj(X509_getm_notAfter(x), 24 * 3600);
-    X509_set_pubkey(x, pkey);
-    X509_NAME* name = X509_get_subject_name(x);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
-    X509_set_issuer_name(x, name);
-    // 作为信任锚需要 CA:TRUE（测试里直接信任该证书）
-    X509V3_CTX ctx{};
-    X509V3_set_ctx_nodb(&ctx);
-    X509V3_set_ctx(&ctx, x, x, nullptr, nullptr, 0);
-    if (X509_EXTENSION* ext =
-            X509V3_EXT_conf_nid(nullptr, &ctx, NID_basic_constraints, "critical,CA:TRUE")) {
-        X509_add_ext(x, ext, -1);
-        X509_EXTENSION_free(ext);
-    }
-    if (X509_sign(x, pkey, EVP_sha256()) == 0)
-        ok = false;
-    // 用 BIO 写盘（MSVC 下 OpenSSL 的 FILE* 接口需要 OPENSSL_Applink，
-    // BIO_new_file 走自己的 IO，无需额外适配）
     if (ok) {
         BIO* b = BIO_new_file(cert_path.c_str(), "w");
-        ok = (b != nullptr) && PEM_write_bio_X509(b, x) == 1;
+        ok = (b != nullptr) && PEM_write_bio_X509(b, cert) == 1;
         if (b != nullptr)
             BIO_free(b);
     }
     if (ok) {
         BIO* b = BIO_new_file(key_path.c_str(), "w");
         ok = (b != nullptr) &&
-             PEM_write_bio_PrivateKey(b, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+             PEM_write_bio_PrivateKey(b, key, nullptr, nullptr, 0, nullptr, nullptr) == 1;
         if (b != nullptr)
             BIO_free(b);
     }
-    X509_free(x);
-    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+bool make_ca_and_leaf(const std::string& ca_cert, const std::string& ca_key,
+                      const std::string& leaf_cert, const std::string& leaf_key,
+                      bool expired = false)
+{
+    // ---- CA ----
+    EVP_PKEY* ca_pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "RSA", 2048);
+    X509* ca = ca_pkey != nullptr ? X509_new() : nullptr;
+    if (ca == nullptr) {
+        if (ca_pkey != nullptr)
+            EVP_PKEY_free(ca_pkey);
+        return false;
+    }
+    X509_set_version(ca, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(ca), 1);
+    X509_gmtime_adj(X509_getm_notBefore(ca), -3600);
+    X509_gmtime_adj(X509_getm_notAfter(ca), 10L * 365 * 24 * 3600);
+    X509_set_pubkey(ca, ca_pkey);
+    X509_NAME* ca_name = X509_get_subject_name(ca);
+    X509_NAME_add_entry_by_txt(ca_name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>("ScholarVPN Test CA"),
+                               -1, -1, 0);
+    X509_set_issuer_name(ca, ca_name);
+    X509V3_CTX ctx{};
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, ca, ca, nullptr, nullptr, 0);
+    if (X509_EXTENSION* e =
+            X509V3_EXT_conf_nid(nullptr, &ctx, NID_basic_constraints, "critical,CA:TRUE,pathlen:0")) {
+        X509_add_ext(ca, e, -1);
+        X509_EXTENSION_free(e);
+    }
+    if (X509_sign(ca, ca_pkey, EVP_sha256()) == 0) {
+        X509_free(ca);
+        EVP_PKEY_free(ca_pkey);
+        return false;
+    }
+
+    // ---- 叶证书（SAN=IP:127.0.0.1，与测试里连接的目标一致）----
+    EVP_PKEY* leaf_pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "RSA", 2048);
+    X509* leaf = leaf_pkey != nullptr ? X509_new() : nullptr;
+    bool ok = leaf != nullptr;
+    if (ok) {
+        X509_set_version(leaf, 2);
+        ASN1_INTEGER_set(X509_get_serialNumber(leaf), 2);
+        if (expired) {
+            X509_gmtime_adj(X509_getm_notBefore(leaf), -7200);
+            X509_gmtime_adj(X509_getm_notAfter(leaf), -3600);   // 已过期
+        } else {
+            X509_gmtime_adj(X509_getm_notBefore(leaf), -3600);
+            X509_gmtime_adj(X509_getm_notAfter(leaf), 24 * 3600);
+        }
+        X509_set_pubkey(leaf, leaf_pkey);
+        X509_NAME* leaf_name = X509_get_subject_name(leaf);
+        X509_NAME_add_entry_by_txt(leaf_name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+        X509_set_issuer_name(leaf, ca_name);
+        X509V3_CTX lctx{};
+        X509V3_set_ctx_nodb(&lctx);
+        X509V3_set_ctx(&lctx, ca, leaf, nullptr, nullptr, 0);
+        if (X509_EXTENSION* e =
+                X509V3_EXT_conf_nid(nullptr, &lctx, NID_basic_constraints, "critical,CA:FALSE")) {
+            X509_add_ext(leaf, e, -1);
+            X509_EXTENSION_free(e);
+        }
+        if (X509_EXTENSION* e =
+                X509V3_EXT_conf_nid(nullptr, &lctx, NID_ext_key_usage, "serverAuth")) {
+            X509_add_ext(leaf, e, -1);
+            X509_EXTENSION_free(e);
+        }
+        if (X509_EXTENSION* e = X509V3_EXT_conf_nid(nullptr, &lctx, NID_subject_alt_name,
+                                                    "IP:127.0.0.1")) {
+            X509_add_ext(leaf, e, -1);
+            X509_EXTENSION_free(e);
+        }
+        ok = X509_sign(leaf, ca_pkey, EVP_sha256()) != 0;
+    }
+    if (ok)
+        ok = write_pem_cert_key(ca, ca_pkey, ca_cert, ca_key);
+    if (ok)
+        ok = write_pem_cert_key(leaf, leaf_pkey, leaf_cert, leaf_key);
+
+    if (leaf != nullptr)
+        X509_free(leaf);
+    if (leaf_pkey != nullptr)
+        EVP_PKEY_free(leaf_pkey);
+    X509_free(ca);
+    EVP_PKEY_free(ca_pkey);
     return ok;
 }
 
@@ -631,7 +692,7 @@ void test_https_proxy(uint16_t tls_port, uint16_t echo_port, const std::string& 
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (ctx == nullptr || SSL_CTX_load_verify_locations(ctx, cert_path.c_str(), nullptr) != 1) {
-        check("测试客户端 SSL_CTX 初始化", false);
+        check("测试客户端 SSL_CTX 初始化（信任锚=CA 证书）", false);
         if (ctx != nullptr)
             SSL_CTX_free(ctx);
         return;
@@ -648,8 +709,16 @@ void test_https_proxy(uint16_t tls_port, uint16_t echo_port, const std::string& 
             c.ssl = SSL_new(ctx);
             SSL_set_fd(c.ssl, static_cast<int>(c.fd));
             const int hs = SSL_connect(c.ssl);
-            check("TLS 握手成功（证书链校验通过）", hs == 1);
+            check("TLS 握手成功（CA 签发链校验通过）", hs == 1);
             if (hs == 1) {
+                // 加固断言：协商结果必须是 AEAD 套件（GCM/CHACHA），且 TLS≥1.2
+                const char* cipher = SSL_get_cipher_name(c.ssl);
+                const char* ver = SSL_get_version(c.ssl);
+                const bool aead = cipher != nullptr &&
+                                  (strstr(cipher, "GCM") != nullptr ||
+                                   strstr(cipher, "CHACHA20") != nullptr);
+                check("协商套件为 AEAD（GCM/CHACHA20）", aead);
+                check("协议版本 ≥ TLS1.2", ver != nullptr && strcmp(ver, "TLSv1") != 0);
                 int status = 0;
                 c = http_proxy_connect(c, "127.0.0.1", echo_port, "", "", &status);
                 check("TLS 隧道内 CONNECT 200", status == 200 && c.fd != INVALID_SOCKET);
@@ -686,6 +755,138 @@ void test_https_proxy(uint16_t tls_port, uint16_t echo_port, const std::string& 
     SSL_CTX_free(ctx);
 }
 #endif   // PROXY_TEST_TLS
+
+// ---------------------------------------------------------------------------
+// 用例：认证失败限速（防在线暴力破解）
+// ---------------------------------------------------------------------------
+void test_auth_throttle(uint16_t port, uint16_t echo_port)
+{
+    printf("认证限速用例（防暴力破解）\n");
+    for (int i = 0; i < 5; ++i) {
+        uint8_t rep = 0xFF;
+        Conn c = socks5_connect(port, "127.0.0.1", echo_port, "alice", "wrong", &rep);
+        c.close_all();
+    }
+    // 锁定期内：即使密码正确也必须被拒（对端表现与认证失败一致）
+    uint8_t rep = 0xFF;
+    Conn c = socks5_connect(port, "127.0.0.1", echo_port, "alice", "s3cret", &rep);
+    check("连续 5 次失败后，正确密码也被临时拒绝（已锁定）", c.fd == INVALID_SOCKET);
+    c.close_all();
+}
+
+// ---------------------------------------------------------------------------
+// 用例：启动期安全校验 + 输入健壮性
+// ---------------------------------------------------------------------------
+void test_startup_guards(uint16_t echo_port)
+{
+    printf("启动校验与输入健壮性用例\n");
+
+    // 1) 无认证 + 非回环监听：默认拒绝（防误开开放代理）
+    Socks5Proxy noauth;
+    check("无认证 + 非回环监听 → 拒绝启动",
+          !noauth.start("0.0.0.0", 11090, "", "", 8) && !noauth.is_running());
+
+    // 2) 显式放行后可启动（内网/前置 TLS 场景）
+    Socks5Proxy noauth_ok;
+    noauth_ok.set_allow_noauth(true);
+    const bool started = noauth_ok.start("0.0.0.0", 11090, "", "", 8);
+    check("--proxy-allow-noauth 显式放行后可启动", started);
+    noauth_ok.stop();
+
+    // 3) 配了用户名但密码为空：等价无认证 → 拒绝
+    Socks5Proxy empty_pass;
+    check("用户名有但密码为空 → 拒绝启动",
+          !empty_pass.start("127.0.0.1", 11091, "alice", "", 8));
+
+    // 4) 回环 + 无认证：允许（本机开发便利）
+    Socks5Proxy loop_ok;
+    check("回环地址 + 无认证 → 允许启动", loop_ok.start("127.0.0.1", 11092, "", "", 8));
+    loop_ok.stop();
+
+    // 5) 超长/畸形目标主机名：返回 400 而不是崩溃或转发
+    HttpConnectProxy plain;
+    HttpConnectProxy::Config pc;
+    pc.bind_ip = "127.0.0.1";
+    pc.port = 11093;
+    pc.use_tls = false;
+    pc.allow_private = true;
+    if (plain.start(pc)) {
+        Conn c = tcp_connect(11093);
+        const std::string long_host(300, 'a');
+        const std::string req = "CONNECT " + long_host + ":443 HTTP/1.1\r\n\r\n";
+        c.send_all(req.data(), req.size());
+        std::string head;
+        const bool got = c.recv_until_headers(head);
+        check("超长目标主机名 → 400 Bad Request",
+              got && head.find("400") != std::string::npos);
+        c.close_all();
+        plain.stop();
+    } else {
+        check("启动明文 HTTP 代理（用于输入健壮性用例）", false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 用例：远程攻击面加固（每来源连接上限、本机地址 ACL、日志限速）
+// ---------------------------------------------------------------------------
+void test_remote_attack_surface(uint16_t echo_port)
+{
+    printf("远程攻击面加固用例\n");
+
+    // 1) 每来源并发连接上限：cap=2 时第 3 条连接必须被拒
+    {
+        Socks5Proxy limited;
+        limited.set_allow_private(true);
+        limited.set_conn_limits(2, 1);          // 并发 2，速率 1/s（突发 30，不影响本用例）
+        if (limited.start("127.0.0.1", 11094, "", "", 8)) {
+            Conn c1 = tcp_connect(11094);        // 占用槽位 1（不发数据，停在握手等待）
+            Conn c2 = tcp_connect(11094);        // 占用槽位 2
+            Conn c3 = tcp_connect(11094);        // 超限：服务端 accept 后立即关闭
+            const uint8_t greet[3] = { 0x05, 0x01, 0x00 };
+            uint8_t resp[2] = { 0xFF, 0xFF };
+            bool got_reply = false;
+            if (c3.fd != INVALID_SOCKET) {
+                c3.send_all(greet, sizeof(greet));
+                got_reply = c3.recv_all(resp, 2);   // 被拒连接应读到 EOF/错误
+            }
+            check("每来源并发超限的第 3 条连接被拒绝", c3.fd == INVALID_SOCKET || !got_reply);
+            c1.close_all();
+            c2.close_all();
+            c3.close_all();
+            limited.stop();
+        } else {
+            check("启动连接限制测试代理", false);
+        }
+    }
+
+    // 2) 本机地址 ACL：目标等于本机任一接口地址（含公网 IP）必须拒绝
+    {
+        proxy_common::TargetAcl acl;
+        acl.allow_internal = false;
+        acl.local_v4_net.push_back(inet_addr("8.8.8.8"));   // 伪造"本机公网地址"
+        const auto r = proxy_common::connect_target_checked("8.8.8.8", 80, acl);
+        check("目标为本机公网地址 → 被 ACL 拒绝（防回连自身服务）",
+              r.fd < 0 && r.blocked);
+        // 对照组：非本机的公网地址不应被 ACL 拒绝（可能连接失败，但不是 blocked）
+        const auto r2 = proxy_common::connect_target_checked("93.184.216.34", 80, acl);
+        check("非本机公网地址不被 ACL 拒绝", !r2.blocked);
+    }
+
+    // 3) 日志限速：每秒 N 条，超出抑制
+    {
+        proxy_common::LogLimiter lim(3);
+        const uint64_t t0 = proxy_common::now_ms();
+        const bool a1 = lim.allow(t0);
+        const bool a2 = lim.allow(t0);
+        const bool a3 = lim.allow(t0);
+        const bool a4 = lim.allow(t0);          // 应被抑制
+        const bool a5 = lim.allow(t0 + 1100);   // 新窗口，放行
+        check("日志限速：窗口内超出即抑制、下一窗口恢复",
+              a1 && a2 && a3 && !a4 && a5);
+    }
+
+    (void)echo_port;
+}
 
 } // namespace
 
@@ -750,12 +951,14 @@ int main()
 #ifdef PROXY_TEST_TLS
     // ---- HTTPS CONNECT（TLS）：自签证书 + 真实握手 ----
     {
-        const std::string cert_path = "proxy_test_cert.pem";
-        const std::string key_path = "proxy_test_key.pem";
-        if (!make_self_signed_cert(cert_path, key_path)) {
-            check("生成测试用自签证书", false, "(OpenSSL 不可用?)");
+        const std::string cert_path = "proxy_test_leaf.pem";
+        const std::string key_path = "proxy_test_leaf.key.pem";
+        const std::string ca_cert = "proxy_test_ca.pem";
+        const std::string ca_key = "proxy_test_ca.key.pem";
+        if (!make_ca_and_leaf(ca_cert, ca_key, cert_path, key_path)) {
+            check("生成测试用 CA + 叶证书", false, "(OpenSSL 不可用?)");
         } else {
-            check("生成测试用自签证书", true);
+            check("生成测试用 CA + 叶证书", true);
             HttpConnectProxy tls_proxy;
             HttpConnectProxy::Config cfg;
             cfg.bind_ip = "127.0.0.1";
@@ -768,12 +971,34 @@ int main()
                 check("HTTPS 代理启动（加载证书）", false);
             } else {
                 check("HTTPS 代理启动（加载证书）", true);
-                test_https_proxy(11084, echo.port(), cert_path);
+                test_https_proxy(11084, echo.port(), ca_cert);
                 tls_proxy.stop();
                 check("HTTPS 代理 stop() 回收完成", !tls_proxy.is_running());
             }
             remove(cert_path.c_str());
             remove(key_path.c_str());
+            remove(ca_cert.c_str());
+            remove(ca_key.c_str());
+
+            // 过期叶证书必须拒绝启动（防止"证书过期后仍静默服务"）
+            const std::string exp_cert = "proxy_test_expired.pem";
+            const std::string exp_key = "proxy_test_expired.key.pem";
+            if (make_ca_and_leaf(ca_cert, ca_key, exp_cert, exp_key, true)) {
+                HttpConnectProxy expired_proxy;
+                HttpConnectProxy::Config ecfg;
+                ecfg.bind_ip = "127.0.0.1";
+                ecfg.port = 11088;
+                ecfg.use_tls = true;
+                ecfg.cert_path = exp_cert;
+                ecfg.key_path = exp_key;
+                check("证书已过期 → 拒绝启动", !expired_proxy.start(ecfg));
+                remove(exp_cert.c_str());
+                remove(exp_key.c_str());
+                remove(ca_cert.c_str());
+                remove(ca_key.c_str());
+            } else {
+                check("生成过期证书（用于负例）", false);
+            }
         }
     }
     // 证书缺失时启动必须失败（use_tls 且未提供证书）
@@ -788,6 +1013,23 @@ int main()
 #else
     printf("（未定义 PROXY_TEST_TLS：跳过 TLS 用例）\n");
 #endif
+
+    // ---- 认证限速（独立实例，避免影响其他用例）----
+    {
+        Socks5Proxy throttle_proxy;
+        if (throttle_proxy.start("127.0.0.1", 11089, "alice", "s3cret", 8)) {
+            test_auth_throttle(11089, echo.port());
+            throttle_proxy.stop();
+        } else {
+            check("启动限速测试用代理", false);
+        }
+    }
+
+    // ---- 启动期安全校验与输入健壮性 ----
+    test_startup_guards(echo.port());
+
+    // ---- 远程攻击面加固 ----
+    test_remote_attack_surface(echo.port());
 
     // ---- 目标 ACL：默认配置（未调用 set_allow_private / allow_private=false）----
     {

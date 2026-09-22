@@ -130,6 +130,8 @@ bool VpnCore::init(const Config &cfg)
     //    chrome.proxy 提供出口，只代理浏览器流量。三个入口独立配置端口：
     //      SOCKS5（明文）/ HTTP CONNECT（明文）/ HTTPS CONNECT（TLS 加密，推荐）
     m_socks5.set_allow_private(m_cfg.proxy_allow_private);
+    m_socks5.set_allow_noauth(m_cfg.proxy_allow_noauth);
+    m_socks5.set_conn_limits(m_cfg.proxy_max_per_source, m_cfg.proxy_conn_rate);
     if(m_cfg.socks5_port != 0 &&
        !m_socks5.start(m_cfg.listen_ip, m_cfg.socks5_port,
                        m_cfg.proxy_user, m_cfg.proxy_pass)){
@@ -146,6 +148,9 @@ bool VpnCore::init(const Config &cfg)
         pc.user = m_cfg.proxy_user;
         pc.pass = m_cfg.proxy_pass;
         pc.allow_private = m_cfg.proxy_allow_private;
+        pc.allow_noauth = m_cfg.proxy_allow_noauth;
+        pc.max_per_source = m_cfg.proxy_max_per_source;
+        pc.conn_rate_per_sec = m_cfg.proxy_conn_rate;
         if(!m_http_proxy.start(pc)){
             fprintf(stderr, "[VpnCore] http_proxy.start(%s:%u) failed\n",
                     m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.http_proxy_port));
@@ -163,6 +168,9 @@ bool VpnCore::init(const Config &cfg)
         pc.user = m_cfg.proxy_user;
         pc.pass = m_cfg.proxy_pass;
         pc.allow_private = m_cfg.proxy_allow_private;
+        pc.allow_noauth = m_cfg.proxy_allow_noauth;
+        pc.max_per_source = m_cfg.proxy_max_per_source;
+        pc.conn_rate_per_sec = m_cfg.proxy_conn_rate;
         if(!m_https_proxy.start(pc)){
             fprintf(stderr, "[VpnCore] https_proxy.start(%s:%u) failed\n",
                     m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.https_proxy_port));

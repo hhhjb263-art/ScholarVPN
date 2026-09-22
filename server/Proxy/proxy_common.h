@@ -24,17 +24,35 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#endif
+
+#include <array>
 
 #include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
 namespace proxy_common {
+
+// 单调时钟毫秒（限速/超时统一用它，避免系统时间跳变影响）
+inline uint64_t now_ms()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 // 常量时间比较（代理凭据校验，避免计时侧信道；长度不同直接失败）
 inline bool constant_time_eq(const std::string& a, const std::string& b)
@@ -145,6 +163,242 @@ inline void set_io_timeout(int fd, int seconds)
 }
 
 // ---------------------------------------------------------------------------
+// 日志安全：目标主机名/来源地址都来自对端（可被构造），直接拼进日志会被
+// 注入换行/ANSI 转义伪造日志行。统一转义为可打印字符并限长
+// ---------------------------------------------------------------------------
+inline std::string sanitize_for_log(const std::string& in, size_t max_len = 128)
+{
+    std::string out;
+    // 不用 std::min：MSVC 的 min 宏会与之冲突（Windows 测试构建踩过）
+    out.reserve(in.size() < max_len ? in.size() : max_len);
+    for (unsigned char c : in) {
+        if (out.size() >= max_len) {
+            out += "...";
+            break;
+        }
+        out.push_back((c >= 0x20 && c <= 0x7E) ? static_cast<char>(c) : '?');
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// 每来源连接限制（并发 + 新建速率）
+//
+// 远程攻击面：不做限制时，单个来源可以占满 256 个连接槽/线程（DoSing 所有
+// 其他用户），也能靠"连上就断"的高频新建放大 CPU（每次 TLS 握手都要签名）。
+// 令牌桶限速 + 并发上限：突发允许 rate_burst，之后按 rate_per_sec 补充；
+// 并发超过 max_concurrent 直接拒绝。条目内存有界，空闲条目会被清理。
+// ---------------------------------------------------------------------------
+// （顶层结构：嵌套类型的默认成员初始化器不能用作同类的默认实参）
+struct ConnLimits
+{
+    size_t max_concurrent = 16;    // 每来源并发连接上限
+    size_t rate_burst = 60;        // 新建连接的突发额度
+    size_t rate_per_sec = 2;       // 每秒补充额度（≈120/分钟）
+};
+
+class ConnLimiter
+{
+public:
+    explicit ConnLimiter(ConnLimits limits = ConnLimits()) : m_limits(limits) {}
+
+    // 尝试占用一个连接槽；false = 超限（调用方应拒绝该连接）
+    bool try_acquire(const std::string& ip, uint64_t now_ms)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        purge_locked(now_ms);
+        Entry& e = m_entries[ip];
+        if (e.last_ms == 0) {
+            e.last_ms = now_ms;
+            e.tokens = static_cast<double>(m_limits.rate_burst);
+        }
+        // 令牌补充
+        const uint64_t elapsed = (now_ms > e.last_ms) ? (now_ms - e.last_ms) : 0;
+        e.tokens += static_cast<double>(elapsed) / 1000.0 * m_limits.rate_per_sec;
+        if (e.tokens > static_cast<double>(m_limits.rate_burst))
+            e.tokens = static_cast<double>(m_limits.rate_burst);
+        e.last_ms = now_ms;
+        if (e.concurrent >= m_limits.max_concurrent)
+            return false;
+        if (e.tokens < 1.0)
+            return false;
+        e.tokens -= 1.0;
+        ++e.concurrent;
+        return true;
+    }
+
+    void release(const std::string& ip)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_entries.find(ip);
+        if (it == m_entries.end())
+            return;
+        if (it->second.concurrent > 0)
+            --it->second.concurrent;
+    }
+
+    size_t tracked() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_entries.size();
+    }
+
+private:
+    struct Entry
+    {
+        size_t concurrent = 0;
+        double tokens = 0.0;
+        uint64_t last_ms = 0;
+    };
+    static constexpr size_t kMaxEntries = 4096;
+    static constexpr uint64_t kIdlePurgeMs = 10 * 60'000;   // 空闲 10 分钟清理
+
+    void purge_locked(uint64_t now_ms)
+    {
+        if (m_entries.size() < kMaxEntries)
+            return;
+        for (auto it = m_entries.begin(); it != m_entries.end(); ) {
+            const bool idle = it->second.concurrent == 0 &&
+                              (now_ms - it->second.last_ms) > kIdlePurgeMs;
+            it = idle ? m_entries.erase(it) : std::next(it);
+        }
+    }
+
+    mutable std::mutex m_mutex;
+    std::unordered_map<std::string, Entry> m_entries;
+    ConnLimits m_limits;
+};
+
+// ---------------------------------------------------------------------------
+// 日志限速：拒绝路径的日志会被攻击者高频触发（连接洪泛/认证爆破），
+// 不限速会把磁盘打满并淹没真实告警。每类日志默认 5 条/秒，超出的丢弃并
+// 在下次放行时附上"已抑制 N 条"
+// ---------------------------------------------------------------------------
+class LogLimiter
+{
+public:
+    explicit LogLimiter(size_t per_sec = 5) : m_per_sec(per_sec) {}
+
+    bool allow(uint64_t now_ms, size_t* suppressed_out = nullptr)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_window_start == 0 || now_ms - m_window_start >= 1000) {
+            m_window_start = now_ms;
+            m_emitted = 0;
+        }
+        if (m_emitted < m_per_sec) {
+            ++m_emitted;
+            if (suppressed_out != nullptr) {
+                *suppressed_out = m_suppressed;
+                m_suppressed = 0;
+            }
+            return true;
+        }
+        ++m_suppressed;
+        return false;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    size_t m_per_sec;
+    size_t m_emitted = 0;
+    size_t m_suppressed = 0;
+    uint64_t m_window_start = 0;
+};
+
+// ---------------------------------------------------------------------------
+// 认证失败限速（防在线暴力破解）
+//
+// 按来源 IP 统计失败次数：60 秒窗口内失败 ≥5 次即锁定，锁定时长随失败次数
+// 指数增长（30s → 15min 封顶）；成功一次立即清零。锁定期内直接拒绝（对端
+// 看到的表现与"认证失败"一致，不泄露是否被锁定）。内存有界：条目上限
+// 4096，超限时清理已过期条目。
+// ---------------------------------------------------------------------------
+class AuthThrottle
+{
+public:
+    // 当前是否允许该来源尝试认证
+    bool allow(const std::string& ip, uint64_t now_ms) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const Entry* e = find(ip);
+        return e == nullptr || now_ms >= e->lock_until;
+    }
+
+    // 记录一次失败；返回锁定剩余毫秒（0 = 未锁定）
+    uint64_t on_failure(const std::string& ip, uint64_t now_ms)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        purge_locked(now_ms);
+        Entry& e = m_entries[ip];
+        if (e.window_start == 0 || now_ms - e.window_start > kWindowMs) {
+            e.fails = 0;
+            e.window_start = now_ms;
+        }
+        ++e.fails;
+        if (e.fails >= kFailsToLock) {
+            const uint32_t step = (e.fails - kFailsToLock) / kFailsToLock;   // 每多 5 次翻倍
+            uint64_t lock_ms = kBaseLockMs << (step > 5 ? 5 : step);
+            if (lock_ms > kMaxLockMs)
+                lock_ms = kMaxLockMs;
+            e.lock_until = now_ms + lock_ms;
+            return lock_ms;
+        }
+        return 0;
+    }
+
+    void on_success(const std::string& ip)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_entries.erase(ip);
+    }
+
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_entries.size();
+    }
+
+private:
+    struct Entry
+    {
+        uint32_t fails = 0;
+        uint64_t window_start = 0;
+        uint64_t lock_until = 0;
+    };
+
+    static constexpr uint64_t kWindowMs = 60'000;      // 统计窗口
+    static constexpr uint32_t kFailsToLock = 5;        // 窗口内失败达 5 次锁定
+    static constexpr uint64_t kBaseLockMs = 30'000;    // 首次锁定 30s
+    static constexpr uint64_t kMaxLockMs = 15 * 60'000; // 封顶 15 分钟
+    static constexpr size_t kMaxEntries = 4096;
+
+    Entry* find(const std::string& ip)
+    {
+        auto it = m_entries.find(ip);
+        return it == m_entries.end() ? nullptr : &it->second;
+    }
+    const Entry* find(const std::string& ip) const
+    {
+        auto it = m_entries.find(ip);
+        return it == m_entries.end() ? nullptr : &it->second;
+    }
+    void purge_locked(uint64_t now_ms)
+    {
+        if (m_entries.size() < kMaxEntries)
+            return;
+        for (auto it = m_entries.begin(); it != m_entries.end(); ) {
+            const bool expired = (now_ms >= it->second.lock_until) &&
+                                 (now_ms - it->second.window_start > kWindowMs);
+            it = expired ? m_entries.erase(it) : std::next(it);
+        }
+    }
+
+    mutable std::mutex m_mutex;
+    std::unordered_map<std::string, Entry> m_entries;
+};
+
+// ---------------------------------------------------------------------------
 // 目标地址 ACL：默认拒绝"服务端内网"目标
 //
 // 为什么需要：代理在服务端本机发起连接，若不限制，任何通过认证的浏览器
@@ -225,6 +479,75 @@ inline bool addr_is_internal(const struct sockaddr* sa)
     return true;   // 未知地址族：保守拒绝
 }
 
+// ---------------------------------------------------------------------------
+// 目标 ACL 上下文
+//
+// 除"内网/回环/链路本地"外，还要拒绝"本机任一接口地址"——否则认证用户可用
+// 代理连回服务器的公网 IP，从而以"服务器自身"为源去访问本机服务（SSH 爆破、
+// 绕过 fail2ban 白名单等）。本机地址在启动时枚举一次（getifaddrs）。
+// ---------------------------------------------------------------------------
+struct TargetAcl
+{
+    bool allow_internal = false;                  // --proxy-allow-private 时放行全部
+    std::vector<uint32_t> local_v4_net;           // 本机 IPv4（网络序）
+    std::vector<std::array<uint8_t, 16>> local_v6;
+
+    bool is_local(const struct sockaddr* sa) const
+    {
+        if (sa == nullptr)
+            return true;
+        if (sa->sa_family == AF_INET) {
+            const auto* a4 = reinterpret_cast<const sockaddr_in*>(sa);
+            for (uint32_t v : local_v4_net) {
+                if (v == a4->sin_addr.s_addr)
+                    return true;
+            }
+            return false;
+        }
+        if (sa->sa_family == AF_INET6) {
+            const auto* a6 = reinterpret_cast<const sockaddr_in6*>(sa);
+            for (const auto& v : local_v6) {
+                if (memcmp(v.data(), a6->sin6_addr.s6_addr, 16) == 0)
+                    return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    // true = 该目标被拒绝
+    bool blocked(const struct sockaddr* sa) const
+    {
+        if (allow_internal)
+            return false;
+        return addr_is_internal(sa) || is_local(sa);
+    }
+};
+
+// 枚举本机接口地址（Windows 测试构建下为空：正式部署在 Linux）
+inline void collect_local_addresses(TargetAcl& acl)
+{
+#if !defined(_WIN32)
+    struct ifaddrs* ifs = nullptr;
+    if (getifaddrs(&ifs) != 0 || ifs == nullptr)
+        return;
+    for (struct ifaddrs* it = ifs; it != nullptr; it = it->ifa_next) {
+        if (it->ifa_addr == nullptr)
+            continue;
+        if (it->ifa_addr->sa_family == AF_INET) {
+            const auto* a4 = reinterpret_cast<const sockaddr_in*>(it->ifa_addr);
+            acl.local_v4_net.push_back(a4->sin_addr.s_addr);
+        } else if (it->ifa_addr->sa_family == AF_INET6) {
+            const auto* a6 = reinterpret_cast<const sockaddr_in6*>(it->ifa_addr);
+            std::array<uint8_t, 16> v{};
+            memcpy(v.data(), a6->sin6_addr.s6_addr, 16);
+            acl.local_v6.push_back(v);
+        }
+    }
+    freeifaddrs(ifs);
+#endif
+}
+
 // 目标连接结果
 struct ConnectResult
 {
@@ -236,7 +559,7 @@ struct ConnectResult
 // 带 ACL 的连接：字面量地址直接判定；域名逐候选过滤（只连允许的地址）。
 // allow_internal=true 时不做限制（--proxy-allow-private）
 inline ConnectResult connect_target_checked(const std::string& host, uint16_t port,
-                                           bool allow_internal)
+                                           const TargetAcl& acl)
 {
     ConnectResult r;
     sockaddr_in t4{};
@@ -255,7 +578,7 @@ inline ConnectResult connect_target_checked(const std::string& host, uint16_t po
             return r;
         }
         for (addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
-            if (!allow_internal && addr_is_internal(ai->ai_addr)) {
+            if (acl.blocked(ai->ai_addr)) {
                 r.blocked = true;
                 continue;
             }
@@ -288,7 +611,7 @@ inline ConnectResult connect_target_checked(const std::string& host, uint16_t po
         return r;
     }
     for (addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
-        if (!allow_internal && addr_is_internal(ai->ai_addr)) {
+        if (acl.blocked(ai->ai_addr)) {
             r.blocked = true;   // 域名解析到内网：跳过该候选
             continue;
         }
@@ -377,14 +700,22 @@ inline int stream_wait_readable(const Stream& s, int timeout_ms)
 // 双向中继：poll 驱动 + 半关闭 + 空闲回收；两侧读尽或出错/停止即返回
 // ---------------------------------------------------------------------------
 inline void relay_two_way(Stream& a, Stream& b,
-                          int idle_timeout_ms, const std::atomic<bool>& running)
+                          int idle_timeout_ms, const std::atomic<bool>& running,
+                          uint64_t max_lifetime_ms = 12ull * 3600 * 1000)
 {
     uint8_t buf[16 * 1024];
     Stream* sides[2] = { &a, &b };
     bool closed[2] = { false, false };
     auto last_active = std::chrono::steady_clock::now();
+    const auto relay_start = last_active;
 
     while (running.load() && !(closed[0] && closed[1])) {
+        // 绝对寿命上限：即使一直有少量流量（涓流）也不允许长期占用连接槽
+        if (max_lifetime_ms != 0 &&
+            std::chrono::steady_clock::now() - relay_start >
+                std::chrono::milliseconds(max_lifetime_ms)) {
+            break;
+        }
         // TLS 侧可能已有解密好但未读的数据（SSL_pending）：此时不必等 socket 可读
         bool pending[2] = { false, false };
         for (int i = 0; i < 2; ++i) {

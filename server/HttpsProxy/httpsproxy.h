@@ -11,6 +11,13 @@
 
 struct ssl_ctx_st;   // OpenSSL SSL_CTX 前置声明（头文件不引入 OpenSSL 类型）
 
+namespace proxy_common {
+class AuthThrottle;   // 认证失败限速器
+class ConnLimiter;    // 每来源连接限制（并发 + 新建速率）
+class LogLimiter;     // 日志限速
+struct TargetAcl;     // 目标 ACL（含本机地址）
+}
+
 // ============================================================================
 // HTTP CONNECT 代理（浏览器插件专用出口；可选 TLS 承载）
 //
@@ -49,9 +56,15 @@ public:
         // 目标（防止浏览器侧借代理访问服务端与其他客户端内网）；
         // true = 内网自用场景放行（--proxy-allow-private）
         bool allow_private = false;
+        // 显式允许"无认证"监听非回环地址（默认拒绝，防误开开放代理）；
+        // 仅内网/前置 TLS 终结（stunnel）场景才应开启（--proxy-allow-noauth）
+        bool allow_noauth = false;
+        // 每来源连接限制（并发/速率）：防单来源占满连接槽或高频新建放大 CPU
+        size_t max_per_source = 16;
+        size_t conn_rate_per_sec = 2;
     };
 
-    HttpConnectProxy() = default;
+    HttpConnectProxy();
     ~HttpConnectProxy();
 
     HttpConnectProxy(const HttpConnectProxy&) = delete;
@@ -70,7 +83,7 @@ private:
     };
 
     void accept_work();
-    void handle_conn(int fd, const std::string& peer);
+    void handle_conn(int fd, const std::string& peer_ip, const std::string& peer);
     void join_finished();
 
     Config m_cfg;
@@ -79,6 +92,10 @@ private:
     std::string m_expected_auth;      // "Basic base64(user:pass)"（启动时算好）
     std::atomic<bool> m_running{ false };
     std::atomic<size_t> m_conns{ 0 };
+    std::unique_ptr<proxy_common::AuthThrottle> m_auth_throttle;   // 认证失败限速
+    std::unique_ptr<proxy_common::ConnLimiter> m_conn_limiter;     // 每来源连接限制
+    std::unique_ptr<proxy_common::LogLimiter> m_log_limiter;       // 日志限速
+    std::unique_ptr<proxy_common::TargetAcl> m_acl;                // 目标 ACL（含本机地址）
     std::thread m_accept_thread;
     std::mutex m_workers_mutex;
     std::vector<Worker> m_workers;

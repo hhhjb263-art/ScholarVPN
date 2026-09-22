@@ -26,6 +26,7 @@
 #     HTTPS_CERT=/path/fullchain.pem  HTTPS_KEY=/path/privkey.pem  （TLS 必需）
 #     PROXY_USER / PROXY_PASS 三个入口共用的 Basic 认证（公网强烈建议；密码勿含空格）
 #     PROXY_ALLOW_PRIVATE=1   允许代理连接服务端内网/回环目标（默认 0 禁止）
+#     PROXY_PASS_FILE=/path   代理密码文件（0600，推荐；比 PROXY_PASS 更安全）
 #     （SOCKS5_USER / SOCKS5_PASS 为历史别名，仍可用）
 # ============================================================
 set -e
@@ -52,6 +53,11 @@ HTTPS_CERT="${HTTPS_CERT:-}"
 HTTPS_KEY="${HTTPS_KEY:-}"
 PROXY_USER="${PROXY_USER:-${SOCKS5_USER:-}}"   # 历史别名兼容
 PROXY_PASS="${PROXY_PASS:-${SOCKS5_PASS:-}}"
+# 密码文件（推荐）：把密码写入 0600 文件，只传路径 → 密码不进 ps / 环境文件
+PROXY_PASS_FILE="${PROXY_PASS_FILE:-}"
+# 每来源连接限制（可选覆盖）：并发上限 / 每秒新建
+PROXY_MAX_PER_SOURCE="${PROXY_MAX_PER_SOURCE:-0}"   # 0 = 用服务端默认(16)
+PROXY_CONN_RATE="${PROXY_CONN_RATE:-0}"             # 0 = 用服务端默认(2/s)
 # 1 = 允许代理连接服务端内网/回环目标（默认 0 禁止；仅内网自用场景开启）
 PROXY_ALLOW_PRIVATE="${PROXY_ALLOW_PRIVATE:-0}"
 ENABLE_IPV6="${ENABLE_IPV6:-0}"        # 1=同时开启 IPv6 转发
@@ -173,12 +179,28 @@ do_stop() {
 }
 
 do_logs() {
-    if [ ! -f "$LOG_FILE" ]; then
-        echo "[*] 尚无日志文件：$LOG_FILE"
+    # 三种运行方式的日志落点不同，按存在情况自动选择：
+    #   daemon（-d）    → logs/vpn-server-YYYYMMDD.log（watchdog 追加）
+    #   systemd（install）→ logs/systemd.log（服务模板 StandardOutput=append）
+    #   前台（start）    → 只在终端，无文件
+    local systemd_log="$LOGS_DIR/systemd.log"
+    if [ -f "$LOG_FILE" ]; then
+        echo "[*] 实时查看重点日志（Ctrl+C 退出）：$LOG_FILE"
+        tail -f "$LOG_FILE"
+    elif [ -f "$systemd_log" ]; then
+        echo "[*] 实时查看 systemd 模式日志（Ctrl+C 退出）：$systemd_log"
+        echo "    也可用：journalctl -u vpn-server -f"
+        tail -f "$systemd_log"
+    elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet vpn-server 2>/dev/null; then
+        echo "[*] 服务运行中，实时查看 journald 日志（Ctrl+C 退出）："
+        journalctl -u vpn-server -f
+    else
+        echo "[*] 尚无日志文件。日志落点取决于启动方式："
+        echo "    - 前台 ./start.sh        → 日志只打在终端（不写文件）"
+        echo "    - 后台 ./start.sh -d     → $LOG_FILE"
+        echo "    - 服务 ./start.sh install → $systemd_log，或 journalctl -u vpn-server -f"
         exit 1
     fi
-    echo "[*] 实时查看重点日志（Ctrl+C 退出）：$LOG_FILE"
-    tail -f "$LOG_FILE"
 }
 
 # 诊断环境：systemd / 服务文件 / 进程 / 日志，用于排查“关闭终端后断开”等问题
@@ -231,7 +253,7 @@ do_doctor() {
     fi
     if [ -f /etc/default/vpn-server ]; then
         echo "    环境文件: /etc/default/vpn-server (存在；编辑后 systemctl restart vpn-server 生效)"
-        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|TRANSPORT|MAX_CLIENTS|SOCKS5_PORT|HTTP_PROXY_PORT|HTTPS_PROXY_PORT|HTTPS_CERT|HTTPS_KEY|PROXY_USER|PROXY_ALLOW_PRIVATE|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
+        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|TRANSPORT|MAX_CLIENTS|SOCKS5_PORT|HTTP_PROXY_PORT|HTTPS_PROXY_PORT|HTTPS_CERT|HTTPS_KEY|PROXY_USER|PROXY_PASS_FILE|PROXY_MAX_PER_SOURCE|PROXY_CONN_RATE|PROXY_ALLOW_PRIVATE|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
     else
         echo "    环境文件: 无 (/etc/default/vpn-server 缺失，使用 start.sh 默认参数)"
     fi
@@ -259,9 +281,10 @@ do_doctor() {
     # 5) 日志
     echo "[5] 日志文件"
     if [ -d "$LOGS_DIR" ]; then
-        ls -lt "$LOGS_DIR" 2>/dev/null | head -4 | sed 's/^/    /'
+        ls -lt "$LOGS_DIR" 2>/dev/null | head -5 | sed 's/^/    /'
+        [ -f "$LOGS_DIR/systemd.log" ] && echo "    （systemd 模式日志在 $LOGS_DIR/systemd.log）"
     else
-        echo "    无日志目录 $LOGS_DIR"
+        echo "    无日志目录 $LOGS_DIR（前台运行时日志只打在终端，不落文件）"
     fi
     echo "========== 诊断完成 =========="
     echo "建议: 服务器有 systemd 就用: sudo ./start.sh install（关闭终端不断开）"
@@ -310,6 +333,9 @@ do_install() {
         echo "HTTPS_KEY=\"$HTTPS_KEY\""
         echo "PROXY_USER=\"$PROXY_USER\""
         echo "PROXY_PASS=\"$PROXY_PASS\""
+        echo "PROXY_PASS_FILE=\"$PROXY_PASS_FILE\""
+        echo "PROXY_MAX_PER_SOURCE=\"$PROXY_MAX_PER_SOURCE\""
+        echo "PROXY_CONN_RATE=\"$PROXY_CONN_RATE\""
         echo "PROXY_ALLOW_PRIVATE=\"$PROXY_ALLOW_PRIVATE\""
         echo "ENABLE_IPV6=\"$ENABLE_IPV6\""
         echo "QUIET=\"$QUIET\""
@@ -317,6 +343,11 @@ do_install() {
         echo "LOGS_DIR=\"$LOGS_DIR\""
         echo "RUN_DIR=\"$RUN_DIR\""
     } > "$ENV_FILE"
+    # 环境文件可能含代理密码：含密码时收紧为 0600（默认 0644 会让本机其他用户读到）
+    if [ -n "$PROXY_PASS" ]; then
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
+        echo "[*] 环境文件含代理密码，已设为 0600（建议改用 PROXY_PASS_FILE 更安全）"
+    fi
     echo "[*] 已生成环境文件: $ENV_FILE（可编辑后 systemctl restart vpn-server 生效）"
     systemctl daemon-reload
     systemctl enable vpn-server >/dev/null 2>&1 || true
@@ -527,8 +558,14 @@ if [ -n "$HTTPS_PROXY_PORT" ] && [ "$HTTPS_PROXY_PORT" != "0" ]; then
     [ -n "$HTTPS_CERT" ] && ARGS+=(--https-proxy-cert "$HTTPS_CERT")
     [ -n "$HTTPS_KEY" ] && ARGS+=(--https-proxy-key "$HTTPS_KEY")
 fi
+[ "$PROXY_MAX_PER_SOURCE" != "0" ] && ARGS+=(--proxy-max-per-source "$PROXY_MAX_PER_SOURCE")
+[ "$PROXY_CONN_RATE" != "0" ] && ARGS+=(--proxy-conn-rate "$PROXY_CONN_RATE")
 [ -n "$PROXY_USER" ] && ARGS+=(--proxy-user "$PROXY_USER")
-[ -n "$PROXY_PASS" ] && ARGS+=(--proxy-pass "$PROXY_PASS")
+if [ -n "$PROXY_PASS_FILE" ]; then
+    ARGS+=(--proxy-pass-file "$PROXY_PASS_FILE")
+else
+    [ -n "$PROXY_PASS" ] && ARGS+=(--proxy-pass "$PROXY_PASS")
+fi
 [ "$PROXY_ALLOW_PRIVATE" = "1" ] && ARGS+=(--proxy-allow-private)
 if [ "$QUIET" = "1" ]; then
     ARGS+=(--quiet)
@@ -572,8 +609,14 @@ if [ "$DAEMON" = "1" ]; then
         [ -n "$HTTPS_CERT" ] && ARGS_STR="$ARGS_STR --https-proxy-cert $HTTPS_CERT"
         [ -n "$HTTPS_KEY" ] && ARGS_STR="$ARGS_STR --https-proxy-key $HTTPS_KEY"
     fi
+    [ "$PROXY_MAX_PER_SOURCE" != "0" ] && ARGS_STR="$ARGS_STR --proxy-max-per-source $PROXY_MAX_PER_SOURCE"
+    [ "$PROXY_CONN_RATE" != "0" ] && ARGS_STR="$ARGS_STR --proxy-conn-rate $PROXY_CONN_RATE"
     [ -n "$PROXY_USER" ] && ARGS_STR="$ARGS_STR --proxy-user $PROXY_USER"
-    [ -n "$PROXY_PASS" ] && ARGS_STR="$ARGS_STR --proxy-pass $PROXY_PASS"
+    if [ -n "$PROXY_PASS_FILE" ]; then
+        ARGS_STR="$ARGS_STR --proxy-pass-file $PROXY_PASS_FILE"
+    else
+        [ -n "$PROXY_PASS" ] && ARGS_STR="$ARGS_STR --proxy-pass $PROXY_PASS"
+    fi
     [ "$PROXY_ALLOW_PRIVATE" = "1" ] && ARGS_STR="$ARGS_STR --proxy-allow-private"
     [ "$QUIET" = "1" ] && ARGS_STR="$ARGS_STR --quiet"
     # 生成 watchdog 守护脚本：vpn_server 异常退出时自动重启

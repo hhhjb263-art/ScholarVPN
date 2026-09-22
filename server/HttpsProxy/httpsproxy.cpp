@@ -21,10 +21,12 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 namespace {
 
 using proxy_common::constant_time_eq;
+using proxy_common::sanitize_for_log;
 using proxy_common::set_io_timeout;
 using proxy_common::Stream;
 using proxy_common::stream_read_headers;
@@ -163,6 +165,11 @@ bool header_filtered_out(const std::string& line)
     const size_t colon = line.find(':');
     if (colon == std::string::npos)
         return true;                  // 异常行不转发
+    // 含控制字符（除制表符）的头部一律不转发：防请求走私/畸形转发
+    for (unsigned char c : line) {
+        if ((c < 0x20 && c != '\t') || c == 0x7F)
+            return true;
+    }
     const std::string name = to_lower(trim(line.substr(0, colon)));
     // 代理专属头不转发给目标服务器
     return name == "proxy-authorization" || name == "proxy-connection";
@@ -241,6 +248,19 @@ bool parse_authority(const std::string& authority, std::string& host, uint16_t& 
     return !host.empty();
 }
 
+// 目标主机名合法性：长度上限（DNS 253）且不含控制字符/空白
+// （主机名来自对端请求，直接用于 getaddrinfo 与日志都必须先校验）
+bool host_is_valid(const std::string& h)
+{
+    if (h.empty() || h.size() > 253)
+        return false;
+    for (unsigned char c : h) {
+        if (c <= 0x20 || c == 0x7F)
+            return false;
+    }
+    return true;
+}
+
 void send_error(Stream& s, const char* status, const char* extra_header = nullptr)
 {
     std::string resp = std::string("HTTP/1.1 ") + status + "\r\n";
@@ -251,6 +271,12 @@ void send_error(Stream& s, const char* status, const char* extra_header = nullpt
 }
 
 } // namespace
+
+HttpConnectProxy::HttpConnectProxy()
+    : m_auth_throttle(new proxy_common::AuthThrottle()),
+      m_log_limiter(new proxy_common::LogLimiter())
+{
+}
 
 HttpConnectProxy::~HttpConnectProxy()
 {
@@ -282,26 +308,95 @@ bool HttpConnectProxy::start(const Config& cfg)
             return false;
         }
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-        SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+        // TLS 加固：
+        //   - 禁压缩（CRIME）、禁重协商（防 DoS/降级类攻击）、禁重协商会话恢复
+        //   - 安全级别 2（≥112-bit，排除 1024-bit RSA/弱曲线等）
+        //   - 显式限定 AEAD 套件（TLS1.3 用 set_ciphersuites，TLS1.2 用 set_cipher_list）
+        SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION |
+                                     SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+        SSL_CTX_set_security_level(ctx, 2);
+        SSL_CTX_set_cipher_list(ctx,
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256");
+        SSL_CTX_set_ciphersuites(ctx,
+            "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
         if (SSL_CTX_use_certificate_chain_file(ctx, m_cfg.cert_path.c_str()) != 1) {
-            fprintf(stderr, "[HTTPS] 加载证书失败 %s\n", m_cfg.cert_path.c_str());
+            fprintf(stderr, "[HTTPS] 加载证书失败 %s: ", m_cfg.cert_path.c_str());
+            log_ssl_errors("");
             SSL_CTX_free(ctx);
             return false;
         }
         if (SSL_CTX_use_PrivateKey_file(ctx, m_cfg.key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
-            fprintf(stderr, "[HTTPS] 加载私钥失败 %s\n", m_cfg.key_path.c_str());
+            fprintf(stderr, "[HTTPS] 加载私钥失败 %s: ", m_cfg.key_path.c_str());
+            log_ssl_errors("");
+            fprintf(stderr, "[HTTPS] 提示：私钥若带口令保护，请先解密："
+                            "openssl pkey -in key.pem -out key.plain.pem（然后 chmod 600）\n");
             SSL_CTX_free(ctx);
             return false;
         }
         if (SSL_CTX_check_private_key(ctx) != 1) {
-            fprintf(stderr, "[HTTPS] 证书与私钥不匹配\n");
+            fprintf(stderr, "[HTTPS] 证书与私钥不匹配: ");
+            log_ssl_errors("");
             SSL_CTX_free(ctx);
             return false;
+        }
+        // 证书有效期检查：已过期直接拒绝启动；剩余 <30 天给出续期告警
+        // （自签证书到期会让所有客户端握手失败，必须提前发现）
+        if (X509* cert = SSL_CTX_get0_certificate(ctx)) {
+            const ASN1_TIME* not_before = X509_get0_notBefore(cert);
+            const ASN1_TIME* not_after = X509_get0_notAfter(cert);
+            if (not_after != nullptr && X509_cmp_current_time(not_after) < 0) {
+                fprintf(stderr, "[HTTPS] 证书已过期（%s），拒绝启动。请重新签发并分发新证书\n",
+                        m_cfg.cert_path.c_str());
+                SSL_CTX_free(ctx);
+                return false;
+            }
+            if (not_before != nullptr && X509_cmp_current_time(not_before) > 0) {
+                fprintf(stderr, "[HTTPS] 警告：证书尚未生效（NotBefore 在未来），客户端会握手失败\n");
+            }
+            int days = 0;
+            int secs = 0;
+            if (not_after != nullptr && ASN1_TIME_diff(&days, &secs, nullptr, not_after) == 1 &&
+                days < 30) {
+                fprintf(stderr, "[HTTPS] 警告：证书将在 %d 天后过期，请尽快续期并重新分发\n", days);
+            }
         }
         m_ssl_ctx = ctx;
     }
     if (!m_cfg.user.empty()) {
         m_expected_auth = "Basic " + base64_encode(m_cfg.user + ":" + m_cfg.pass);
+    }
+
+    // ---- 认证安全校验（防开放代理）----
+    if (!m_cfg.user.empty() && m_cfg.pass.empty()) {
+        fprintf(stderr, "[HTTPS] 拒绝启动：设置了 --proxy-user 但密码为空"
+                        "（空密码等于无认证，请设置 --proxy-pass 或用 --proxy-pass-file）\n");
+        if (m_ssl_ctx != nullptr) {
+            SSL_CTX_free(static_cast<SSL_CTX*>(m_ssl_ctx));
+            m_ssl_ctx = nullptr;
+        }
+        return false;
+    }
+    const bool loopback = (m_cfg.bind_ip == "127.0.0.1" || m_cfg.bind_ip == "::1" ||
+                           m_cfg.bind_ip == "localhost");
+    if (m_cfg.user.empty() && !loopback && !m_cfg.allow_noauth) {
+        fprintf(stderr, "[HTTPS] 拒绝启动：监听 %s 但未配置认证。\n"
+                        "        请加 --proxy-user/--proxy-pass；确需无认证（仅内网/前置 TLS）"
+                        "再加 --proxy-allow-noauth\n", m_cfg.bind_ip.c_str());
+        if (m_ssl_ctx != nullptr) {
+            SSL_CTX_free(static_cast<SSL_CTX*>(m_ssl_ctx));
+            m_ssl_ctx = nullptr;
+        }
+        return false;
+    }
+    if (m_cfg.user.empty() && !loopback) {
+        fprintf(stderr, "[HTTPS] 警告：无认证代理监听 %s（已由 --proxy-allow-noauth 显式放行）\n",
+                m_cfg.bind_ip.c_str());
+    }
+    if (!m_cfg.user.empty() && m_cfg.pass.size() < 8) {
+        fprintf(stderr, "[HTTPS] 警告：代理密码长度仅 %zu，公网暴露建议 ≥8 位随机密码\n",
+                m_cfg.pass.size());
     }
 
     m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -334,6 +429,19 @@ bool HttpConnectProxy::start(const Config& cfg)
         ::close(m_listen_fd);
         m_listen_fd = -1;
         return false;
+    }
+
+    // 目标 ACL：内网/回环 + 本机接口地址（防经公网 IP 回连本机服务）
+    m_acl.reset(new proxy_common::TargetAcl());
+    m_acl->allow_internal = m_cfg.allow_private;
+    proxy_common::collect_local_addresses(*m_acl);
+    // 每来源连接限制
+    {
+        proxy_common::ConnLimits lim;
+        lim.max_concurrent = m_cfg.max_per_source;
+        lim.rate_per_sec = m_cfg.conn_rate_per_sec;
+        lim.rate_burst = m_cfg.conn_rate_per_sec * 30;
+        m_conn_limiter.reset(new proxy_common::ConnLimiter(lim));
     }
 
     m_running.store(true);
@@ -448,15 +556,28 @@ void HttpConnectProxy::accept_work()
 
         char ipbuf[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf));
+        const std::string peer_ip = ipbuf;
         const std::string peer_str =
-            std::string(ipbuf) + ":" + std::to_string(ntohs(peer.sin_port));
+            peer_ip + ":" + std::to_string(ntohs(peer.sin_port));
+
+        // 每来源连接限制：并发超限或新建过快直接拒绝
+        if (!m_conn_limiter->try_acquire(peer_ip, proxy_common::now_ms())) {
+            size_t suppressed = 0;
+            if (m_log_limiter->allow(proxy_common::now_ms(), &suppressed)) {
+                fprintf(stderr, "[HTTPS] %s 连接数/速率超限，拒绝（已抑制 %zu 条同类日志）\n",
+                        sanitize_for_log(peer_ip).c_str(), suppressed);
+            }
+            ::close(fd);
+            continue;
+        }
 
         m_conns.fetch_add(1);
         auto done = std::make_shared<std::atomic<bool>>(false);
         try {
             std::lock_guard<std::mutex> lock(m_workers_mutex);
-            m_workers.push_back(Worker{ std::thread([this, fd, peer_str, done] {
-                handle_conn(fd, peer_str);
+            m_workers.push_back(Worker{ std::thread([this, fd, peer_ip, peer_str, done] {
+                handle_conn(fd, peer_ip, peer_str);
+                m_conn_limiter->release(peer_ip);
                 done->store(true);
             }), done });
         } catch (const std::system_error& e) {
@@ -468,20 +589,20 @@ void HttpConnectProxy::accept_work()
     join_finished();
 }
 
-void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
+void HttpConnectProxy::handle_conn(int fd, const std::string& peer_ip, const std::string& peer)
 {
     SSL* ssl = nullptr;
     if (m_ssl_ctx != nullptr) {
         ssl = SSL_new(static_cast<SSL_CTX*>(m_ssl_ctx));
         if (ssl == nullptr) {
-            fprintf(stderr, "[HTTPS] %s SSL_new 失败\n", peer.c_str());
+            fprintf(stderr, "[HTTPS] %s SSL_new 失败\n", sanitize_for_log(peer).c_str());
             ::close(fd);
             m_conns.fetch_sub(1);
             return;
         }
         SSL_set_accept_state(ssl);   // 明确服务端角色（避免"connection type not set"）
         if (SSL_set_fd(ssl, fd) != 1) {
-            fprintf(stderr, "[HTTPS] %s SSL_set_fd 失败\n", peer.c_str());
+            fprintf(stderr, "[HTTPS] %s SSL_set_fd 失败\n", sanitize_for_log(peer).c_str());
             log_ssl_errors("");
             SSL_free(ssl);
             ::close(fd);
@@ -489,7 +610,7 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
             return;
         }
         if (!proxy_common::ssl_handshake_timed(ssl, fd, kHandshakeTimeoutMs)) {
-            fprintf(stderr, "[HTTPS] %s TLS 握手失败: ", peer.c_str());
+            fprintf(stderr, "[HTTPS] %s TLS 握手失败: ", sanitize_for_log(peer).c_str());
             log_ssl_errors("");
             fflush(stderr);
             SSL_free(ssl);
@@ -503,7 +624,7 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
     // ---- 读请求头 ----
     std::string raw;
     if (!stream_read_headers(browser, raw, kMaxHeaderBytes, kHandshakeTimeoutMs)) {
-        fprintf(stderr, "[HTTPS] %s 读取请求头失败\n", peer.c_str());
+        fprintf(stderr, "[HTTPS] %s 读取请求头失败\n", sanitize_for_log(peer).c_str());
         if (ssl != nullptr) {
             SSL_shutdown(ssl);
             SSL_free(ssl);
@@ -526,12 +647,12 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
 
     // ---- 认证（可选 Basic）----
     if (!m_expected_auth.empty()) {
-        const bool ok = req.has_proxy_authorization &&
-                        constant_time_eq(req.proxy_authorization, m_expected_auth);
-        if (!ok) {
+        // 防暴力破解：失败过多的来源在锁定期内直接回 407（与密码错误表现一致）
+        if (!m_auth_throttle->allow(peer_ip, proxy_common::now_ms())) {
             send_error(browser, "407 Proxy Authentication Required",
                        "Proxy-Authenticate: Basic realm=\"ScholarVPN\"");
-            fprintf(stderr, "[HTTPS] %s 认证失败\n", peer.c_str());
+            fprintf(stderr, "[HTTPS] %s 认证失败次数过多，暂时拒绝\n",
+                    sanitize_for_log(peer_ip).c_str());
             if (ssl != nullptr) {
                 SSL_shutdown(ssl);
                 SSL_free(ssl);
@@ -540,6 +661,28 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
             m_conns.fetch_sub(1);
             return;
         }
+        const bool ok = req.has_proxy_authorization &&
+                        constant_time_eq(req.proxy_authorization, m_expected_auth);
+        if (!ok) {
+            send_error(browser, "407 Proxy Authentication Required",
+                       "Proxy-Authenticate: Basic realm=\"ScholarVPN\"");
+            const uint64_t lock_ms = m_auth_throttle->on_failure(peer_ip, proxy_common::now_ms());
+            if (lock_ms > 0) {
+                fprintf(stderr, "[HTTPS] %s 认证失败，已锁定 %llu 秒（防暴力破解）\n",
+                        sanitize_for_log(peer_ip).c_str(),
+                        static_cast<unsigned long long>(lock_ms / 1000));
+            } else {
+                fprintf(stderr, "[HTTPS] %s 认证失败\n", sanitize_for_log(peer).c_str());
+            }
+            if (ssl != nullptr) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+            }
+            ::close(fd);
+            m_conns.fetch_sub(1);
+            return;
+        }
+        m_auth_throttle->on_success(peer_ip);
     }
 
     // ---- 连接目标 ----
@@ -548,7 +691,7 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
     const bool is_connect = (req.method == "CONNECT");
     std::string forward_head;         // 非 CONNECT：改写为 origin-form 的请求头
     if (is_connect) {
-        if (!parse_authority(req.target, host, port)) {
+        if (!parse_authority(req.target, host, port) || !host_is_valid(host)) {
             send_error(browser, "400 Bad Request");
             if (ssl != nullptr) {
                 SSL_shutdown(ssl);
@@ -560,8 +703,37 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
         }
     } else {
         std::string origin_form;
-        if (!parse_absolute_uri(req.target, host, port, origin_form)) {
+        if (!parse_absolute_uri(req.target, host, port, origin_form) ||
+            !host_is_valid(host)) {
             send_error(browser, "501 Not Implemented");   // 仅支持 http:// 绝对形式
+            if (ssl != nullptr) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+            }
+            ::close(fd);
+            m_conns.fetch_sub(1);
+            return;
+        }
+        // 请求走私加固（RFC 7230 §3.3.3）：Transfer-Encoding 与 Content-Length
+        // 共存、或 TE 非 chunked 一律拒绝——转发这类歧义请求会把走私风险带给目标站点
+        bool has_te = false;
+        bool has_cl = false;
+        bool te_bad = false;
+        for (const auto& line : req.header_lines) {
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos)
+                continue;
+            const std::string name = to_lower(trim(line.substr(0, colon)));
+            if (name == "transfer-encoding") {
+                has_te = true;
+                if (to_lower(trim(line.substr(colon + 1))).find("chunked") == std::string::npos)
+                    te_bad = true;
+            } else if (name == "content-length") {
+                has_cl = true;
+            }
+        }
+        if (te_bad || (has_te && has_cl)) {
+            send_error(browser, "400 Bad Request");
             if (ssl != nullptr) {
                 SSL_shutdown(ssl);
                 SSL_free(ssl);
@@ -581,17 +753,22 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
     // ACL：默认拒绝服务端内网/回环目标（防浏览器侧借代理访问服务端与其他
     // 客户端内网/TUN 网段）；--proxy-allow-private 可放行
     const proxy_common::ConnectResult cr =
-        proxy_common::connect_target_checked(host, port, m_cfg.allow_private);
+        proxy_common::connect_target_checked(host, port, *m_acl);
     const int out_fd = cr.fd;
     if (out_fd < 0) {
         if (cr.blocked) {
             send_error(browser, "403 Forbidden");
-            fprintf(stderr, "[HTTPS] %s → %s:%u 被目标 ACL 拒绝（服务端内网/回环；"
-                            "内网自用可加 --proxy-allow-private）\n",
-                    peer.c_str(), host.c_str(), port);
+            // ACL 拒绝日志可被高频触发 → 限速（附抑制计数），避免刷屏打满磁盘
+            size_t suppressed = 0;
+            if (m_log_limiter->allow(proxy_common::now_ms(), &suppressed)) {
+                fprintf(stderr, "[HTTPS] %s → %s:%u 被目标 ACL 拒绝（服务端内网/回环/本机；"
+                                "内网自用可加 --proxy-allow-private）（已抑制 %zu 条同类日志）\n",
+                        sanitize_for_log(peer).c_str(), sanitize_for_log(host).c_str(), port,
+                        suppressed);
+            }
         } else {
             send_error(browser, "502 Bad Gateway");
-            fprintf(stderr, "[HTTPS] %s → %s:%u 连接失败: %s\n", peer.c_str(), host.c_str(),
+            fprintf(stderr, "[HTTPS] %s → %s:%u 连接失败: %s\n", sanitize_for_log(peer).c_str(), host.c_str(),
                     port, strerror(cr.last_errno));
         }
         if (ssl != nullptr) {
@@ -632,7 +809,7 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
             return;
         }
     }
-    fprintf(stderr, "[HTTPS] %s → %s:%u 已建立（%s）\n", peer.c_str(), host.c_str(), port,
+    fprintf(stderr, "[HTTPS] %s → %s:%u 已建立（%s）\n", sanitize_for_log(peer).c_str(), sanitize_for_log(host).c_str(), port,
             m_cfg.use_tls ? "TLS 加密" : "明文");
 
     // ---- 双向中继 ----
@@ -641,7 +818,7 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer)
     const auto relay_secs = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - relay_begin).count();
     if (relay_secs >= kIdleTimeoutMs / 1000) {
-        fprintf(stderr, "[HTTPS] %s 空闲超时，回收\n", peer.c_str());
+        fprintf(stderr, "[HTTPS] %s 空闲超时，回收\n", sanitize_for_log(peer).c_str());
     }
 
     ::close(out_fd);

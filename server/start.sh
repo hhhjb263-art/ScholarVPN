@@ -19,6 +19,14 @@
 # 环境变量可覆盖：TUN_IP=10.8.0.1 VPN_PORT=51820 TRANSPORT=both QUIET=0 ... 等
 #   TRANSPORT=both|udp|tcp  传输方式（默认 both：UDP 与 TCP 同端口同时监听）
 #   QUIET=1 关闭数据包级次要日志，只保留重点日志（公网服务器推荐）
+#   SOCKS5_PORT=1080 浏览器插件代理入口（默认全关）：
+#     SOCKS5_PORT=1080        标准 SOCKS5（链路明文，最快）
+#     HTTP_PROXY_PORT=8080    HTTP CONNECT（明文；仅内网或前置 stunnel/SSH）
+#     HTTPS_PROXY_PORT=8443   HTTPS CONNECT（TLS 加密，公网推荐）
+#     HTTPS_CERT=/path/fullchain.pem  HTTPS_KEY=/path/privkey.pem  （TLS 必需）
+#     PROXY_USER / PROXY_PASS 三个入口共用的 Basic 认证（公网强烈建议；密码勿含空格）
+#     PROXY_ALLOW_PRIVATE=1   允许代理连接服务端内网/回环目标（默认 0 禁止）
+#     （SOCKS5_USER / SOCKS5_PASS 为历史别名，仍可用）
 # ============================================================
 set -e
 
@@ -35,6 +43,17 @@ LISTEN_IP="${LISTEN_IP:-0.0.0.0}"
 TRANSPORT="${TRANSPORT:-both}"           # 传输方式：both|udp|tcp（默认 both = UDP+TCP 同端口）
 KEY_PATH="${KEY_PATH:-$SCRIPT_DIR/keys/server_sig.key}"
 MAX_CLIENTS="${MAX_CLIENTS:-0}"     # 最大并发客户端数，0=服务端默认(64)；多用户自动分配虚拟 IP
+# 浏览器插件代理入口（默认全关）：仅浏览器流量，配合 MV3 扩展使用。
+# 公网暴露必须设置认证；要加密请开 HTTPS_PROXY_PORT（TLS）
+SOCKS5_PORT="${SOCKS5_PORT:-0}"           # 0 = 不启用
+HTTP_PROXY_PORT="${HTTP_PROXY_PORT:-0}"
+HTTPS_PROXY_PORT="${HTTPS_PROXY_PORT:-0}"
+HTTPS_CERT="${HTTPS_CERT:-}"
+HTTPS_KEY="${HTTPS_KEY:-}"
+PROXY_USER="${PROXY_USER:-${SOCKS5_USER:-}}"   # 历史别名兼容
+PROXY_PASS="${PROXY_PASS:-${SOCKS5_PASS:-}}"
+# 1 = 允许代理连接服务端内网/回环目标（默认 0 禁止；仅内网自用场景开启）
+PROXY_ALLOW_PRIVATE="${PROXY_ALLOW_PRIVATE:-0}"
 ENABLE_IPV6="${ENABLE_IPV6:-0}"        # 1=同时开启 IPv6 转发
 # ---- 运行 / 日志 ----
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"        # 重点日志保存目录（按天轮转）
@@ -212,7 +231,7 @@ do_doctor() {
     fi
     if [ -f /etc/default/vpn-server ]; then
         echo "    环境文件: /etc/default/vpn-server (存在；编辑后 systemctl restart vpn-server 生效)"
-        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|TRANSPORT|MAX_CLIENTS|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
+        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|TRANSPORT|MAX_CLIENTS|SOCKS5_PORT|HTTP_PROXY_PORT|HTTPS_PROXY_PORT|HTTPS_CERT|HTTPS_KEY|PROXY_USER|PROXY_ALLOW_PRIVATE|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
     else
         echo "    环境文件: 无 (/etc/default/vpn-server 缺失，使用 start.sh 默认参数)"
     fi
@@ -284,6 +303,14 @@ do_install() {
         echo "TRANSPORT=\"$TRANSPORT\""
         echo "KEY_PATH=\"$KEY_PATH\""
         echo "MAX_CLIENTS=\"$MAX_CLIENTS\""
+        echo "SOCKS5_PORT=\"$SOCKS5_PORT\""
+        echo "HTTP_PROXY_PORT=\"$HTTP_PROXY_PORT\""
+        echo "HTTPS_PROXY_PORT=\"$HTTPS_PROXY_PORT\""
+        echo "HTTPS_CERT=\"$HTTPS_CERT\""
+        echo "HTTPS_KEY=\"$HTTPS_KEY\""
+        echo "PROXY_USER=\"$PROXY_USER\""
+        echo "PROXY_PASS=\"$PROXY_PASS\""
+        echo "PROXY_ALLOW_PRIVATE=\"$PROXY_ALLOW_PRIVATE\""
         echo "ENABLE_IPV6=\"$ENABLE_IPV6\""
         echo "QUIET=\"$QUIET\""
         echo "MAX_RESTARTS=\"$MAX_RESTARTS\""
@@ -412,6 +439,13 @@ setup_firewall() {
             iptables -A INPUT -p udp --dport "$VPN_PORT" -j ACCEPT
         iptables -C INPUT -p tcp --dport "$VPN_PORT" -j ACCEPT 2>/dev/null || \
             iptables -A INPUT -p tcp --dport "$VPN_PORT" -j ACCEPT
+        # 浏览器插件代理入口（启用时逐个放行；公网暴露请配 PROXY_USER/PASS）
+        for _pp in "$SOCKS5_PORT" "$HTTP_PROXY_PORT" "$HTTPS_PROXY_PORT"; do
+            if [ -n "$_pp" ] && [ "$_pp" != "0" ]; then
+                iptables -C INPUT -p tcp --dport "$_pp" -j ACCEPT 2>/dev/null || \
+                    iptables -A INPUT -p tcp --dport "$_pp" -j ACCEPT
+            fi
+        done
         return 0
     fi
     # 3.2 回退 nftables（先删旧表保证幂等）
@@ -430,6 +464,9 @@ table inet vpn {
         type filter hook input priority 0; policy accept;
         udp dport $VPN_PORT accept
         tcp dport $VPN_PORT accept
+        $( [ -n "$SOCKS5_PORT" ] && [ "$SOCKS5_PORT" != "0" ] && echo "tcp dport $SOCKS5_PORT accept" )
+        $( [ -n "$HTTP_PROXY_PORT" ] && [ "$HTTP_PROXY_PORT" != "0" ] && echo "tcp dport $HTTP_PROXY_PORT accept" )
+        $( [ -n "$HTTPS_PROXY_PORT" ] && [ "$HTTPS_PROXY_PORT" != "0" ] && echo "tcp dport $HTTPS_PROXY_PORT accept" )
     }
     chain postrouting {
         type nat hook postrouting priority 100;
@@ -448,11 +485,23 @@ if command -v ufw >/dev/null 2>&1; then
     echo "[*] ufw 放行 UDP/$VPN_PORT + TCP/$VPN_PORT"
     ufw allow "$VPN_PORT/udp" >/dev/null 2>&1 || true
     ufw allow "$VPN_PORT/tcp" >/dev/null 2>&1 || true
+    for _pp in "$SOCKS5_PORT" "$HTTP_PROXY_PORT" "$HTTPS_PROXY_PORT"; do
+        if [ -n "$_pp" ] && [ "$_pp" != "0" ]; then
+            echo "[*] ufw 放行 TCP/$_pp（浏览器代理）"
+            ufw allow "$_pp/tcp" >/dev/null 2>&1 || true
+        fi
+    done
 fi
 if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
     echo "[*] firewalld 放行 UDP/$VPN_PORT + TCP/$VPN_PORT"
     firewall-cmd --permanent --add-port="$VPN_PORT/udp" >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-port="$VPN_PORT/tcp" >/dev/null 2>&1 || true
+    for _pp in "$SOCKS5_PORT" "$HTTP_PROXY_PORT" "$HTTPS_PROXY_PORT"; do
+        if [ -n "$_pp" ] && [ "$_pp" != "0" ]; then
+            echo "[*] firewalld 放行 TCP/$_pp（浏览器代理）"
+            firewall-cmd --permanent --add-port="$_pp/tcp" >/dev/null 2>&1 || true
+        fi
+    done
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
@@ -467,6 +516,20 @@ ARGS=(-l "$LISTEN_IP" -p "$VPN_PORT" -n "$TUN_NAME" -a "$TUN_IP"
 if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
     ARGS+=(--max-clients "$MAX_CLIENTS")
 fi
+if [ -n "$SOCKS5_PORT" ] && [ "$SOCKS5_PORT" != "0" ]; then
+    ARGS+=(--socks5-port "$SOCKS5_PORT")
+fi
+if [ -n "$HTTP_PROXY_PORT" ] && [ "$HTTP_PROXY_PORT" != "0" ]; then
+    ARGS+=(--http-proxy-port "$HTTP_PROXY_PORT")
+fi
+if [ -n "$HTTPS_PROXY_PORT" ] && [ "$HTTPS_PROXY_PORT" != "0" ]; then
+    ARGS+=(--https-proxy-port "$HTTPS_PROXY_PORT")
+    [ -n "$HTTPS_CERT" ] && ARGS+=(--https-proxy-cert "$HTTPS_CERT")
+    [ -n "$HTTPS_KEY" ] && ARGS+=(--https-proxy-key "$HTTPS_KEY")
+fi
+[ -n "$PROXY_USER" ] && ARGS+=(--proxy-user "$PROXY_USER")
+[ -n "$PROXY_PASS" ] && ARGS+=(--proxy-pass "$PROXY_PASS")
+[ "$PROXY_ALLOW_PRIVATE" = "1" ] && ARGS+=(--proxy-allow-private)
 if [ "$QUIET" = "1" ]; then
     ARGS+=(--quiet)
     LOG_DESC="精简（仅重点日志）"
@@ -497,6 +560,21 @@ if [ "$DAEMON" = "1" ]; then
     if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
         ARGS_STR="$ARGS_STR --max-clients $MAX_CLIENTS"
     fi
+    # 浏览器插件代理入口（密码/路径请勿含空格：watchdog 以字符串方式透传参数）
+    if [ -n "$SOCKS5_PORT" ] && [ "$SOCKS5_PORT" != "0" ]; then
+        ARGS_STR="$ARGS_STR --socks5-port $SOCKS5_PORT"
+    fi
+    if [ -n "$HTTP_PROXY_PORT" ] && [ "$HTTP_PROXY_PORT" != "0" ]; then
+        ARGS_STR="$ARGS_STR --http-proxy-port $HTTP_PROXY_PORT"
+    fi
+    if [ -n "$HTTPS_PROXY_PORT" ] && [ "$HTTPS_PROXY_PORT" != "0" ]; then
+        ARGS_STR="$ARGS_STR --https-proxy-port $HTTPS_PROXY_PORT"
+        [ -n "$HTTPS_CERT" ] && ARGS_STR="$ARGS_STR --https-proxy-cert $HTTPS_CERT"
+        [ -n "$HTTPS_KEY" ] && ARGS_STR="$ARGS_STR --https-proxy-key $HTTPS_KEY"
+    fi
+    [ -n "$PROXY_USER" ] && ARGS_STR="$ARGS_STR --proxy-user $PROXY_USER"
+    [ -n "$PROXY_PASS" ] && ARGS_STR="$ARGS_STR --proxy-pass $PROXY_PASS"
+    [ "$PROXY_ALLOW_PRIVATE" = "1" ] && ARGS_STR="$ARGS_STR --proxy-allow-private"
     [ "$QUIET" = "1" ] && ARGS_STR="$ARGS_STR --quiet"
     # 生成 watchdog 守护脚本：vpn_server 异常退出时自动重启
     cat > "$RUN_DIR/watchdog.sh" <<WDE

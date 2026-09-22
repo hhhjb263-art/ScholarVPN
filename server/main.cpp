@@ -39,6 +39,15 @@ static void print_usage(const char *prog)
     printf("  -g, --gen-token [n]   生成 n 个一次性注册令牌(默认1)追加到 keys/register_tokens.txt 后退出\n");
     printf("      --quiet           关闭数据包级日志，只输出重点日志（公网服务器推荐）\n");
     printf("      --transport both  传输方式 both|udp|tcp（默认 both：同端口双栈）\n");
+    printf("      --socks5-port <n> 浏览器插件 SOCKS5 代理端口（默认 0=关闭；链路明文）\n");
+    printf("      --http-proxy-port <n>   浏览器插件 HTTP CONNECT 代理（明文；仅内网/前置 stunnel）\n");
+    printf("      --https-proxy-port <n>  浏览器插件 HTTPS CONNECT 代理（TLS 加密，公网推荐）\n");
+    printf("      --https-proxy-cert <p>  TLS 证书链 PEM（与 --https-proxy-port 配套）\n");
+    printf("      --https-proxy-key <p>   TLS 私钥 PEM\n");
+    printf("      --proxy-user <u>  三个代理入口共用的用户名/密码认证（公网强烈建议）\n");
+    printf("      --proxy-pass <p>  与 --proxy-user 配套\n");
+    printf("      --proxy-allow-private  允许代理连接服务端内网/回环目标\n");
+    printf("                        （默认禁止；仅内网自用场景开启）\n");
     printf("  -h, --help            显示本帮助\n");
 }
 
@@ -119,6 +128,52 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
                 return false;
             }
             cfg.transport_mode = mode;
+        }else if(arg == "--socks5-port"){
+            const char *v = next("端口");
+            if(!v) return false;
+            const long n = std::strtol(v, nullptr, 10);
+            if(n < 0 || n > 65535){
+                fprintf(stderr, "参数错误: --socks5-port 必须是 0-65535\n");
+                return false;
+            }
+            cfg.socks5_port = static_cast<uint16_t>(n);
+        }else if(arg == "--http-proxy-port"){
+            const char *v = next("端口");
+            if(!v) return false;
+            const long n = std::strtol(v, nullptr, 10);
+            if(n < 0 || n > 65535){
+                fprintf(stderr, "参数错误: --http-proxy-port 必须是 0-65535\n");
+                return false;
+            }
+            cfg.http_proxy_port = static_cast<uint16_t>(n);
+        }else if(arg == "--https-proxy-port"){
+            const char *v = next("端口");
+            if(!v) return false;
+            const long n = std::strtol(v, nullptr, 10);
+            if(n < 0 || n > 65535){
+                fprintf(stderr, "参数错误: --https-proxy-port 必须是 0-65535\n");
+                return false;
+            }
+            cfg.https_proxy_port = static_cast<uint16_t>(n);
+        }else if(arg == "--https-proxy-cert"){
+            const char *v = next("路径");
+            if(!v) return false;
+            cfg.https_cert_path = v;
+        }else if(arg == "--https-proxy-key"){
+            const char *v = next("路径");
+            if(!v) return false;
+            cfg.https_key_path = v;
+        }else if(arg == "--proxy-user" || arg == "--socks5-user"){
+            // --socks5-user 为历史别名（三个代理入口共用同一份凭据）
+            const char *v = next("用户名");
+            if(!v) return false;
+            cfg.proxy_user = v;
+        }else if(arg == "--proxy-pass" || arg == "--socks5-pass"){
+            const char *v = next("密码");
+            if(!v) return false;
+            cfg.proxy_pass = v;
+        }else if(arg == "--proxy-allow-private"){
+            cfg.proxy_allow_private = true;
         }else{
             fprintf(stderr, "未知选项: %s\n", arg.c_str());
             print_usage(argv[0]);

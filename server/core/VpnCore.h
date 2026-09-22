@@ -9,6 +9,8 @@
 #include "../tun/tun.h"
 #include "../UDP/UDP.h"
 #include "../TCP/tcpserver.h"
+#include "../Socks5/socks5.h"
+#include "../HttpsProxy/httpsproxy.h"
 #include "../LinuxAdapter/LinuxAdapter.h"
 
 // VPN 核心（服务端）：把 TUN 虚拟网卡与 UDP 隧道桥接起来。
@@ -46,6 +48,23 @@ public:
 
         // 传输开关：both（默认，同端口双栈）/ udp（禁用 TCP 监听）/ tcp（禁用 UDP 监听）
         std::string transport_mode = "both";
+
+        // 浏览器插件专用代理入口（默认全部关闭）：给 MV3 扩展的 chrome.proxy
+        // 提供出口，只代理浏览器流量、不安装系统级 VPN。
+        //   --socks5-port      SOCKS5（标准协议，链路明文，最快）
+        //   --http-proxy-port  HTTP CONNECT（明文；仅内网/前置 stunnel 用）
+        //   --https-proxy-port HTTPS CONNECT（TLS 加密，公网推荐；需证书）
+        // proxy_user 非空则三个入口都要求认证
+        uint16_t socks5_port = 0;       // 0 = 不启用
+        uint16_t http_proxy_port = 0;
+        uint16_t https_proxy_port = 0;
+        std::string https_cert_path;    // TLS 证书链（PEM）
+        std::string https_key_path;     // TLS 私钥（PEM）
+        std::string proxy_user;         // 三个代理入口共用
+        std::string proxy_pass;
+        // 目标地址 ACL：默认（false）拒绝代理访问服务端内网/回环/链路本地/
+        // 组播/TUN 网段目标；true = 内网自用场景放行（--proxy-allow-private）
+        bool proxy_allow_private = false;
     };
 
 public:
@@ -73,6 +92,9 @@ private:
     Tun m_tun;                     // 虚拟网卡
     UDP m_udp;                     // UDP 隧道（服务端：绑定监听，含会话表/认证/心跳）
     TCPServer m_tcp{m_udp};        // TCP 监听（同端口双栈，会话表与 UDP 共用）
+    Socks5Proxy m_socks5;          // 浏览器插件专用 SOCKS5 代理（默认关闭）
+    HttpConnectProxy m_http_proxy;   // 浏览器插件专用 HTTP CONNECT 代理（明文）
+    HttpConnectProxy m_https_proxy;  // 浏览器插件专用 HTTPS CONNECT 代理（TLS 加密）
     LinuxAdapter m_adapter;        // 系统网卡配置（IP/MTU/路由）
     std::thread m_thread_t2u;      // 转发线程1: tun → udp
     std::thread m_thread_u2t;      // 转发线程2: udp → tun

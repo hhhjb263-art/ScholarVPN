@@ -19,6 +19,8 @@ add_library(vpn_modules STATIC
     Buffer/QueueBuffer.cpp
     UDP/UDP.cpp
     TCP/tcpserver.cpp
+    Socks5/socks5.cpp
+    HttpsProxy/httpsproxy.cpp
     tun/tun.cpp
     LinuxAdapter/LinuxAdapter.cpp
     core/VpnCore.cpp
@@ -31,6 +33,9 @@ target_include_directories(vpn_modules PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/Buffer
     ${CMAKE_CURRENT_SOURCE_DIR}/UDP
     ${CMAKE_CURRENT_SOURCE_DIR}/TCP
+    ${CMAKE_CURRENT_SOURCE_DIR}/Socks5
+    ${CMAKE_CURRENT_SOURCE_DIR}/HttpsProxy
+    ${CMAKE_CURRENT_SOURCE_DIR}/Proxy
     ${CMAKE_CURRENT_SOURCE_DIR}/tun
     ${CMAKE_CURRENT_SOURCE_DIR}/LinuxAdapter
     ${CMAKE_CURRENT_SOURCE_DIR}/core
@@ -41,7 +46,7 @@ target_include_directories(vpn_modules PUBLIC
 find_package(Threads REQUIRED)
 # 加密（X25519 / HKDF / AES-256-GCM）
 find_package(OpenSSL REQUIRED)
-target_link_libraries(vpn_modules PUBLIC Threads::Threads OpenSSL::Crypto)
+target_link_libraries(vpn_modules PUBLIC Threads::Threads OpenSSL::Crypto OpenSSL::SSL)
 
 # 编译告警
 target_compile_options(vpn_modules PRIVATE -Wall -Wextra)

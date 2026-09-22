@@ -126,6 +126,50 @@ bool VpnCore::init(const Config &cfg)
         stop();
         return false;
     }
+    // 7) 浏览器插件专用代理入口（默认全部关闭）：给 Chrome/Edge MV3 扩展的
+    //    chrome.proxy 提供出口，只代理浏览器流量。三个入口独立配置端口：
+    //      SOCKS5（明文）/ HTTP CONNECT（明文）/ HTTPS CONNECT（TLS 加密，推荐）
+    m_socks5.set_allow_private(m_cfg.proxy_allow_private);
+    if(m_cfg.socks5_port != 0 &&
+       !m_socks5.start(m_cfg.listen_ip, m_cfg.socks5_port,
+                       m_cfg.proxy_user, m_cfg.proxy_pass)){
+        fprintf(stderr, "[VpnCore] socks5.start(%s:%u) failed\n",
+                m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.socks5_port));
+        stop();
+        return false;
+    }
+    if(m_cfg.http_proxy_port != 0){
+        HttpConnectProxy::Config pc;
+        pc.bind_ip = m_cfg.listen_ip;
+        pc.port = m_cfg.http_proxy_port;
+        pc.use_tls = false;              // 明文 HTTP CONNECT（内网/前置 stunnel）
+        pc.user = m_cfg.proxy_user;
+        pc.pass = m_cfg.proxy_pass;
+        pc.allow_private = m_cfg.proxy_allow_private;
+        if(!m_http_proxy.start(pc)){
+            fprintf(stderr, "[VpnCore] http_proxy.start(%s:%u) failed\n",
+                    m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.http_proxy_port));
+            stop();
+            return false;
+        }
+    }
+    if(m_cfg.https_proxy_port != 0){
+        HttpConnectProxy::Config pc;
+        pc.bind_ip = m_cfg.listen_ip;
+        pc.port = m_cfg.https_proxy_port;
+        pc.use_tls = true;               // TLS 加密（浏览器插件推荐路径）
+        pc.cert_path = m_cfg.https_cert_path;
+        pc.key_path = m_cfg.https_key_path;
+        pc.user = m_cfg.proxy_user;
+        pc.pass = m_cfg.proxy_pass;
+        pc.allow_private = m_cfg.proxy_allow_private;
+        if(!m_https_proxy.start(pc)){
+            fprintf(stderr, "[VpnCore] https_proxy.start(%s:%u) failed\n",
+                    m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.https_proxy_port));
+            stop();
+            return false;
+        }
+    }
     return true;
 }
 
@@ -168,6 +212,10 @@ void VpnCore::stop()
     m_udp.stop();
     // 再停止 TCP 监听（epoll 事件线程退出并统一关闭全部连接 + 注销唤醒钩子）
     m_tcp.stop();
+    // 浏览器插件代理入口（与主隧道无共享状态，顺序无关）
+    m_socks5.stop();
+    m_http_proxy.stop();
+    m_https_proxy.stop();
     // 清理路由与网卡（仅在 TUN 创建成功后才做网卡操作）
     if(m_cfg.add_default_route){
         m_adapter.route_del("0.0.0.0", 0);

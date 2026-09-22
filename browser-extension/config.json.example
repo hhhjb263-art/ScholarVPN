@@ -1,6 +1,6 @@
 {
-  "_说明": "复制为 config.json 使用。无人值守配置：applyOnStartup=true 表示每次启动浏览器都按这里的值应用（无需点弹窗）；日常手动控制可删掉本文件或改为 false。config.json 含密码，已被 .gitignore 忽略，不会提交。",
-  "applyOnStartup": true,
+  "_说明": "复制为 config.json 使用（含密码，已被 .gitignore 忽略）。applyOnStartup=false（默认）= 启动时不干预，按弹窗手动开关；true = 每次启动都强制按这里的值（无人值守部署，或“每次启动强制关闭”）；applyOnce=true = 仅在从未保存过设置时应用一次。",
+  "applyOnStartup": false,
   "enabled": true,
   "protocol": "https",
   "host": "1.2.3.4",

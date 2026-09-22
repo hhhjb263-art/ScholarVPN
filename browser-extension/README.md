@@ -134,8 +134,9 @@ browser-extension/   扩展本体（manifest / background / popup / 图标 / 测
 
 ## 五、无人值守配置（config.json，可选）
 
-不想每次点弹窗配置，可在扩展目录放一份 `config.json`（含密码，已在 `.gitignore` 中，
-不会提交；模板见 `config.json.example`）：
+**默认不启动代理**：装好后开关是关的，需要时在弹窗里手动打开（手动设置会保留，
+重启浏览器不丢）。若不想每次手动填服务器/账号，可在扩展目录放一份 `config.json`
+预填这些字段（含密码，已在 `.gitignore` 中，不会提交；模板见 `config.json.example`）：
 
 ```json
 {
@@ -153,8 +154,8 @@ browser-extension/   扩展本体（manifest / background / popup / 图标 / 测
 
 | 字段 | 说明 |
 | --- | --- |
-| `applyOnStartup` | `true` = 每次浏览器启动都把上面配置写回并生效（固定部署；避免误关） |
-| `applyOnce` | `true` = 仅在从未保存过设置时应用一次（日常手动控制用） |
+| `applyOnStartup` | `false`（默认）= 启动时不按本文件强制开关，**完全由弹窗手动控制**；`true` = 每次启动都按这里的值强制应用（无人值守部署，或"每次启动强制关闭"：`true` + `enabled: false`） |
+| `applyOnce` | `true` = 仅在从未保存过设置时应用一次 |
 | 其余字段 | 与弹窗一一对应：`protocol` = `https`/`socks5`/`http`；`mode` = `global`/`whitelist`；`list` = 域名数组 |
 
 生效方式：改完 `config.json` 后**重启浏览器**（或到 `chrome://extensions`/`edge://extensions`

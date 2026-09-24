@@ -1163,8 +1163,21 @@ void UDP::handle_auth_client_hello(Session& s, const uint8_t* payload, size_t le
 //   5) 通过 → 分配虚拟 IP → 回 identity_ok（携带 [ip(4)][prefix(1)]）→ 放行
 void UDP::handle_identity(Session& s, const std::vector<uint8_t>& inner)
 {
-    // 已认证会话再次收到身份报文 = 客户端在首次成功确认前发出的重传，直接忽略。
+    // 已认证会话再次收到身份报文 = 客户端没收到上一次 identity_ok 的【重传】。
+    // 必须幂等重发 identity_ok，不能静默忽略：identity_ok 只是单个 UDP 报文，
+    // 一旦丢包，客户端会按 500ms 间隔重传至 10 次 / 5s 超时 —— 握手从此必失败
+    // （阶段1 的 ServerHello 已是幂等重发语义，阶段3 与之保持一致）。
+    // 安全性：本帧必须先通过 AES-GCM 验签与反重放窗口才会走到这里（旧序号帧
+    // 已在 handle_framed 被丢弃），只有持有本会话密钥的合法客户端能触发，无放大风险。
     if (s.authenticated.load()) {
+        uint8_t resend_payload[5] = {0};
+        memcpy(resend_payload, &s.virtual_ip, 4);
+        resend_payload[4] = static_cast<uint8_t>(m_tun_prefix);
+        std::vector<uint8_t> resend_buf;
+        if (!send_packet(s, static_cast<uint8_t>(m_identity_ok), resend_payload,
+                         sizeof(resend_payload), resend_buf)) {
+            fprintf(stderr, "[UDP][AUTH] 重传 identity_ok 失败 (%s)\n", s.peer_key.c_str());
+        }
         return;
     }
     // identity_deny 携带 1 字节原因码（密文内层）：

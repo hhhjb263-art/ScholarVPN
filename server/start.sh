@@ -20,12 +20,18 @@
 #   TRANSPORT=both|udp|tcp  传输方式（默认 both：UDP 与 TCP 同端口同时监听）
 #   QUIET=1 关闭数据包级次要日志，只保留重点日志（公网服务器推荐）
 #   SOCKS5_PORT=1080 浏览器插件代理入口（默认全关）：
+#     ★ PROXY_ALL=1            一次开齐下面三个入口（端口用各自默认值；
+#                              已单独指定的 *_PORT 优先，不会被你显式设置的值覆盖）
 #     SOCKS5_PORT=1080        标准 SOCKS5（链路明文，最快）
 #     HTTP_PROXY_PORT=8080    HTTP CONNECT（明文；仅内网或前置 stunnel/SSH）
 #     HTTPS_PROXY_PORT=8443   HTTPS CONNECT（TLS 加密，公网推荐）
+#                              证书缺失时自动跳过该入口并提示生成命令；
+#                              证书未显式指定时自动采用 ./keys/proxy.{cert,key}.pem
 #     HTTPS_CERT=/path/fullchain.pem  HTTPS_KEY=/path/privkey.pem  （TLS 必需）
 #     PROXY_USER / PROXY_PASS 三个入口共用的 Basic 认证（公网强烈建议；密码勿含空格）
 #     PROXY_ALLOW_PRIVATE=1   允许代理连接服务端内网/回环目标（默认 0 禁止）
+#     PROXY_ALLOW_NOAUTH=1    显式允许代理入口无认证对外监听（默认 0 拒绝；
+#                             仅内网自用/前置 TLS 终结时开启，明文入口勿暴露公网）
 #     PROXY_PASS_FILE=/path   代理密码文件（0600，推荐；比 PROXY_PASS 更安全）
 #     （SOCKS5_USER / SOCKS5_PASS 为历史别名，仍可用）
 # ============================================================
@@ -60,6 +66,57 @@ PROXY_MAX_PER_SOURCE="${PROXY_MAX_PER_SOURCE:-0}"   # 0 = 用服务端默认(16)
 PROXY_CONN_RATE="${PROXY_CONN_RATE:-0}"             # 0 = 用服务端默认(2/s)
 # 1 = 允许代理连接服务端内网/回环目标（默认 0 禁止；仅内网自用场景开启）
 PROXY_ALLOW_PRIVATE="${PROXY_ALLOW_PRIVATE:-0}"
+# 1 = 显式允许代理入口无认证对外监听（默认 0 拒绝，防误开开放代理；仅内网自用）
+PROXY_ALLOW_NOAUTH="${PROXY_ALLOW_NOAUTH:-0}"
+
+# ---- 一次开齐三个代理入口：SOCKS5 / HTTP CONNECT / HTTPS CONNECT ----
+# 浏览器插件（Chrome/Edge MV3）支持在这三种方式间切换；服务端三个入口同时监听时，
+# 客户端换协议不用改服务端。三个入口默认全关，PROXY_ALL=1 一次全开。
+# 单独指定 SOCKS5_PORT/HTTP_PROXY_PORT/HTTPS_PROXY_PORT 优先于 PROXY_ALL 的默认值。
+PROXY_ALL="${PROXY_ALL:-0}"
+# 证书未显式指定时，自动采用 gen-self-signed-cert.sh 的默认产物位置（./keys/），
+# 这样"先生成证书 → 再 PROXY_ALL=1"就能直接带上 HTTPS 入口，无需再传两个变量
+if [ -z "$HTTPS_CERT" ] && [ -f "$SCRIPT_DIR/keys/proxy.cert.pem" ]; then
+    HTTPS_CERT="$SCRIPT_DIR/keys/proxy.cert.pem"
+fi
+if [ -z "$HTTPS_KEY" ] && [ -f "$SCRIPT_DIR/keys/proxy.key.pem" ]; then
+    HTTPS_KEY="$SCRIPT_DIR/keys/proxy.key.pem"
+fi
+if [ "$PROXY_ALL" = "1" ]; then
+    if [ "$SOCKS5_PORT" = "0" ]; then SOCKS5_PORT=1080; fi
+    if [ "$HTTP_PROXY_PORT" = "0" ]; then HTTP_PROXY_PORT=8080; fi
+    if [ "$HTTPS_PROXY_PORT" = "0" ]; then HTTPS_PROXY_PORT=8443; fi
+    # 端口互查：任意两个相同、或撞上隧道端口，服务端只能起来一个（另一个 bind 失败）
+    if [ "$SOCKS5_PORT" = "$HTTP_PROXY_PORT" ] || \
+       [ "$SOCKS5_PORT" = "$HTTPS_PROXY_PORT" ] || \
+       [ "$HTTP_PROXY_PORT" = "$HTTPS_PROXY_PORT" ]; then
+        echo "[错误] PROXY_ALL：三个代理入口的端口不能重复（当前 SOCKS5=$SOCKS5_PORT HTTP=$HTTP_PROXY_PORT HTTPS=$HTTPS_PROXY_PORT）" >&2
+        exit 1
+    fi
+    if [ "$SOCKS5_PORT" = "$VPN_PORT" ] || \
+       [ "$HTTP_PROXY_PORT" = "$VPN_PORT" ] || \
+       [ "$HTTPS_PROXY_PORT" = "$VPN_PORT" ]; then
+        echo "[错误] PROXY_ALL：代理入口端口不能与隧道端口 VPN_PORT=$VPN_PORT 相同" >&2
+        exit 1
+    fi
+    # HTTPS 入口需要证书：没有就跳过它（另外两个照常），并给出可照做的两条命令
+    if [ -z "$HTTPS_CERT" ] || [ -z "$HTTPS_KEY" ]; then
+        echo "[警告] PROXY_ALL=1 但未找到 HTTPS 证书 → 跳过 HTTPS 入口（SOCKS5/HTTP 照常启动）" >&2
+        echo "       1) 生成自签证书（<服务器IP或域名> 换成你的地址，默认输出到 ./keys/）：" >&2
+        echo "            ./gen-self-signed-cert.sh <服务器IP或域名>" >&2
+        echo "       2) 生成后重跑（证书已自动识别，也可显式指定）：" >&2
+        echo "            PROXY_ALL=1 ./start.sh -d" >&2
+        HTTPS_PROXY_PORT=0
+    fi
+    # 三个入口对外监听都要求认证，服务端会拒绝无认证对外监听。
+    # 这里只警告不退出：VPN 隧道必须先起来（代理是可选项，失败不该牵连隧道）
+    if [ -z "$PROXY_USER" ] && [ -z "$PROXY_PASS" ] && [ -z "$PROXY_PASS_FILE" ] && \
+       [ "$PROXY_ALLOW_NOAUTH" != "1" ]; then
+        echo "[警告] PROXY_ALL=1 但未配置代理认证 → 三个入口都会被服务端拒绝启动。" >&2
+        echo "       公网推荐：PROXY_USER=alice PROXY_PASS_FILE=/etc/scholarvpn/proxy.pass" >&2
+        echo "       内网自用：再加 PROXY_ALLOW_NOAUTH=1（明文代理，勿暴露公网）" >&2
+    fi
+fi
 ENABLE_IPV6="${ENABLE_IPV6:-0}"        # 1=同时开启 IPv6 转发
 # ---- 运行 / 日志 ----
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"        # 重点日志保存目录（按天轮转）
@@ -253,7 +310,7 @@ do_doctor() {
     fi
     if [ -f /etc/default/vpn-server ]; then
         echo "    环境文件: /etc/default/vpn-server (存在；编辑后 systemctl restart vpn-server 生效)"
-        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|TRANSPORT|MAX_CLIENTS|SOCKS5_PORT|HTTP_PROXY_PORT|HTTPS_PROXY_PORT|HTTPS_CERT|HTTPS_KEY|PROXY_USER|PROXY_PASS_FILE|PROXY_MAX_PER_SOURCE|PROXY_CONN_RATE|PROXY_ALLOW_PRIVATE|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
+        grep -E "^(TUN_IP|VPN_PORT|LISTEN_IP|TRANSPORT|MAX_CLIENTS|PROXY_ALL|SOCKS5_PORT|HTTP_PROXY_PORT|HTTPS_PROXY_PORT|HTTPS_CERT|HTTPS_KEY|PROXY_USER|PROXY_PASS_FILE|PROXY_MAX_PER_SOURCE|PROXY_CONN_RATE|PROXY_ALLOW_PRIVATE|PROXY_ALLOW_NOAUTH|QUIET|KEY_PATH)=" /etc/default/vpn-server 2>/dev/null | sed 's/^/      /'
     else
         echo "    环境文件: 无 (/etc/default/vpn-server 缺失，使用 start.sh 默认参数)"
     fi
@@ -326,6 +383,7 @@ do_install() {
         echo "TRANSPORT=\"$TRANSPORT\""
         echo "KEY_PATH=\"$KEY_PATH\""
         echo "MAX_CLIENTS=\"$MAX_CLIENTS\""
+        echo "PROXY_ALL=\"$PROXY_ALL\""
         echo "SOCKS5_PORT=\"$SOCKS5_PORT\""
         echo "HTTP_PROXY_PORT=\"$HTTP_PROXY_PORT\""
         echo "HTTPS_PROXY_PORT=\"$HTTPS_PROXY_PORT\""
@@ -337,6 +395,7 @@ do_install() {
         echo "PROXY_MAX_PER_SOURCE=\"$PROXY_MAX_PER_SOURCE\""
         echo "PROXY_CONN_RATE=\"$PROXY_CONN_RATE\""
         echo "PROXY_ALLOW_PRIVATE=\"$PROXY_ALLOW_PRIVATE\""
+        echo "PROXY_ALLOW_NOAUTH=\"$PROXY_ALLOW_NOAUTH\""
         echo "ENABLE_IPV6=\"$ENABLE_IPV6\""
         echo "QUIET=\"$QUIET\""
         echo "MAX_RESTARTS=\"$MAX_RESTARTS\""
@@ -567,6 +626,7 @@ else
     [ -n "$PROXY_PASS" ] && ARGS+=(--proxy-pass "$PROXY_PASS")
 fi
 [ "$PROXY_ALLOW_PRIVATE" = "1" ] && ARGS+=(--proxy-allow-private)
+[ "$PROXY_ALLOW_NOAUTH" = "1" ] && ARGS+=(--proxy-allow-noauth)
 if [ "$QUIET" = "1" ]; then
     ARGS+=(--quiet)
     LOG_DESC="精简（仅重点日志）"
@@ -618,6 +678,7 @@ if [ "$DAEMON" = "1" ]; then
         [ -n "$PROXY_PASS" ] && ARGS_STR="$ARGS_STR --proxy-pass $PROXY_PASS"
     fi
     [ "$PROXY_ALLOW_PRIVATE" = "1" ] && ARGS_STR="$ARGS_STR --proxy-allow-private"
+    [ "$PROXY_ALLOW_NOAUTH" = "1" ] && ARGS_STR="$ARGS_STR --proxy-allow-noauth"
     [ "$QUIET" = "1" ] && ARGS_STR="$ARGS_STR --quiet"
     # 生成 watchdog 守护脚本：vpn_server 异常退出时自动重启
     cat > "$RUN_DIR/watchdog.sh" <<WDE

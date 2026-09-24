@@ -76,11 +76,22 @@ cd server
 脚本默认生成 **CA + 叶证书**（服务器只放叶证书，客户端导入 CA），也可用
 `--self-signed` 生成单张自签证书。
 
-**客户端导入的是 `ca.cert.pem`**（不是服务器在用的 `proxy.cert.pem`）：
+**客户端导入哪一张，取决于服务端证书是怎么生成的**（两张模式产出的文件不同）：
+
+| 生成方式 | 服务端产物 | **客户端要导入** |
+| --- | --- | --- |
+| **CA + 叶证书**（`./gen-self-signed-cert.sh <IP>` 默认） | `ca.cert.pem` `ca.key.pem` `proxy.cert.pem` `proxy.key.pem` | **`ca.cert.pem`**（不是服务器在用的 `proxy.cert.pem`） |
+| **单张自签**（`./gen-self-signed-cert.sh <IP> --self-signed`） | 只有 `proxy.cert.pem` `proxy.key.pem`，**没有 ca.cert.pem** | **`proxy.cert.pem` 本身**（证书即根） |
+
+判断方法：看服务器 `keys/` 目录里有没有 `ca.cert.pem`。没有就是自签模式。
 
 ```powershell
-certutil -addstore -f Root ca.cert.pem     # 管理员；导入后完全重启浏览器
+certutil -addstore -f Root ca.cert.pem      # CA 模式（管理员；导入后完全重启浏览器）
+certutil -addstore -f Root proxy.cert.pem   # 自签模式
 ```
+
+> 也可以直接用仓库里的 `导入证书(管理员运行).bat`：它会**自动识别**同目录下是
+> `ca.cert.pem` 还是 `proxy.cert.pem` 并导入正确的那个。
 
 脚本会做链校验自检（`openssl verify -verify_ip …`）并打印续期方法：叶证书
 到期只需重新签发叶证书，CA 不变、客户端**无需重新导入**。此前导入过旧自签

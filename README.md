@@ -146,8 +146,10 @@ Metric=5
 
 - **客户端连不上**：确认服务端在运行、端口在云安全组与防火墙都已放行；运营商丢 UDP 时可改用
   TCP 传输（`Transport=1`，服务端需 `--transport both|tcp`）。
-- **浏览器插件报证书不受信任**：把服务端生成的 `ca.cert.pem` 导入系统"受信任的根证书颁发机构"，
-  然后**完全退出并重开浏览器**。
+- **浏览器插件报证书不受信任**：把服务端生成的证书导入系统"受信任的根证书颁发机构"，
+  然后**完全退出并重开浏览器**。导入哪一张取决于服务端证书怎么生成的：CA 模式导
+  `ca.cert.pem`，单张自签模式导 `proxy.cert.pem` 本身（详见 `browser-extension/README.md`；
+  用 `导入证书(管理员运行).bat` 会自动识别）。
 - **日志在哪看**：前台运行看终端输出；`./start.sh -d` 写入 `logs/vpn-server-YYYYMMDD.log`；
   systemd 模式用 `journalctl -u vpn-server -f`。
 - **多客户端共享服务端出口**：需要内核转发 + NAT，`start.sh` 会自动配置。

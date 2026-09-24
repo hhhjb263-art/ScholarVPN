@@ -406,12 +406,21 @@ bool HttpConnectProxy::start(const Config& cfg)
     }
     int reuse = 1;
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    // 本监听面是 AF_INET：把 "localhost" / "::1" 归一化成 127.0.0.1。
+    // 否则上面的回环判定（loopback）认了这两个写法，这里 inet_pton(AF_INET,...)
+    // 却必然失败 → 代理入口直接起不来（表现为"配了 localhost 就没监听"）。
+    std::string bind_ip4 = m_cfg.bind_ip;
+    if (bind_ip4.empty() || bind_ip4 == "0.0.0.0") {
+        bind_ip4 = "0.0.0.0";
+    } else if (bind_ip4 == "localhost" || bind_ip4 == "::1") {
+        bind_ip4 = "127.0.0.1";
+    }
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(m_cfg.port);
-    if (m_cfg.bind_ip == "0.0.0.0") {
+    if (bind_ip4 == "0.0.0.0") {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (inet_pton(AF_INET, m_cfg.bind_ip.c_str(), &addr.sin_addr) != 1) {
+    } else if (inet_pton(AF_INET, bind_ip4.c_str(), &addr.sin_addr) != 1) {
         fprintf(stderr, "[HTTPS] 非法绑定地址 %s\n", m_cfg.bind_ip.c_str());
         ::close(m_listen_fd);
         m_listen_fd = -1;
@@ -636,6 +645,14 @@ void HttpConnectProxy::handle_conn(int fd, const std::string& peer_ip, const std
     HttpRequest req;
     if (!parse_request(raw, req)) {
         send_error(browser, "400 Bad Request");
+        // 非 HTTP 数据：多半是"把 VPN 客户端/其它协议接到了代理端口"
+        size_t suppressed = 0;
+        if (m_log_limiter->allow(proxy_common::now_ms(), &suppressed)) {
+            fprintf(stderr, "[HTTPS] %s 收到非 HTTP 数据（首行不是请求行）。"
+                            "若这是 VPN 客户端，请把它的端口改回隧道端口（默认 51820）"
+                            "（已抑制 %zu 条同类日志）\n",
+                    sanitize_for_log(peer).c_str(), suppressed);
+        }
         if (ssl != nullptr) {
             SSL_shutdown(ssl);
             SSL_free(ssl);

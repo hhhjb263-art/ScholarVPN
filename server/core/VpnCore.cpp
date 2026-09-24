@@ -10,6 +10,8 @@
 #include <system_error>
 #include <chrono>
 #include <thread>
+#include <utility>   // std::pair（端口判重表）
+#include <vector>
 
 VpnCore::~VpnCore()
 {
@@ -129,16 +131,52 @@ bool VpnCore::init(const Config &cfg)
     // 7) 浏览器插件专用代理入口（默认全部关闭）：给 Chrome/Edge MV3 扩展的
     //    chrome.proxy 提供出口，只代理浏览器流量。三个入口独立配置端口：
     //      SOCKS5（明文）/ HTTP CONNECT（明文）/ HTTPS CONNECT（TLS 加密，推荐）
+    //
+    //    ★ 代理入口失败【不影响主隧道】：Windows / Android 客户端与浏览器插件
+    //      要能同时使用，任何一个代理入口配置有误（端口冲突 / 证书缺失 /
+    //      未配认证等）只跳过该入口并打印原因，VPN 隧道照常提供服务。
+    //
+    // ---- 端口判重表：四个监听面共用，撞车只跳过后者并说明与谁冲突 ----
+    // 隧道先登记，代理依次登记；任何一处撞车都不再是"莫名的 bind failed"，
+    // 而是明确告诉运维"这个端口被谁占了"，避免误判成代理功能坏了。
+    std::vector<std::pair<uint16_t, std::string>> used_ports;
+    used_ports.emplace_back(m_cfg.listen_port, "VPN 隧道入口");
+    const auto find_owner = [&used_ports](uint16_t port) -> const char * {
+        for(const auto &kv : used_ports){
+            if(kv.first == port)
+                return kv.second.c_str();
+        }
+        return nullptr;
+    };
+
+    int proxy_ok = 0;
+    int proxy_failed = 0;
+    // 三个代理入口的最终状态：末尾汇总逐条打印，便于确认三类客户端是否都可用
+    std::string st_socks5 = "未启用";
+    std::string st_http = "未启用";
+    std::string st_https = "未启用";
+
     m_socks5.set_allow_private(m_cfg.proxy_allow_private);
     m_socks5.set_allow_noauth(m_cfg.proxy_allow_noauth);
     m_socks5.set_conn_limits(m_cfg.proxy_max_per_source, m_cfg.proxy_conn_rate);
-    if(m_cfg.socks5_port != 0 &&
-       !m_socks5.start(m_cfg.listen_ip, m_cfg.socks5_port,
-                       m_cfg.proxy_user, m_cfg.proxy_pass)){
-        fprintf(stderr, "[VpnCore] socks5.start(%s:%u) failed\n",
-                m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.socks5_port));
-        stop();
-        return false;
+    if(m_cfg.socks5_port != 0){
+        const char *owner = find_owner(m_cfg.socks5_port);
+        if(owner != nullptr){
+            fprintf(stderr, "[VpnCore] SOCKS5 代理端口 %u 已被%s占用，已跳过该入口\n",
+                    static_cast<unsigned>(m_cfg.socks5_port), owner);
+            st_socks5 = std::string("端口被") + owner + "占用，已跳过";
+            ++proxy_failed;
+        }else if(m_socks5.start(m_cfg.listen_ip, m_cfg.socks5_port,
+                                m_cfg.proxy_user, m_cfg.proxy_pass)){
+            used_ports.emplace_back(m_cfg.socks5_port, "SOCKS5 代理");
+            st_socks5 = "监听中（明文）";
+            ++proxy_ok;
+        }else{
+            fprintf(stderr, "[VpnCore] SOCKS5 代理入口未启动（不影响 VPN 隧道）："
+                            "请检查上面的原因\n");
+            st_socks5 = "启动失败（原因见上）";
+            ++proxy_failed;
+        }
     }
     if(m_cfg.http_proxy_port != 0){
         HttpConnectProxy::Config pc;
@@ -151,11 +189,21 @@ bool VpnCore::init(const Config &cfg)
         pc.allow_noauth = m_cfg.proxy_allow_noauth;
         pc.max_per_source = m_cfg.proxy_max_per_source;
         pc.conn_rate_per_sec = m_cfg.proxy_conn_rate;
-        if(!m_http_proxy.start(pc)){
-            fprintf(stderr, "[VpnCore] http_proxy.start(%s:%u) failed\n",
-                    m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.http_proxy_port));
-            stop();
-            return false;
+        const char *owner = find_owner(m_cfg.http_proxy_port);
+        if(owner != nullptr){
+            fprintf(stderr, "[VpnCore] HTTP 代理端口 %u 已被%s占用，已跳过该入口\n",
+                    static_cast<unsigned>(m_cfg.http_proxy_port), owner);
+            st_http = std::string("端口被") + owner + "占用，已跳过";
+            ++proxy_failed;
+        }else if(m_http_proxy.start(pc)){
+            used_ports.emplace_back(m_cfg.http_proxy_port, "HTTP 代理");
+            st_http = "监听中（明文）";
+            ++proxy_ok;
+        }else{
+            fprintf(stderr, "[VpnCore] HTTP 代理入口未启动（不影响 VPN 隧道）："
+                            "请检查上面的原因\n");
+            st_http = "启动失败（原因见上）";
+            ++proxy_failed;
         }
     }
     if(m_cfg.https_proxy_port != 0){
@@ -171,12 +219,65 @@ bool VpnCore::init(const Config &cfg)
         pc.allow_noauth = m_cfg.proxy_allow_noauth;
         pc.max_per_source = m_cfg.proxy_max_per_source;
         pc.conn_rate_per_sec = m_cfg.proxy_conn_rate;
-        if(!m_https_proxy.start(pc)){
-            fprintf(stderr, "[VpnCore] https_proxy.start(%s:%u) failed\n",
-                    m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.https_proxy_port));
-            stop();
-            return false;
+        const char *owner = find_owner(m_cfg.https_proxy_port);
+        if(owner != nullptr){
+            fprintf(stderr, "[VpnCore] HTTPS 代理端口 %u 已被%s占用，已跳过该入口\n",
+                    static_cast<unsigned>(m_cfg.https_proxy_port), owner);
+            st_https = std::string("端口被") + owner + "占用，已跳过";
+            ++proxy_failed;
+        }else if(m_https_proxy.start(pc)){
+            used_ports.emplace_back(m_cfg.https_proxy_port, "HTTPS 代理");
+            st_https = "监听中（TLS 加密）";
+            ++proxy_ok;
+        }else{
+            fprintf(stderr, "[VpnCore] HTTPS 代理入口未启动（不影响 VPN 隧道）："
+                            "请检查上面的原因\n");
+            st_https = "启动失败（原因见上）";
+            ++proxy_failed;
         }
+    }
+
+    // 启动汇总：逐条列出四个监听面，一眼确认"Windows / Android 走隧道、
+    // 浏览器插件走代理"是否都可用。代理入口失败只影响浏览器插件，
+    // VPN 隧道（Windows / Android）不受影响——这正是本函数不再 return false 的原因。
+    const char *tunnel_proto =
+        (m_cfg.transport_mode == "udp") ? "UDP" :
+        (m_cfg.transport_mode == "tcp") ? "TCP" : "UDP+TCP";
+    const auto entry_line = [&](uint16_t port, const std::string &state){
+        char buf[192];
+        if(port == 0){
+            std::snprintf(buf, sizeof(buf), "%s", state.c_str());   // "未启用"
+        }else{
+            std::snprintf(buf, sizeof(buf), "%s:%u — %s",
+                          m_cfg.listen_ip.c_str(), static_cast<unsigned>(port),
+                          state.c_str());
+        }
+        return std::string(buf);
+    };
+    fprintf(stderr,
+            "[VpnCore] 监听汇总（三类客户端可同时在线）：\n"
+            "          · Windows / Android 客户端 → VPN 隧道 %s:%u（%s 同端口）\n"
+            "          · 浏览器插件 → SOCKS5 %s\n"
+            "          · 浏览器插件 → HTTP   %s\n"
+            "          · 浏览器插件 → HTTPS  %s\n"
+            "          浏览器代理入口：成功 %d 个，失败 %d 个%s\n",
+            m_cfg.listen_ip.c_str(), static_cast<unsigned>(m_cfg.listen_port), tunnel_proto,
+            entry_line(m_cfg.socks5_port, st_socks5).c_str(),
+            entry_line(m_cfg.http_proxy_port, st_http).c_str(),
+            entry_line(m_cfg.https_proxy_port, st_https).c_str(),
+            proxy_ok, proxy_failed,
+            (proxy_failed > 0 && proxy_ok == 0) ? "（浏览器插件当前不可用，VPN 隧道不受影响）" : "");
+
+    // 代理全部起不来时给出可操作的排查方向——这几条覆盖了绝大多数实际配置错误。
+    // 强调"VPN 隧道不受影响"是因为这正是本次改动的目的：三类客户端互不牵连。
+    if(proxy_ok == 0 && proxy_failed > 0){
+        fprintf(stderr,
+                "[VpnCore] 提示：代理入口全部未启动，常见原因——\n"
+                "          1) 监听 0.0.0.0 但没配 --proxy-user/--proxy-pass\n"
+                "             （无认证不允许对外监听；内网自用可加 --proxy-allow-noauth）\n"
+                "          2) HTTPS 入口缺 --https-proxy-cert / --https-proxy-key\n"
+                "          3) 端口被占用（见上方「已被…占用」提示，隧道端口也会占位，默认 51820）\n"
+                "          Windows / Android 客户端的 VPN 隧道不受影响，仍可正常连接。\n");
     }
     return true;
 }

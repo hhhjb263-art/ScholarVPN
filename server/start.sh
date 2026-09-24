@@ -543,7 +543,7 @@ case "$TRANSPORT" in
     *)   LISTEN_DESC="UDP+TCP/$VPN_PORT" ;;
 esac
 ARGS=(-l "$LISTEN_IP" -p "$VPN_PORT" -n "$TUN_NAME" -a "$TUN_IP"
-      --prefix "$TUN_PREFIX" --mtu "$TUN_MTU" -k "$KEY_PATH" --transport both)
+      --prefix "$TUN_PREFIX" --mtu "$TUN_MTU" -k "$KEY_PATH" --transport "$TRANSPORT")
 if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
     ARGS+=(--max-clients "$MAX_CLIENTS")
 fi
@@ -593,7 +593,7 @@ if [ "$DAEMON" = "1" ]; then
         exit 1
     fi
     rm -f "$STOP_FLAG" "$VPID_FILE"
-    ARGS_STR="-l $LISTEN_IP -p $VPN_PORT -n $TUN_NAME -a $TUN_IP --prefix $TUN_PREFIX --mtu $TUN_MTU -k $KEY_PATH --transport both"
+    ARGS_STR="-l $LISTEN_IP -p $VPN_PORT -n $TUN_NAME -a $TUN_IP --prefix $TUN_PREFIX --mtu $TUN_MTU -k $KEY_PATH --transport $TRANSPORT"
     if [ -n "$MAX_CLIENTS" ] && [ "$MAX_CLIENTS" -gt 0 ] 2>/dev/null; then
         ARGS_STR="$ARGS_STR --max-clients $MAX_CLIENTS"
     fi

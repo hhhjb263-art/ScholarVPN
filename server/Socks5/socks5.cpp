@@ -121,12 +121,21 @@ bool Socks5Proxy::start(const std::string& bind_ip, uint16_t port,
     int reuse = 1;
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
+    // 本监听面是 AF_INET：把 "localhost" / "::1" 归一化成 127.0.0.1。
+    // 否则上面的回环判定（loopback）认了这两个写法，这里 inet_pton(AF_INET,...)
+    // 却必然失败 → 代理入口直接起不来（表现为"配了 localhost 就没监听"）。
+    std::string bind_ip4 = m_bind_ip;
+    if (bind_ip4.empty() || bind_ip4 == "0.0.0.0") {
+        bind_ip4 = "0.0.0.0";
+    } else if (bind_ip4 == "localhost" || bind_ip4 == "::1") {
+        bind_ip4 = "127.0.0.1";
+    }
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(m_port);
-    if (m_bind_ip == "0.0.0.0") {
+    if (bind_ip4 == "0.0.0.0") {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (inet_pton(AF_INET, m_bind_ip.c_str(), &addr.sin_addr) != 1) {
+    } else if (inet_pton(AF_INET, bind_ip4.c_str(), &addr.sin_addr) != 1) {
         fprintf(stderr, "[SOCKS5] 非法绑定地址 %s\n", m_bind_ip.c_str());
         ::close(m_listen_fd);
         m_listen_fd = -1;
@@ -303,6 +312,14 @@ void Socks5Proxy::handle_conn(int fd, const std::string& peer_ip, const std::str
     // ---- 阶段1：方法协商 ----
     uint8_t hdr[2] = {0};
     if (!read_full(fd, hdr, 2, kHandshakeTimeoutMs) || hdr[0] != kVer5) {
+        // 版本字节不是 0x05：多半是"把 VPN 客户端/其它协议接到了 SOCKS5 端口"
+        size_t suppressed = 0;
+        if (m_log_limiter->allow(proxy_common::now_ms(), &suppressed)) {
+            fprintf(stderr, "[SOCKS5] %s 收到非 SOCKS5 数据（首字节 0x%02X）。"
+                            "若这是 VPN 客户端，请把它的端口改回隧道端口（默认 51820）"
+                            "（已抑制 %zu 条同类日志）\n",
+                    sanitize_for_log(peer).c_str(), static_cast<unsigned>(hdr[0]), suppressed);
+        }
         ::close(fd);
         m_conns.fetch_sub(1);
         return;

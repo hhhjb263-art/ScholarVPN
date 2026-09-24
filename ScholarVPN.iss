@@ -1,71 +1,83 @@
 ; ============================================================
-; ScholarVPN å®¢æˆ·ç«¯å®‰è£…è„šæœ¬ï¼ˆInno Setup 6ï¼‰
-; ç”¨æ³•ï¼ˆä¸‰æ­¥ï¼Œæˆ–ç›´æ¥è¿è¡Œ scripts\package.bat ä¸€é”®å®Œæˆï¼‰ï¼š
+; ScholarVPN ¿Í»§¶Ë°²×°½Å±¾ (Inno Setup 6)
+; Ê¹ÓÃ·½·¨(Èı²½£¬»òÕßÖ±½ÓÔËĞĞ scripts\package.bat Ò»¼üÍê³É):
 ;   1) MSBuild VPN_.sln /p:Configuration=Release /p:Platform=x64
-;   2) windeployqt x64\Release\ScholarVPN.exe        ï¼ˆæ”¶é›†å…¨éƒ¨ Qt ä¾èµ–ï¼‰
-;   3) ISCC.exe ScholarVPN.iss                       ï¼ˆç”Ÿæˆ x64\Release\ScholarVPNsetup.exeï¼‰
-; ç›®æ ‡æœºå™¨æ— éœ€å®‰è£…ä»»ä½•è¿è¡Œç¯å¢ƒï¼šQt/OpenSSL/Wintun åŠæ’ä»¶å…¨éƒ¨éšåŒ…å®‰è£…ã€‚
+;   2) windeployqt x64\Release\ScholarVPN.exe        ;ÊÕ¼¯È«²¿ Qt ÒÀÀµ
+;   3) ISCC.exe ScholarVPN.iss                       ;Éú³É x64\Release\ScholarVPNsetup.exe
+; Ä¿±ê»úÆ÷ÎŞĞè°²×°ÈÎºÎÔËĞĞ»·¾³£¬Qt/OpenSSL/Wintun ÒÔ¼°²å¼şÈ«²¿Ëæ°ü°²×°¡£
 ; ============================================================
-
 #define MyAppName "ScholarVPN"
 #define MyAppVersion "1.5"
 #define MyAppPublisher "ScholarVPN"
 #define MyAppExeName "ScholarVPN.exe"
 
 [Setup]
-; AppId å•ç‹¬æ ‡è¯†æœ¬åº”ç”¨ï¼Œå‹¿ä¸å…¶ä»–å®‰è£…ç¨‹åºå…±ç”¨
+; AppId Î¨Ò»±êÊ¶±¾Ó¦ÓÃ£¬²»ÒªºÍÆäËü°²×°³ÌĞò¹²ÓÃ
 AppId={{CECB2BA2-256E-4200-802E-FA3D2AEBB0F7}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-; ç¨‹åºè¦å»º TUN ç½‘å¡/æ”¹è·¯ç”±/æ”¹ DNS/å†™æ³¨å†Œè¡¨ï¼Œå¿…é¡»ç®¡ç†å‘˜
+
+; ³ÌĞòĞèÒª´´½¨ TUN Íø¿¨/ĞŞ¸ÄÂ·ÓÉ/ĞŞ¸ÄDNS/Ğ´×¢²á±í£¬±ØĞë¹ÜÀíÔ±È¨ÏŞ
 PrivilegesRequired=admin
-; ä»… 64 ä½
+
+; ½ö64Î»ÏµÍ³
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
+
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 UsedUserAreasWarning=no
 UninstallDisplayIcon={app}\{#MyAppExeName}
-; è¾“å‡ºç›®å½•ä¸æ–‡ä»¶å
+
+; Êä³öÄ¿Â¼ÓëÎÄ¼şÃû
 OutputDir=x64\Release
 OutputBaseFilename=ScholarVPNsetup
-; å®‰è£…åŒ…å›¾æ ‡
-SetupIconFile=source\icon.ico
+
+; °²×°°üÍ¼±ê
+SetupIconFile="D:\Vis  c++\ScholarVPN\source\icon.ico"
+
+
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 
 [Languages]
-; ä¸­æ–‡ç‰ˆ Inno Setupï¼šDefault.isl å³ç®€ä½“ä¸­æ–‡
+; ¼òÌåÖĞÎÄ Inno Setup£¬Default.isl ¾ÍÊÇ¼òÌåÖĞÎÄ
 Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; ä¸»ç¨‹åº
+; Ö÷³ÌĞò
 Source: "x64\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-; Qt è¿è¡Œåº“ï¼ˆwindeployqt æ”¶é›†ï¼‰
+
+; Qt ÔËĞĞ¿â (windeployqt ÊÕ¼¯)
 Source: "x64\Release\Qt6Core.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\Qt6Gui.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\Qt6Widgets.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\Qt6Network.dll"; DestDir: "{app}"; Flags: ignoreversion
-; OpenGL è½¯æ¸²æŸ“å›é€€ï¼ˆæ— æ˜¾å¡é©±åŠ¨çš„æœºå™¨ä¹Ÿèƒ½æ˜¾ç¤ºç•Œé¢ï¼‰
+
+; OpenGL ÈíäÖÈ¾»ØÍË£¬ÎŞÏÔ¿¨Çı¶¯µÄ»úÆ÷Ò²ÄÜÏÔÊ¾½çÃæ
 Source: "x64\Release\D3Dcompiler_47.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\opengl32sw.dll"; DestDir: "{app}"; Flags: ignoreversion
-; OpenSSL åŠ å¯†åº“ + Wintun é©±åŠ¨
+
+; OpenSSL¼ÓÃÜ¿â + WintunÇı¶¯
 Source: "x64\Release\libcrypto-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
-; Qt å¹³å°æ’ä»¶ï¼ˆç¼ºäº†ç¨‹åºæ— æ³•å¯åŠ¨ï¼‰
+
+; QtÆ½Ì¨²å¼ş£¬È±ÉÙ³ÌĞòÎŞ·¨Æô¶¯
 Source: "x64\Release\platforms\*"; DestDir: "{app}\platforms"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Qt å…¶ä½™æ’ä»¶ï¼ˆæ ·å¼/å›¾åƒæ ¼å¼/å›¾æ ‡å¼•æ“/TLS/ç½‘ç»œä¿¡æ¯ï¼‰
+
+; QtÆäÓà²å¼ş(ÑùÊ½¡¢Í¼Ïñ¸ñÊ½¡¢Í¼±êÒıÇæ¡¢TLS¡¢ÍøÂçĞÅÏ¢)
 Source: "x64\Release\styles\*"; DestDir: "{app}\styles"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\imageformats\*"; DestDir: "{app}\imageformats"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\iconengines\*"; DestDir: "{app}\iconengines"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\tls\*"; DestDir: "{app}\tls"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\networkinformation\*"; DestDir: "{app}\networkinformation"; Flags: ignoreversion recursesubdirs createallsubdirs
-; å…¨å±€æ ·å¼è¡¨
+
+; È«¾ÖÑùÊ½±í
 Source: "x64\Release\style.qss"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -76,5 +88,6 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; å¸è½½é»˜è®¤ä¿ç•™ %APPDATA%\ScholarVPNï¼ˆç”¨æˆ·é…ç½®ä¸èº«ä»½å¯†é’¥ï¼‰ï¼›è¦å½»åº•æ¸…é™¤å¯å»æ‰ä¸‹ä¸€è¡Œæ³¨é‡Šï¼š
+; Ğ¶ÔØÄ¬ÈÏ±£Áô %APPDATA%\ScholarVPN(ÓÃ»§ÅäÖÃÓëÉí·İÃÜÔ¿)
+; ĞèÒª³¹µ×Çå³ı¿ÉÒÔÈ¡ÏûÏÂÃæÒ»ĞĞ×¢ÊÍ
 ; Type: filesandordirs; Name: "{userappdata}\ScholarVPN"

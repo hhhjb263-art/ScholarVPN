@@ -193,6 +193,15 @@ struct Session
     std::atomic<bool> enc_ready{ false };
     std::atomic<bool> authenticated{ false };
     std::atomic<bool> handshaked{ false };
+    // 会话已下线（release_session 置位，不可逆）：用于兜住"会话已从会话表摘除、
+    // 但 TCP 连接还挂着几十毫秒"的窗口——期间到达的帧必须直接丢弃，否则一个
+    // 明文 auth_hello 就能让僵尸会话重新走完握手、再拿一个虚拟 IP（池里泄漏一个地址）
+    std::atomic<bool> released{ false };
+    // 已签名的 ServerHello 载荷缓存（nonce_s || dh_srv_pub || sig_srv，只含公开数据）。
+    // 未认证会话的 auth_hello 重传每 500ms 一次，原先每次都重新做 Ed25519 签名
+    // （伪造源地址狂刷可以放大成 CPU 消耗）；Ed25519 是确定性签名，同一会话的
+    // nonce_s/dh_srv_pub 不变 → 缓存后重传只做"查表 + 重发"。新 nonce 重置时清空。
+    std::vector<uint8_t> server_hello_payload;
 
     PacketQueue send_queue;           // 本会话待发数据（TUN 下行，明文 IP 包）
     std::mutex send_mutex;            // 发送串行化（多个线程可能同时发送）；
@@ -206,6 +215,13 @@ struct Session
     size_t tcp_tx_bytes = 0;          // 仅在 tcp_tx_mutex 内读写
     std::atomic<uint32_t> seq{ 0 };
     ReplayWindow replay;              // 上行密文帧反重放滑窗（验签成功后提交）
+    // "拒绝上行数据包"日志的已打印次数（限流用）：客户端网卡残留旧虚拟 IP 时会
+    // 持续发错源地址，每个包都打日志会把日志刷爆、淹没真实告警。每会话只详报几条。
+    std::atomic<uint32_t> src_reject_logged{ 0 };
+    // "密文帧认证失败"日志的已打印次数（限流用）：密钥不匹配（如客户端实例残帧、
+    // 会话被踢后旧连接的余包）会持续解密失败。原先完全静默，两侧都表现为
+    // "对端不可达"，排查时无法区分"没收到"和"收到了但解不开"
+    std::atomic<uint32_t> auth_fail_logged{ 0 };
 
     std::atomic<int64_t> last_rx_ms{ 0 };     // 最近收到【已认证】对端报文的时间
     std::atomic<int64_t> created_at_ms{ 0 };  // 会话创建时间（握手超时清理用）

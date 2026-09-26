@@ -132,6 +132,10 @@ protected:
     std::atomic<bool> m_enc_ready{ false };     // 密钥派生完成（阶段2 结束）
     ReplayWindow m_replay;                      // 下行（对端→本端）密文帧反重放滑窗
                                                 // （handle_frame 仅 recv 线程执行，天然串行）
+    // 静默丢帧的限流日志计数（每实例只详报前几条）：GCM 认证失败与反重放拒绝原先
+    // 完全静默，日志里"密钥不匹配/被丢弃"与"对端不可达"无法区分，排查极易走偏
+    std::atomic<uint32_t> m_auth_fail_logged{ 0 };
+    std::atomic<uint32_t> m_replay_reject_logged{ 0 };
 protected:
     // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 tunnel_protoco.h（两端一致）；
     // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限

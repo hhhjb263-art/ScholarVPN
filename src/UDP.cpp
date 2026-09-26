@@ -618,6 +618,16 @@ void UDP::send_work()
 					m_need_reconnect.store(true);
 					break;
 				}
+				// 同时重传 auth_client_hello（本端临时 DH 公钥）：这一帧只在阶段1b
+				// 发过一次，UDP 上丢一次，服务端就永远派生不出会话密钥（s.enc_ready
+				// 恒为 false），之后所有密文帧——包括身份报文——都被服务端在解密
+				// 之前丢弃，表现为 5s 握手超时后断开重连，且每次重连都重演。
+				// 服务端对该帧有阶段机保护（非 HELLO 阶段直接拒绝，不会覆盖已派生
+				// 密钥），所以重传是幂等且安全的。
+				if (!m_dh_cli_pub.empty()) {
+					send_packet(static_cast<uint8_t>(m_auth_client_hello),
+						m_dh_cli_pub.data(), m_dh_cli_pub.size(), sendbuf);
+				}
 				send_packet(static_cast<uint8_t>(m_identity), identity_msg.data(), identity_msg.size(), sendbuf);
 				last_id = now;
 			}
@@ -660,10 +670,14 @@ void UDP::send_work()
 			send_packet(static_cast<uint8_t>(m_heart), nullptr, 0, sendbuf);
 			last_heart = now;
 		}
-		// 心跳超时：超过 kHeartbeatTimeout 未收到对端任何报文 -> 判定链路失效
+		// 心跳超时：超过 kHeartbeatTimeout 未收到【能通过认证的】对端报文 -> 判定链路失效
 		if (m_last_rx_ms.load() != 0 &&
 			now - std::chrono::steady_clock::time_point(std::chrono::milliseconds(m_last_rx_ms.load())) > kHeartbeatTimeout) {
-			LOG_ERR("[UDP] heartbeat timeout, peer unreachable, reconnecting\n");
+			// 注意措辞：这条不等于"对端不可达"——本端解密失败或被反重放窗口丢弃的帧
+			// 同样不刷新存活时间（上面两条限流日志会给出真正原因），故两者都列出
+			LOG_ERR("[UDP] heartbeat timeout: %lldms 内未收到任何通过认证的对端报文"
+				"（对端不可达，或本端解密失败/被反重放丢弃），重连\n",
+				static_cast<long long>(kHeartbeatTimeout.count() * 1000));
 			m_need_reconnect.store(true);
 			break;
 		}
@@ -807,11 +821,26 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			}
 			if (plain_len == 0)
 			{
-				return; // 认证失败，静默丢弃（不推进窗口、不刷新存活）
+				// 认证失败（GCM tag 不匹配 / 密钥不一致）：不推进窗口、不刷新存活。
+				// 限流报前 3 条——静默丢弃会让"密钥/帧有问题"看起来和"对端不可达"一样
+				const uint32_t n = m_auth_fail_logged.fetch_add(1);
+				if (n < 3)
+				{
+					LOG_ERR("[UDP] 收到的密文帧认证失败（密钥不匹配/帧被篡改），丢弃%s",
+						(n == 2) ? "（同类日志已抑制）" : "");
+				}
+				return;
 			}
 			// 验证通过才提交反重放窗口 + 刷新存活时间
 			if (!m_replay.accept(seq_host)) {
-				return;   // 重放帧：静默丢弃
+				// 重放/乱序过旧帧：静默丢弃会让"被丢帧"看起来像"对端不可达"
+				const uint32_t n = m_replay_reject_logged.fetch_add(1);
+				if (n < 3)
+				{
+					LOG_ERR("[UDP] 帧被反重放窗口拒绝（seq=%u），丢弃%s",
+						seq_host, (n == 2) ? "（同类日志已抑制）" : "");
+				}
+				return;
 			}
 			m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 			if (plain_len < 1)
@@ -913,8 +942,12 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 				sig_ok = false;
 			}
 			if (!sig_ok) {
-				// 中间人攻击：服务器签名校验失败，直接断开
-				LOG_ERR("[UDP] SIG_SRV_PUB 验签失败：无法确认服务器身份，断开连接\n");
+				// 可能是中间人，也可能是"用来验签的公钥与服务器身份不一致"
+				//（服务器条目留空 ServerPubKey 时用的是内置固定公钥；
+				//  服务器换了身份密钥也会这样）。两种都表现为握手刚起步就断开
+				LOG_ERR("[UDP] SIG_SRV_PUB 验签失败：无法确认服务器身份，断开连接\n"
+					"      请核对本条目是否配了正确的 ServerPubKey（留空 = 用内置固定公钥），\n"
+					"      以及服务端 keys/server_sig.pub 是否与之一致（服务端启动日志会打印指纹）\n");
 				m_auth_failed.store(true);
 				break;
 			}

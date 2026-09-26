@@ -88,6 +88,13 @@ private:
     uint32_t allocate_virtual_ip();
     void release_virtual_ip(uint32_t ip);
 
+    // 握手重算限速（令牌桶，按来源 IP）：只有"需要重算握手"的 auth_hello
+    // （携带新 nonce → 要生成临时 X25519 密钥对 + Ed25519 签名）才消耗令牌；
+    // 同一 nonce 的重传走幂等分支（查表 + 重发缓存），合法客户端不受影响。
+    // 用途：把"伪造源地址狂刷 new-nonce auth_hello"能烧掉的 CPU / 反射放大
+    // 限制在可控范围。@return false = 超出速率，丢弃本帧（不回包）
+    bool allow_handshake_recompute(uint32_t ip_net);
+
     // 认证处理（仅在 recv 线程执行）
     void handle_auth_hello(Session& s, const uint8_t* payload, size_t len);
     void handle_auth_client_hello(Session& s, const uint8_t* payload, size_t len);
@@ -130,6 +137,17 @@ private:
     mutable std::mutex m_vip_mutex;
     std::unordered_map<uint32_t, std::string> m_vip_to_key;
     std::shared_ptr<VirtualIpPool> m_ip_pool;
+
+    // 握手重算限速表（来源 IP 网络序 → 令牌桶）；见 allow_handshake_recompute。
+    // logged 只为"每条 IP 最多打 3 条日志"限流用，避免被刷屏
+    struct HandshakeRateBucket
+    {
+        double tokens{ 0.0 };
+        int64_t last_ms{ 0 };
+        uint32_t logged{ 0 };
+    };
+    std::mutex m_hs_rl_mutex;
+    std::unordered_map<uint32_t, HandshakeRateBucket> m_hs_rl;
 
     // 队列消费者唤醒（m_wake_mutex 保护两个唤醒标志，杜绝丢失唤醒）
     std::mutex m_wake_mutex;

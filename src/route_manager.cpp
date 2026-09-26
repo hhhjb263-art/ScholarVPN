@@ -74,6 +74,26 @@ bool RouteManager::add_default_route(uint32_t metric)
 	return add_tunnel_route(L"0.0.0.0",0,metric);
 }
 
+// IPv6 kill-switch：::/0 也指向 TUN（下一跳 ::，on-link）。
+// TUN 上没有 IPv6 地址 → 系统发不出去（等效黑洞）；客户端 tun→udp 方向
+// 只转发 IPv4，这些包在本地被丢弃（ClientApp::tun_to_udp_loop），
+// 应用侧快速失败后回落 IPv4。目的：避免 V6 优先流量绕过隧道泄漏真实出口 IP。
+bool RouteManager::add_ipv6_default_route(uint32_t metric)
+{
+	if (m_tunnelLuid.Value == 0) {
+		::SetLastError(ERROR_INVALID_HANDLE);
+		return false;
+	}
+	MIB_IPFORWARD_ROW2 row{};
+	InitializeIpForwardEntry(&row);
+	row.InterfaceLuid = m_tunnelLuid;
+	row.DestinationPrefix.Prefix.si_family = AF_INET6;
+	row.DestinationPrefix.PrefixLength = 0;          // ::/0
+	row.NextHop.si_family = AF_INET6;                // 下一跳 ::（on-link）
+	row.Metric = metric;
+	return create_route(row);
+}
+
 bool RouteManager::add_server_bypass_route(const std::wstring& serverIp)
 {
 	SOCKADDR_INET destination{};
@@ -103,8 +123,13 @@ void RouteManager::remove_default_route() noexcept
 {
 	for (auto it = m_createdRoutes.rbegin(); it != m_createdRoutes.rend(); ++it)
 	{
-		// 默认路由 = 目的前缀 0.0.0.0/0
+		// 默认路由 = 目的前缀 0.0.0.0/0。
+		// 必须显式判地址族：IPv6 kill-switch 路由（::/0）的 PrefixLength 同样为 0、
+		// 且共用同一 union 的那 4 字节也是 0，只按"前缀长度 0 + 地址为 0"匹配会把
+		// 它误删（它是后加的、rbegin 先命中）——那样重连时 IPv4 默认路由反而留在
+		// 网卡上，断线后全流量仍进 TUN = 黑洞。
 		if (it->DestinationPrefix.PrefixLength == 0 &&
+			it->DestinationPrefix.Prefix.si_family == AF_INET &&
 			it->DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr == 0)
 		{
 			::DeleteIpForwardEntry2(&(*it));

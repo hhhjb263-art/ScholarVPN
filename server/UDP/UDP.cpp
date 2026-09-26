@@ -60,9 +60,22 @@ static bool with_token_lock(const std::string& tokens_path,
 constexpr auto kHeartbeatInterval = std::chrono::seconds(10);   // 每 10s 发一次心跳
 constexpr auto kHeartbeatTimeout  = std::chrono::seconds(30);   // 30s 未收到对端任何报文判失联
 // 未认证（pending）会话独立防护：客户端连接失败/重试风暴不能占满整张会话表
-constexpr auto kHandshakeTimeout  = std::chrono::seconds(10);   // 未认证会话 10s 未完成握手即清理
+// 30s（原 10s）太紧：整条握手链要跑 auth_hello→ServerHello→auth_client_hello
+// →identity（再回 identity_ok），手机在移动网下 RTT 常达 2~4s、还有丢包重传，
+// 实测一次成功握手要 3~4s（日志里 22411 会话重传 7 轮才走完），10s 会把
+// 慢链路客户端的会话在握手途中清掉——客户端随后拿着旧 nonce 继续握手，
+// 服务端已是新会话（新 nonce），最终"会话上下文不匹配"被拒。
+// 放宽后资源仍受限：未认证会话另有 32 条全局配额 + 每源 3 条上限（超限先淘汰
+// 最早的未认证会话），单个手机重连风暴最多占 3 条 pending。
+constexpr auto kHandshakeTimeout  = std::chrono::seconds(30);   // 未认证会话 30s 未完成握手即清理
 constexpr size_t kMaxPendingSessions = 32;                      // 未认证会话独立配额（不挤占已认证容量）
 constexpr size_t kMaxSessionsPerIp   = 3;                       // 每来源 IP 最多同时持有的会话数
+
+// 单套会话密钥的寿命上限（毫秒）：到期由 heartbeat_work 主动换会话（客户端重连
+// 即重新握手、全新密钥）。本协议没有 in-protocol rekey，用这条给前向安全窗口
+// 设上界——否则一条长连接（序号上限 2^31 包 ≈ 3TB）可以用同一套密钥跑很多天。
+// 24h 一次、重连约 0.3s，对使用者几乎无感。
+constexpr uint64_t kSessionMaxLifetimeMs = 24ull * 60ull * 60ull * 1000ull;
 
 // 当前 steady_clock 毫秒时间戳
 uint64_t now_ms()
@@ -174,10 +187,23 @@ std::shared_ptr<Session> UDP::get_or_create_session(const sockaddr_in& addr, boo
                 ip.c_str(), oldestPendingKey.c_str());
         // 淘汰必须走统一断开流程：被淘汰的 TCP 会话置 tcp_drop 交 epoll
         // 线程 close（否则连接滞留在 TCPServer 内，逃过心跳/握手超时清理，
-        // 持续消耗 fd 与内存）；UDP 会话无连接，仅摘表
+        // 持续消耗 fd 与内存）；UDP 会话无连接，仅摘表。
+        // 注意：本函数持有 m_sessions_mutex，不能直接调 release_session（会自锁），
+        // 因此在这里补上同样的收尾——归还虚拟 IP + 置失效标志。否则"已分配 IP 但
+        // handshaked 尚未置位"的会话被摘表后，那个地址会永远留在池里（慢慢耗尽
+        // /24 地址池，最终所有新连接都拿不到 IP = 连不上）
         auto victim = m_sessions[oldestPendingKey];
-        if (victim && victim->is_tcp)
-            victim->tcp_drop.store(true);
+        if (victim) {
+            if (victim->is_tcp)
+                victim->tcp_drop.store(true);
+            if (victim->ip_assigned && victim->virtual_ip != 0)
+                release_virtual_ip(victim->virtual_ip);
+            victim->released.store(true);
+            victim->enc_ready.store(false);
+            victim->authenticated.store(false);
+            victim->handshaked.store(false);
+            victim->hs_stage.store(HS_STAGE_NONE);
+        }
         m_sessions.erase(oldestPendingKey);
     }
 
@@ -207,6 +233,11 @@ void UDP::release_session(const std::string& key)
     if (victim->ip_assigned && victim->virtual_ip != 0) {
         release_virtual_ip(victim->virtual_ip);
     }
+    // 摘表后立刻让会话"失效"：released 让后续帧在下发入口直接丢弃（TCP 连接可能
+    // 还挂着几十毫秒），enc_ready=false 让密文帧连解密都不做——否则僵尸会话能重新
+    // 走完握手再占一个虚拟 IP（池泄漏），或与踢它的新会话抢同一个地址
+    victim->released.store(true);
+    victim->enc_ready.store(false);
     victim->authenticated.store(false);
     victim->handshaked.store(false);
     victim->hs_stage.store(HS_STAGE_NONE);
@@ -231,6 +262,60 @@ void UDP::release_virtual_ip(uint32_t ip)
     }
     if (m_ip_pool)
         m_ip_pool->release(ip);
+}
+
+// 握手重算限速（令牌桶，按来源 IP 网络序）。
+// 只有"新 nonce 的 auth_hello"会走到调用点：它要生成临时 X25519 密钥对 +
+// 做一次 Ed25519 签名（都是 CPU 开销），伪造源地址狂刷这类包既是 CPU 放大，
+// 也是"小请求换大响应"的反射放大（28B 请求 → 124B ServerHello，约 4.4×）。
+// 同一 nonce 的重传走幂等分支（查表 + 重发缓存的 ServerHello），不消耗令牌，
+// 所以合法客户端 500ms 重传完全不受影响；正常客户端每次连接最多消耗 1 个令牌。
+// 参数取 20 次/秒、突发 40：人类操作/客户端重连（最多几秒一次）永远打不到，
+// 单 IP 的自动化洪泛被压到每秒 20 次以内（分布式洪泛需上游清洗，见 README 部署建议）。
+bool UDP::allow_handshake_recompute(uint32_t ip_net)
+{
+    constexpr double kRatePerSec = 20.0;
+    constexpr double kBurst = 40.0;
+    const int64_t now = static_cast<int64_t>(now_ms());
+
+    std::lock_guard<std::mutex> lock(m_hs_rl_mutex);
+    // 表大小兜底：恶意源 IP 太多时清掉闲置项，仍过大就整体清空（等价全部重新给满桶），
+    // 保证限速表本身不会被撑爆内存
+    if (m_hs_rl.size() > 4096) {
+        for (auto it = m_hs_rl.begin(); it != m_hs_rl.end(); ) {
+            if (now - it->second.last_ms > 10000)
+                it = m_hs_rl.erase(it);
+            else
+                ++it;
+        }
+        if (m_hs_rl.size() > 4096)
+            m_hs_rl.clear();
+    }
+    auto& b = m_hs_rl[ip_net];
+    if (b.last_ms == 0) {
+        b.tokens = kBurst;   // 首次见到的来源：满桶
+        b.last_ms = now;
+    }
+    const double elapsed = static_cast<double>(now - b.last_ms) / 1000.0;
+    b.tokens += elapsed * kRatePerSec;
+    if (b.tokens > kBurst)
+        b.tokens = kBurst;
+    b.last_ms = now;
+    if (b.tokens < 1.0) {
+        ++b.logged;
+        // 每 IP 最多报 3 条，避免被刷屏
+        if (b.logged <= 3) {
+            char ipstr[INET_ADDRSTRLEN] = {0};
+            struct in_addr a{};
+            a.s_addr = ip_net;
+            inet_ntop(AF_INET, &a, ipstr, sizeof(ipstr));
+            fprintf(stderr, "[UDP][AUTH] 握手重算限速命中，丢弃来自 %s 的 auth_hello%s\n",
+                    ipstr, (b.logged == 3) ? "（同类日志已抑制）" : "");
+        }
+        return false;
+    }
+    b.tokens -= 1.0;
+    return true;
 }
 
 // 生命周期
@@ -619,6 +704,47 @@ static bool tunnel_packet_source_ok(const Session& s, const std::vector<uint8_t>
     return s.ip_assigned && src == s.virtual_ip;
 }
 
+// 被 tunnel_packet_source_ok 拒绝的【具体原因】（只在拒绝路径调用，不在热路径）：
+// 把"源地址不等于本会话虚拟 IP"与"包本身不合法（非 IPv4 / IHL / 总长字段）"分开报。
+// 两种原因原先共用一条"拒绝冒用源地址"日志，排查时会把方向带偏——看到它未必是
+// 源地址问题，也可能是客户端把非 IPv4 包塞进了隧道。
+static std::string tunnel_packet_reject_reason(const Session& s, const std::vector<uint8_t>& pkt)
+{
+    auto ip4 = [](uint32_t net_order_ip) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(&net_order_ip);
+        char out[16] = {0};
+        std::snprintf(out, sizeof(out), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        return std::string(out);
+    };
+    char buf[192] = {0};
+    if (pkt.size() < 20) {
+        std::snprintf(buf, sizeof(buf), "包过短（%zu 字节，不足 IPv4 最小头 20）", pkt.size());
+    } else if ((pkt[0] >> 4) != 4) {
+        std::snprintf(buf, sizeof(buf), "非 IPv4 包（version=%u，%zu 字节）",
+                      static_cast<unsigned>(pkt[0] >> 4), pkt.size());
+    } else if ((pkt[0] & 0x0F) < 5 || static_cast<size_t>(pkt[0] & 0x0F) * 4 > pkt.size()) {
+        std::snprintf(buf, sizeof(buf), "IPv4 头长度非法（IHL=%u，实际 %zu 字节）",
+                      static_cast<unsigned>(pkt[0] & 0x0F), pkt.size());
+    } else {
+        const uint16_t total = static_cast<uint16_t>((pkt[2] << 8) | pkt[3]);
+        const uint16_t hdr_len = static_cast<uint16_t>((pkt[0] & 0x0F) * 4);
+        if (total < hdr_len || total > pkt.size()) {
+            std::snprintf(buf, sizeof(buf), "IPv4 总长字段与实际不符（total=%u，实际 %zu 字节）",
+                          static_cast<unsigned>(total), pkt.size());
+        } else {
+            uint32_t src = 0;
+            std::memcpy(&src, pkt.data() + 12, 4);
+            if (!s.ip_assigned) {
+                std::snprintf(buf, sizeof(buf), "本会话尚未分配虚拟 IP 却收到上行数据包");
+            } else {
+                std::snprintf(buf, sizeof(buf), "包内源地址=%s，本会话虚拟 IP=%s（源地址不匹配）",
+                              ip4(src).c_str(), ip4(s.virtual_ip).c_str());
+            }
+        }
+    }
+    return std::string(buf);
+}
+
 void UDP::reply_heartbeat(Session& s)
 {
     std::vector<uint8_t> sendbuf;
@@ -773,6 +899,11 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
         fprintf(stderr, "[UDP][RX] type=%d len=%zu from=%s (tcp=%d)\n",
                 hdr.type, pay_len, s.peer_key.c_str(), s.is_tcp ? 1 : 0);
     }
+    // 已下线会话（release_session 后 TCP 连接可能还挂着几十毫秒）：到达的帧一律丢弃。
+    // 否则一个明文 auth_hello 就能让僵尸会话重新走完握手、再占一个虚拟 IP
+    if (s.released.load()) {
+        return;
+    }
 
     // 期望的协议版本：按会话传输类型区分（错误传输的报文在此被丢弃）；
     // 传输类型随会话创建固定（会话键含协议，TCP/UDP 不会混用同一会话）
@@ -823,7 +954,14 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
             return;
         }
         if (plain_len == 0) {
-            return;   // 认证失败，静默丢弃（不推进窗口、不刷新存活）
+            // 认证失败（GCM tag 不匹配 / 密钥不一致）：不推进窗口、不刷新存活。
+            // 限流报前 3 条——静默丢弃会让"密钥不匹配"看起来和"对端不可达"一样
+            const uint32_t n = s.auth_fail_logged.fetch_add(1);
+            if (n < 3) {
+                fprintf(stderr, "[UDP] 密文帧认证失败（密钥不匹配/帧被篡改），丢弃 (%s)%s\n",
+                        s.peer_key.c_str(), (n == 2) ? "（同类日志已抑制）" : "");
+            }
+            return;
         }
         // 验证通过才提交窗口与存活时间（提交在单会话接收路径上天然串行）
         if (!s.replay.accept(seq_host)) {
@@ -847,7 +985,16 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
             {
                 std::vector<uint8_t> pkt(inner_data, inner_data + inner_len);
                 if (!tunnel_packet_source_ok(s, pkt)) {
-                    fprintf(stderr, "[UDP] 拒绝冒用源地址的数据包 (%s)\n", s.peer_key.c_str());
+                    // 限流：每会话最多详报 3 条（持续发错包时日志会被刷爆），
+                    // 但必须打出【具体原因】——是源地址不匹配，还是包本身不合法，
+                    // 决定了该改客户端网卡地址还是查客户端的发包路径
+                    const uint32_t n = s.src_reject_logged.fetch_add(1);
+                    if (n < 3) {
+                        const std::string why = tunnel_packet_reject_reason(s, pkt);
+                        fprintf(stderr, "[UDP] 拒绝上行数据包 (%s): %s%s\n",
+                                s.peer_key.c_str(), why.c_str(),
+                                (n == 2) ? "（同类日志已抑制）" : "");
+                    }
                     break;
                 }
                 if (m_queue_recv.push(packet_buffer(std::move(pkt))))
@@ -927,29 +1074,34 @@ void UDP::handle_auth_hello(Session& s, const uint8_t* payload, size_t len)
     }
 
     // 组装并发送 ServerHello：nonce_s || DH_SRV_EPHEM_PUB || sig_srv
+    // 签名结果按会话缓存（Ed25519 确定性签名，同会话 nonce/临时公钥不变）：
+    // 重传路径只做查表+重发，不再逐帧重算签名（见 Session::server_hello_payload）
     auto send_server_hello = [&]() -> bool {
-        // sig_payload = nonce_c || nonce_s || DH_SRV_EPHEM_PUB，用 SIG_SRV_PRI 签名
-        std::vector<uint8_t> sig_payload;
-        sig_payload.reserve(KAuthNonceLen * 2 + KAuthDhPubLen);
-        sig_payload.insert(sig_payload.end(), s.nonce_c.begin(), s.nonce_c.end());
-        sig_payload.insert(sig_payload.end(), s.nonce_s.begin(), s.nonce_s.end());
-        sig_payload.insert(sig_payload.end(), s.dh_srv_pub.begin(), s.dh_srv_pub.end());
-        std::vector<uint8_t> sig;
-        try {
-            sig = ed25519_sign(m_sig_priv.get(), sig_payload.data(), sig_payload.size());
-        } catch (const std::exception& e) {
-            fprintf(stderr, "[UDP][AUTH] 服务器签名失败: %s\n", e.what());
-            return false;
+        if (s.server_hello_payload.size() != KAuthServerHelloLen) {
+            // sig_payload = nonce_c || nonce_s || DH_SRV_EPHEM_PUB，用 SIG_SRV_PRI 签名
+            std::vector<uint8_t> sig_payload;
+            sig_payload.reserve(KAuthNonceLen * 2 + KAuthDhPubLen);
+            sig_payload.insert(sig_payload.end(), s.nonce_c.begin(), s.nonce_c.end());
+            sig_payload.insert(sig_payload.end(), s.nonce_s.begin(), s.nonce_s.end());
+            sig_payload.insert(sig_payload.end(), s.dh_srv_pub.begin(), s.dh_srv_pub.end());
+            std::vector<uint8_t> sig;
+            try {
+                sig = ed25519_sign(m_sig_priv.get(), sig_payload.data(), sig_payload.size());
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[UDP][AUTH] 服务器签名失败: %s\n", e.what());
+                return false;
+            }
+            if (sig.size() != KAuthSigLen)
+                return false;
+            s.server_hello_payload.clear();
+            s.server_hello_payload.reserve(KAuthServerHelloLen);
+            s.server_hello_payload.insert(s.server_hello_payload.end(), s.nonce_s.begin(), s.nonce_s.end());
+            s.server_hello_payload.insert(s.server_hello_payload.end(), s.dh_srv_pub.begin(), s.dh_srv_pub.end());
+            s.server_hello_payload.insert(s.server_hello_payload.end(), sig.begin(), sig.end());
         }
-        if (sig.size() != KAuthSigLen)
-            return false;
-        std::vector<uint8_t> reply;
-        reply.reserve(KAuthServerHelloLen);
-        reply.insert(reply.end(), s.nonce_s.begin(), s.nonce_s.end());
-        reply.insert(reply.end(), s.dh_srv_pub.begin(), s.dh_srv_pub.end());
-        reply.insert(reply.end(), sig.begin(), sig.end());
         std::vector<uint8_t> sendbuf;
-        return send_packet(s, static_cast<uint8_t>(m_auth_server_hello), reply.data(), reply.size(), sendbuf);
+        return send_packet(s, static_cast<uint8_t>(m_auth_server_hello),
+                           s.server_hello_payload.data(), s.server_hello_payload.size(), sendbuf);
     };
 
     // 已认证会话：拒绝一切明文握手——防止攻击者观察握手后注入明文报文
@@ -980,6 +1132,12 @@ void UDP::handle_auth_hello(Session& s, const uint8_t* payload, size_t len)
         return;
     }
 
+    // 走到这里 = 要为一个"新 nonce 的 auth_hello"重算握手（临时密钥对 + 签名）。
+    // 先过按源 IP 的令牌桶：合法客户端每次连接只消耗 1 个令牌（重传走上面的
+    // 幂等分支），伪造源地址狂刷则被压制，避免 CPU/反射放大
+    if (!allow_handshake_recompute(s.peer_addr.sin_addr.s_addr))
+        return;
+
     // 新会话：重置上一会话的认证/密钥状态（客户端重连时不复用旧密钥）
     if (s.dh_srv_priv != nullptr) {
         EVP_PKEY_free(s.dh_srv_priv);
@@ -987,6 +1145,7 @@ void UDP::handle_auth_hello(Session& s, const uint8_t* payload, size_t len)
     }
     secure_wipe(s.key_c2s);
     secure_wipe(s.key_s2c);
+    s.server_hello_payload.clear();   // 旧 ServerHello 签名缓存随 nonce/临时公钥一起作废
     s.enc_ready.store(false);
     s.authenticated.store(false);
     s.handshaked.store(false);
@@ -1076,8 +1235,22 @@ void UDP::handle_auth_client_hello(Session& s, const uint8_t* payload, size_t le
 //   5) 通过 → 分配虚拟 IP → 回 identity_ok（携带 [ip(4)][prefix(1)]）→ 放行
 void UDP::handle_identity(Session& s, const std::vector<uint8_t>& inner)
 {
-    // 已认证会话再次收到身份报文 = 客户端在首次成功确认前发出的重传，直接忽略。
+    // 已认证会话再次收到身份报文 = 客户端没收到上一次 identity_ok 的【重传】。
+    // 必须幂等重发 identity_ok，不能静默忽略：identity_ok 是单个报文（UDP 会丢），
+    // 一旦丢失，客户端按 500ms 间隔重传至 10 次 / 5s 超时 —— 那次握手必然失败，
+    // 表现为"连上（阶段2/3 走完）之后立刻断开重连"。阶段1 的 ServerHello 已是
+    // 幂等重发语义，阶段3 与此保持一致。
+    // 安全性：本帧先通过 AES-GCM 验证与反重放窗口才会走到这里（旧序号帧已在
+    // handle_framed 被丢弃），只有持有本会话密钥的合法客户端能触发，无放大风险。
     if (s.authenticated.load()) {
+        uint8_t resend_payload[5] = {0};
+        memcpy(resend_payload, &s.virtual_ip, 4);
+        resend_payload[4] = static_cast<uint8_t>(m_tun_prefix);
+        std::vector<uint8_t> resend_buf;
+        if (!send_packet(s, static_cast<uint8_t>(m_identity_ok), resend_payload,
+                         sizeof(resend_payload), resend_buf)) {
+            fprintf(stderr, "[UDP][AUTH] 重传 identity_ok 失败 (%s)\n", s.peer_key.c_str());
+        }
         return;
     }
     // identity_deny 携带 1 字节原因码（密文内层）：
@@ -1209,9 +1382,14 @@ void UDP::handle_identity(Session& s, const std::vector<uint8_t>& inner)
         }
         for (auto& victim : victims) {
             if (victim->is_tcp)
-                victim->tcp_drop.store(true);   // epoll 线程收尾时 close + release_session
-            else
-                release_session(victim->peer_key);
+                victim->tcp_drop.store(true);   // fd 由 epoll 线程统一 close
+            // 无论 TCP/UDP 都【立即】释放会话（含虚拟 IP）：下面几行就要给新会话
+            // 分配地址，若把 TCP 的释放推给事件线程下一轮，旧会话的 VIP 还占着，
+            // 新会话只能拿到另一个地址 → 客户端网卡跟着改地址，改地址瞬间发出的包
+            // 源地址还是旧 IP，会被源地址防伪校验丢掉（日志实证：连续重连时
+            // 分配结果在 10.8.0.2 / 10.8.0.3 之间来回跳）。
+            // release_session 幂等：事件线程收尾时再调一次不会重复释放。
+            release_session(victim->peer_key);
         }
     }
 
@@ -1300,6 +1478,23 @@ void UDP::heartbeat_work()
             if (last != 0 && (now - static_cast<uint64_t>(last)) > timeout_ms) {
                 destroy("heartbeat timeout");
                 continue;
+            }
+            // 会话密钥寿命上限：到点主动换会话（客户端重连 = 重新握手 = 全新密钥，
+            // 前向安全窗口从此有上界）。本协议没有 in-protocol rekey，只能这样折中：
+            // 先尽力发一条密文 disconnect 让客户端立刻重连，再按统一路径断开。
+            // 24h 一次、重连约 0.3s，对使用者几乎无感；断链窗口由客户端重连兜底。
+            {
+                const uint64_t age_ms = now - static_cast<uint64_t>(s->created_at_ms.load());
+                if (age_ms > kSessionMaxLifetimeMs) {
+                    fprintf(stderr, "[UDP] 会话时长达到上限（%llu 小时），换新会话重协商密钥: %s\n",
+                            static_cast<unsigned long long>(kSessionMaxLifetimeMs / 3600000ull),
+                            s->peer_key.c_str());
+                    std::vector<uint8_t> bye_buf;
+                    // 尽力而为：TCP 下由 epoll 线程本轮 pump_tx 先刷出再 close
+                    send_packet(*s, static_cast<uint8_t>(disconnect), nullptr, 0, bye_buf);
+                    destroy("会话时长上限");
+                    continue;
+                }
             }
             // 主动发送心跳
             std::vector<uint8_t> sendbuf;

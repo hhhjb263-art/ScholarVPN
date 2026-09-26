@@ -184,7 +184,15 @@ bool TCP::recv_frame(tunnel_header& hdr, const uint8_t*& payload,
 			return true;    // 超时：外层循环继续
 		}
 		if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-			LOG_INFO("[TCP] 连接已被服务端关闭，标记重连");
+			// 必须区分两种情况：本地 stop() 关闭 socket 时 WSAPoll 会返回 POLLNVAL，
+			// 与"对端真的关了/链路出错"共用一条日志时，本地断开会被误读成
+			// "服务端把我踢了"，排查方向直接跑偏（历史上已发生）
+			if ((pfd.revents & POLLNVAL) || !m_running.load()) {
+				LOG_INFO("[TCP] 本地已关闭 socket（停止/重连收尾），收包线程退出");
+				got = false;
+				return false;
+			}
+			LOG_INFO("[TCP] 对端关闭或连接错误（POLLERR/POLLHUP），标记重连");
 			m_need_reconnect.store(true);
 			got = false;
 			return false;
@@ -195,8 +203,8 @@ bool TCP::recv_frame(tunnel_header& hdr, const uint8_t*& payload,
 	// ③ recv 一段数据入缓冲
 	uint8_t tmp[KMax_packet_size];
 	int n = recv(m_sock, reinterpret_cast<char*>(tmp), static_cast<int>(sizeof(tmp)), 0);
-	if (n == 0) {           // 对端优雅关闭
-		LOG_INFO("[TCP] 连接已被服务端关闭，标记重连");
+	if (n == 0) {           // 对端优雅关闭（FIN）
+		LOG_INFO("[TCP] 对端已关闭连接（收到 FIN），标记重连");
 		m_need_reconnect.store(true);
 		got = false;
 		return false;

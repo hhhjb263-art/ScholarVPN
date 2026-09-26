@@ -366,7 +366,11 @@ void TCPServer::handle_accept()
 // 返回 false = 连接作废（对端关闭/致命错误/非法帧头），调用方 drop
 bool TCPServer::read_conn(int fd, Conn& c)
 {
-    std::vector<uint8_t> tmp(1441 + 64);
+    // 临时接收缓冲挂在连接上复用（原先每次调用新建一个 1.5KB vector：
+    // 这函数每收到一段数据就跑一次，是热路径上的堆分配/释放）
+    if (c.readTmp.size() < 1441 + 64)
+        c.readTmp.resize(1441 + 64);
+    std::vector<uint8_t>& tmp = c.readTmp;
     int frames = 0;
     for (;;) {
         const ssize_t n = recv(fd, tmp.data(), tmp.size(), 0);

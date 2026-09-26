@@ -48,6 +48,9 @@ private:
     {
         std::shared_ptr<Session> session;
         std::vector<uint8_t> rxBuf;
+        // recv() 的临时接收缓冲（每连接一个，复用）：这条路径每来一段数据就
+        // 走一次，原先每次调用都新建/释放一个 1.5KB vector（热路径堆分配）
+        std::vector<uint8_t> readTmp;
         // 待发缓冲：跨线程入队的已加密整帧 + 尚未写完的部分帧；
         // txOff = 已写出偏移。socket 满（EAGAIN）时订阅 EPOLLOUT 续写
         std::vector<uint8_t> txBuf;

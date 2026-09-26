@@ -6,7 +6,7 @@
 | 文件 | 说明 |
 |------|------|
 | `server_sig.key` | 服务器持久 Ed25519 身份私钥（SIG_SRV_PRI，敏感）。首次启动服务端时自动生成 |
-| `server_sig.pub` | 服务器身份公钥（SIG_SRV_PUB）。**请把其内容（含 BEGIN/END 行）硬编码进客户端** `src/main.cpp` 的 `kServerSigPubPem` 常量，客户端用它验证服务器签名、防中间人攻击 |
+| `server_sig.pub` | 服务器身份公钥（SIG_SRV_PUB）。**请把其内容（含 BEGIN/END 行）硬编码进客户端** `src/client/ClientApp.cpp` 的 `kServerSigPubPem` 常量（Debug/Release 两段都要改；不在 `src/main.cpp`，早期文档写错了），客户端用它验证服务器签名、防中间人攻击；各服务器条目自己的 `ServerPubKey` 优先于它，留空才用这个内置兜底值 |
 | `register_tokens.txt` | 一次性注册令牌库。管理员执行 `./build/vpn_server --gen-token [n]` 生成追加；客户端注册成功后自动移除作废 |
 | `registered_clients.txt` | 已注册客户端 Ed25519 公钥（每行一个 64 位十六进制）。登录模式下服务端据此比对放行 |
 

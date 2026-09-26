@@ -35,16 +35,22 @@ bool dpapi_unprotect(const std::vector<uint8_t>& enc, std::vector<uint8_t>& plai
     return true;
 }
 
-// 服务器身份公钥 SIG_SRV_PUB（硬编码编译进客户端）
-// 按构建配置区分：Debug 用本地测试服务器公钥；Release 用正式服务器公钥。
+// 服务器身份公钥 SIG_SRV_PUB（硬编码编译进客户端，作"服务器条目没填 ServerPubKey"
+// 时的兜底固定值）。按构建配置区分，目前 Debug/Release 都指向线上正式服务器。
+//
+// 历史坑：之前这两段是两把早已作废的旧服务器公钥（指纹 Release 4092aa67…、
+// Debug f80ef768…），与线上服务器实际身份（指纹 0ce5731a…，即下面这把）都不匹配。
+// 结果：任何留空 ServerPubKey 的服务器条目都会在阶段1 之后立刻"验签失败"断开，
+// 现象与"服务器把我踢了"一模一样。改服务器身份密钥时，这里和 config.ini 的
+// ServerPubKey 必须一起更新（可用 server/keys/server_sig.pub 的正文行）。
 #ifdef _DEBUG
 const std::string kServerSigPubPem = R"(-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA+A73aBlJFR3H7ozQ0os5SduqQIga6zIpfI5VSFlGE0A=
+MCowBQYDK2VwAyEADOVzGrvIQ/LWfUu9aatEdjKotXm2OXcy02/IJ/RqlcI=
 -----END PUBLIC KEY-----
 )";
 #else
 const std::string kServerSigPubPem = R"(-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAQJKqZ2TRYWoyzZynyNACpTZAUPPXVEPNsM8Vb1qpBCU=
+MCowBQYDK2VwAyEADOVzGrvIQ/LWfUu9aatEdjKotXm2OXcy02/IJ/RqlcI=
 -----END PUBLIC KEY-----
 )";
 #endif
@@ -406,6 +412,14 @@ bool ClientApp::start()
             {
                 m_route->add_server_bypass_route(to_wstring(m_remote));
                 m_route->add_default_route(m_cfg.Metric);
+                // 注意：**不要**在这里调用 add_ipv6_default_route()（::/0 kill-switch）。
+                // 2026-09-25 实测回归（Android 端同样现象）：把 ::/0 拉进 TUN 后，
+                // 我们的客户端只会本地静默丢弃这些 IPv6 包（tun_to_udp_loop 的
+                // IPv4-only 过滤），V6 优先的应用要等连接超时（10~20s）才回落 IPv4
+                // —— 表现为"连上了但很多应用打不开/很慢"。不接管 IPv6（走物理网卡）
+                // 后恢复正常。代价：IPv6 流量绕过隧道、泄漏真实出口 IP。
+                // 要既堵泄漏又不卡，正确做法是对 IPv6 包回 ICMPv6 Destination
+                // Unreachable / TCP RST，让应用快速失败——尚未实现（需真机验证）。
             }
             // 隧道已建立：此时才清物理网卡 DNS / 禁用多宿主解析（防泄漏），
             // 断线时由状态回调恢复，不会出现\"没连上却把系统 DNS/路由切走\"的黑洞。
@@ -423,23 +437,29 @@ bool ClientApp::start()
                               (ip >> 8) & 0xFF, ip & 0xFF);
                 const std::wstring wip = to_wstring(std::string(ipstr));
                 const uint8_t prefix = u->assigned_prefix();
-                if (wip != m_cfg.VirtualIP)
+                // 采用服务端分配的虚拟 IP 之前，先清掉本网卡上的【其它】IPv4 地址：
+                // Wintun 适配器是持久设备、地址跨进程保留，历次运行被分到不同虚拟 IP 时
+                // 网卡上会残留多个地址，Windows 选源地址可能挑到旧的那个，被服务端的
+                // 源地址防伪校验整片丢弃（现象：认证成功、显示已连接，却一个包都上不去）。
+                // 传 wip = 保留本次要用的地址本身：已在网卡上就不动它（不退掉再重加，
+                // 避免 set 失败后网卡没有任何地址），只清残留。
+                const int cleared = m_adapter->clear_IPv4_addresses(wip);
+                if (cleared > 0)
                 {
-                    if (!m_cfg.VirtualIP.empty())
-                    {
-                        m_adapter->remove_IPv4_address(m_cfg.VirtualIP,
-                                                       static_cast<uint8_t>(m_cfg.VirtualPrefix));
-                    }
-                    if (m_adapter->set_IPv4_address(wip, prefix))
+                    emit_log("[TUN] 已清理网卡上 %d 个遗留 IPv4 地址（防源地址不匹配）", cleared);
+                }
+                if (m_adapter->set_IPv4_address(wip, prefix))
+                {
+                    if (wip != m_cfg.VirtualIP)
                     {
                         m_cfg.VirtualIP = wip;
                         m_cfg.VirtualPrefix = prefix;
                         emit_log("[TUN] 已采用服务端分配的虚拟 IP: %s/%u", ipstr, static_cast<unsigned>(prefix));
                     }
-                    else
-                    {
-                        LOG_ERR("[TUN] 设置服务端分配的 IP 失败: %s/%u", ipstr, static_cast<unsigned>(prefix));
-                    }
+                }
+                else
+                {
+                    LOG_ERR("[TUN] 设置服务端分配的 IP 失败: %s/%u", ipstr, static_cast<unsigned>(prefix));
                 }
             }
             // 注册模式连上 = 注册成功：清空 RegisterToken，下次自动登录
@@ -521,6 +541,21 @@ void ClientApp::tun_to_udp_loop()
             uint8_t* pkt = m_tun->read_packet(&len);
             if (pkt && len > 0)
             {
+                // 只转发 IPv4：Wintun 网卡上还会有系统自己产生的 IPv6 链路本地报文
+                // （MLD/NDP 等 48~76 字节的控制报文），隧道的 tun 只配置了 IPv4，
+                // 塞进去只会被服务端逐包拒收（白耗上行 + 刷服务端日志）。本地丢弃。
+                if (len < 20 || (pkt[0] >> 4) != 4)
+                {
+                    m_tun->release_read_packet(pkt);
+                    const uint32_t n = m_nonIpv4Dropped.fetch_add(1);
+                    if (n < 3)
+                    {
+                        LOG_INFO("[TUN] 丢弃非 IPv4 报文（%u 字节，本隧道只承载 IPv4）%s",
+                                 static_cast<unsigned>(len),
+                                 (n == 2) ? "（同类日志已抑制）" : "");
+                    }
+                    continue;
+                }
                 m_txPkts.fetch_add(1);
                 m_txBytes.fetch_add(len);
                 packet_buffer buf(pkt, len);
@@ -671,11 +706,18 @@ void ClientApp::set_server(const ServerEntry& entry)
         m_serverSigPubPem = "-----BEGIN PUBLIC KEY-----\n"
                           + narrow(entry.ServerPubKey)
                           + "\n-----END PUBLIC KEY-----\n";
-        emit_log("已加载服务器公钥（用于验签防中间人）: %s", m_remote.c_str());
+        // 注意别再打 m_remote（服务器 IP）——历史上这里打的是 IP，看着像"公钥"，
+        // 排查时无法判断到底用的是哪把钥匙。实际指纹由 UDP::init 的
+        // "[Identity] 客户端验签用的服务器公钥指纹" 打印，可与服务端启动日志比对
+        emit_log("已应用服务器条目 %ls 配置的 ServerPubKey 验签", m_cfg.ServerIP.c_str());
     }
     else
     {
         m_serverSigPubPem = m_builtinServerSigPubPem;
+        // 兜底用的是编译进程序的固定公钥：它一旦与服务器实际身份不一致，
+        // 阶段1 就会验签失败并断开（现象酷似"被服务器踢掉"），必须显式提示
+        emit_log("服务器条目未配置 ServerPubKey，使用内置固定公钥验签"
+                 "（若与服务器身份不符会在握手时验签失败）");
     }
     emit_log("已选择服务器: %s:%u, ClientID=%s", m_remote.c_str(), static_cast<int>(m_port),
              narrow(m_cfg.ClientID).c_str());

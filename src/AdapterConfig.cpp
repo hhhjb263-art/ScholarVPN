@@ -91,7 +91,9 @@ bool AdapterConfig::remove_IPv4_address(const std::wstring &ipAdress, uint8_t pr
     }
     const NETIO_STATUS  status = ::DeleteUnicastIpAddressEntry(&row);
     if (status == NO_ERROR || status == ERROR_NOT_FOUND) {
-        LOG_INFO("CreateUnicastIpAddressEntry success err=%lu", status);
+        // 注意函数名：这里删地址，历史上错打成 "CreateUnicastIpAddressEntry success"，
+        // 日志里"多出一条创建成功"是假象（曾据此误判网卡上有两个地址）
+        LOG_INFO("DeleteUnicastIpAddressEntry success err=%lu", status);
         return true;
     }
     /*
@@ -103,6 +105,54 @@ bool AdapterConfig::remove_IPv4_address(const std::wstring &ipAdress, uint8_t pr
 
     ::SetLastError(status);
     return false;
+}
+
+/*
+ * @brief 清掉本网卡上【除 keepIpv4 之外】的全部 IPv4 地址，返回删除成功的个数
+ *
+ * Wintun 适配器是持久设备，地址跨进程保留：历次运行被分配到不同虚拟 IP 时网卡上会
+ * 残留多个地址，Windows 选源地址可能挑到旧的那个，被服务端的源地址防伪校验全部丢弃
+ * ——表现为"能连上但一个包都上不去"。因此采用服务端新分配的虚拟 IP 之前，先把本网卡
+ * 的其它地址清掉。
+ *
+ * keepIpv4 = 本次要用的地址：已在网卡上就不删（不退掉再重加，避免"删了加不回来"的
+ * 窗口）；只清其它残留。传空串 = 全清。
+ * 实现：GetUnicastIpAddressTable 枚举本机全部 IPv4 单播地址，按 InterfaceLuid
+ * 过滤出本网卡的，逐个 DeleteUnicastIpAddressEntry（绝不碰物理网卡）。
+ */
+int AdapterConfig::clear_IPv4_addresses(const std::wstring& keepIpv4)
+{
+    if (m_interfaceLuid.Value == 0) {
+        LOG_ERROR("clear_IPv4_addresses: invalid interface LUID");
+        return 0;
+    }
+    IN_ADDR keep{};
+    const bool has_keep = !keepIpv4.empty() && parse(keepIpv4, &keep);
+    PMIB_UNICASTIPADDRESS_TABLE table = nullptr;
+    const NETIO_STATUS gst = ::GetUnicastIpAddressTable(AF_INET, &table);
+    if (gst != NO_ERROR || table == nullptr) {
+        LOG_ERROR("clear_IPv4_addresses: GetUnicastIpAddressTable failed, err = %lu", gst);
+        return 0;
+    }
+    int removed = 0;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        MIB_UNICASTIPADDRESS_ROW& row = table->Table[i];
+        if (row.InterfaceLuid.Value != m_interfaceLuid.Value)
+            continue;   // 只动本虚拟网卡
+        if (has_keep && row.Address.Ipv4.sin_addr.S_un.S_addr == keep.S_un.S_addr)
+            continue;   // 本次要用的地址：保留
+        const NETIO_STATUS dst = ::DeleteUnicastIpAddressEntry(&row);
+        if (dst == NO_ERROR || dst == ERROR_NOT_FOUND) {
+            ++removed;
+        } else {
+            LOG_ERROR("clear_IPv4_addresses: delete entry failed, err = %lu", dst);
+        }
+    }
+    ::FreeMibTable(table);
+    if (removed > 0) {
+        LOG_INFO("clear_IPv4_addresses: removed %d stale address(es)", removed);
+    }
+    return removed;
 }
 
 bool AdapterConfig::set_MTU(uint32_t mtu)

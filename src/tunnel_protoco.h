@@ -47,6 +47,10 @@ constexpr uint32_t Kmagic = 0x4D56504E;
 constexpr uint8_t Kversion = v_udp;
 constexpr size_t Ktunnel_header = sizeof(tunnel_header);
 constexpr size_t Max_payload_len = 1429;
+// 发送序号安全上限（=2^31）：达到即触发重连换新会话（新密钥=新反重放
+// 窗口），防止 32 位序号回绕被滑窗误判。100k 包/s 也需 ~6h 才触达，
+// 实际流量远低于此；重连代价对用户几乎无感
+constexpr uint32_t kSeqRekeyLimit = 0x80000000u;
 // 数据面明文载荷上限：AES-GCM 封装 inner(1) + nonce(12) + tag(16) 后不得超过 Max_payload_len
 // （对应 TUN MTU 1400，与 server/Buffer/tunnel_protoco.h 保持一致）
 constexpr size_t KMax_data_payload = 1400;

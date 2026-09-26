@@ -393,127 +393,159 @@ std::vector<std::uint8_t> aes256_gcm_encrypt(
     std::size_t aad_length)
 {
     validate_aes256_key(key);
-    validate_optional_buffer(
-        plaintext,
-        plaintext_length,
-        "plaintext");
+    validate_optional_buffer(plaintext, plaintext_length, "plaintext");
     validate_optional_buffer(aad, aad_length, "AAD");
 
-    const int plaintext_length_int =
-        checked_size_to_int(plaintext_length, "plaintext");
-    const int aad_length_int =
-        checked_size_to_int(aad_length, "AAD");
+    std::vector<std::uint8_t> out(
+        plaintext_length + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN);
+    const std::size_t written = aes256_gcm_seal(
+        key, plaintext, plaintext_length, nullptr, 0, aad, aad_length,
+        out.data(), out.size());
+    out.resize(written);
+    return out;
+}
 
-    std::vector<std::uint8_t> nonce(AES_GCM_NONCE_LEN);
+// ---- 热路径零拷贝实现（与服务端 server/Crypt/crypt.cpp 同一算法布局）----
+// EVP_CIPHER_CTX 线程本地复用 + 逐包 EVP_CIPHER_CTX_reset，
+// 输出（nonce||ct||tag）直写调用方缓冲区，逐包 0 次堆分配
 
-    if (RAND_bytes(
-        nonce.data(),
-        checked_size_to_int(nonce.size(), "nonce")) != 1) {
+thread_local CipherCtxPtr g_seal_ctx(nullptr, &EVP_CIPHER_CTX_free);
+thread_local CipherCtxPtr g_open_ctx(nullptr, &EVP_CIPHER_CTX_free);
+
+std::size_t aes256_gcm_seal(
+    const std::vector<std::uint8_t>& key,
+    const std::uint8_t* plaintext1, std::size_t plaintext1_length,
+    const std::uint8_t* plaintext2, std::size_t plaintext2_length,
+    const std::uint8_t* aad, std::size_t aad_length,
+    std::uint8_t* out, std::size_t out_cap)
+{
+    validate_aes256_key(key);
+    validate_optional_buffer(plaintext1, plaintext1_length, "plaintext");
+    validate_optional_buffer(plaintext2, plaintext2_length, "plaintext");
+    validate_optional_buffer(aad, aad_length, "AAD");
+
+    const std::size_t pt_len = plaintext1_length + plaintext2_length;
+    if (out == nullptr || out_cap < pt_len + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN) {
+        throw std::length_error("aes256_gcm_seal: output buffer too small");
+    }
+
+    std::uint8_t* nonce = out;
+    if (RAND_bytes(nonce, AES_GCM_NONCE_LEN) != 1) {
         throw_openssl_error("RAND_bytes failed");
     }
 
-    CipherCtxPtr context(
-        EVP_CIPHER_CTX_new(),
-        &EVP_CIPHER_CTX_free);
-
-    if (!context)
-        throw_openssl_error("EVP_CIPHER_CTX_new failed");
-
-    if (EVP_EncryptInit_ex2(
-        context.get(),
-        EVP_aes_256_gcm(),
-        nullptr,
-        nullptr,
-        nullptr) != 1) {
-        throw_openssl_error("EVP_EncryptInit_ex2 failed");
+    if (!g_seal_ctx) {
+        g_seal_ctx.reset(EVP_CIPHER_CTX_new());
+        if (!g_seal_ctx)
+            throw_openssl_error("EVP_CIPHER_CTX_new failed");
     }
+    EVP_CIPHER_CTX* ctx = g_seal_ctx.get();
+    EVP_CIPHER_CTX_reset(ctx);
 
-    if (EVP_CIPHER_CTX_ctrl(
-        context.get(),
-        EVP_CTRL_AEAD_SET_IVLEN,
-        checked_size_to_int(nonce.size(), "nonce"),
-        nullptr) != 1) {
-        throw_openssl_error(
-            "Cannot set AES-GCM nonce length");
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), nonce) != 1) {
+        throw_openssl_error("EVP_EncryptInit_ex failed");
     }
-
-    if (EVP_EncryptInit_ex2(
-        context.get(),
-        nullptr,
-        key.data(),
-        nonce.data(),
-        nullptr) != 1) {
-        throw_openssl_error(
-            "Cannot initialize AES-GCM key and nonce");
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                            static_cast<int>(AES_GCM_NONCE_LEN), nullptr) != 1) {
+        throw_openssl_error("Cannot set AES-GCM nonce length");
     }
 
     int produced = 0;
-
     if (aad_length != 0 &&
-        EVP_EncryptUpdate(
-            context.get(),
-            nullptr,
-            &produced,
-            aad,
-            aad_length_int) != 1) {
+        EVP_EncryptUpdate(ctx, nullptr, &produced, aad,
+                          checked_size_to_int(aad_length, "AAD")) != 1) {
         throw_openssl_error("AES-GCM AAD update failed");
     }
+    std::uint8_t* ct = out + AES_GCM_NONCE_LEN;
+    if (plaintext1_length != 0 &&
+        EVP_EncryptUpdate(ctx, ct, &produced, plaintext1,
+                          checked_size_to_int(plaintext1_length, "plaintext")) != 1) {
+        throw_openssl_error("AES-GCM plaintext encryption failed");
+    }
+    if (plaintext2_length != 0 &&
+        EVP_EncryptUpdate(ctx, ct + plaintext1_length, &produced, plaintext2,
+                          checked_size_to_int(plaintext2_length, "plaintext")) != 1) {
+        throw_openssl_error("AES-GCM plaintext encryption failed");
+    }
+    if (EVP_EncryptFinal_ex(ctx, ct + pt_len, &produced) != 1) {
+        throw_openssl_error("AES-GCM encryption finalization failed");
+    }
+    if (produced != 0) {
+        throw std::runtime_error("AES-GCM produced unexpected final bytes");
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG,
+                            static_cast<int>(AES_GCM_TAG_LEN), ct + pt_len) != 1) {
+        throw_openssl_error("Cannot obtain AES-GCM authentication tag");
+    }
+    return AES_GCM_NONCE_LEN + pt_len + AES_GCM_TAG_LEN;
+}
 
-    std::vector<std::uint8_t> ciphertext(
-        plaintext_length + EVP_MAX_BLOCK_LENGTH);
+std::size_t aes256_gcm_open(
+    const std::vector<std::uint8_t>& key,
+    const std::uint8_t* sealed, std::size_t sealed_length,
+    const std::uint8_t* aad, std::size_t aad_length,
+    std::uint8_t* out, std::size_t out_capacity)
+{
+    validate_aes256_key(key);
+    validate_optional_buffer(aad, aad_length, "AAD");
 
-    int total = 0;
-
-    if (plaintext_length != 0) {
-        if (EVP_EncryptUpdate(
-            context.get(),
-            ciphertext.data(),
-            &produced,
-            plaintext,
-            plaintext_length_int) != 1) {
-            throw_openssl_error(
-                "AES-GCM plaintext encryption failed");
-        }
-
-        total = produced;
+    constexpr std::size_t overhead = AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN;
+    if (sealed == nullptr || sealed_length < overhead || out == nullptr) {
+        return 0;
+    }
+    const std::size_t ct_len = sealed_length - overhead;
+    if (ct_len > out_capacity) {
+        throw std::length_error("aes256_gcm_open: output buffer too small");
     }
 
-    if (EVP_EncryptFinal_ex(
-        context.get(),
-        ciphertext.data() + total,
-        &produced) != 1) {
-        throw_openssl_error(
-            "AES-GCM encryption finalization failed");
+    const std::uint8_t* nonce = sealed;
+    const std::uint8_t* ciphertext = sealed + AES_GCM_NONCE_LEN;
+    const std::uint8_t* tag = ciphertext + ct_len;
+
+    if (!g_open_ctx) {
+        g_open_ctx.reset(EVP_CIPHER_CTX_new());
+        if (!g_open_ctx)
+            throw_openssl_error("EVP_CIPHER_CTX_new failed");
+    }
+    EVP_CIPHER_CTX* ctx = g_open_ctx.get();
+    EVP_CIPHER_CTX_reset(ctx);
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), nonce) != 1) {
+        throw_openssl_error("EVP_DecryptInit_ex failed");
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                            static_cast<int>(AES_GCM_NONCE_LEN), nullptr) != 1) {
+        throw_openssl_error("Cannot set AES-GCM nonce length");
     }
 
-    total += produced;
-    ciphertext.resize(static_cast<std::size_t>(total));
-
-    std::vector<std::uint8_t> tag(AES_GCM_TAG_LEN);
-
-    if (EVP_CIPHER_CTX_ctrl(
-        context.get(),
-        EVP_CTRL_AEAD_GET_TAG,
-        checked_size_to_int(tag.size(), "tag"),
-        tag.data()) != 1) {
-        throw_openssl_error(
-            "Cannot obtain AES-GCM authentication tag");
+    int produced = 0;
+    if (aad_length != 0 &&
+        EVP_DecryptUpdate(ctx, nullptr, &produced, aad,
+                          checked_size_to_int(aad_length, "AAD")) != 1) {
+        throw_openssl_error("AES-GCM AAD update failed");
     }
-
-    std::vector<std::uint8_t> result;
-    result.reserve(
-        nonce.size() +
-        ciphertext.size() +
-        tag.size());
-
-    result.insert(result.end(), nonce.begin(), nonce.end());
-    result.insert(
-        result.end(),
-        ciphertext.begin(),
-        ciphertext.end());
-    result.insert(result.end(), tag.begin(), tag.end());
-
-    return result;
+    if (ct_len != 0 &&
+        EVP_DecryptUpdate(ctx, out, &produced, ciphertext,
+                          checked_size_to_int(ct_len, "ciphertext")) != 1) {
+        OPENSSL_cleanse(out, ct_len);
+        throw_openssl_error("AES-GCM ciphertext processing failed");
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
+                            static_cast<int>(AES_GCM_TAG_LEN),
+                            const_cast<std::uint8_t*>(tag)) != 1) {
+        OPENSSL_cleanse(out, ct_len);
+        throw_openssl_error("Cannot set AES-GCM authentication tag");
+    }
+    const int final_result = EVP_DecryptFinal_ex(ctx, out + ct_len, &produced);
+    if (final_result <= 0) {
+        OPENSSL_cleanse(out, ct_len);   // 认证失败：明文不可信，擦除
+        return 0;
+    }
+    if (produced != 0) {
+        OPENSSL_cleanse(out, ct_len);
+        throw std::runtime_error("AES-GCM produced unexpected final bytes");
+    }
+    return ct_len;
 }
 
 std::optional<std::vector<std::uint8_t>> aes256_gcm_decrypt(
@@ -538,111 +570,14 @@ std::optional<std::vector<std::uint8_t>> aes256_gcm_decrypt(
     if (input.size() < overhead)
         return std::nullopt;
 
-    const std::size_t ciphertext_length =
-        input.size() - overhead;
-
-    const int ciphertext_length_int =
-        checked_size_to_int(ciphertext_length, "ciphertext");
-    const int aad_length_int =
-        checked_size_to_int(aad_length, "AAD");
-
-    const std::uint8_t* nonce = input.data();
-    const std::uint8_t* ciphertext =
-        input.data() + AES_GCM_NONCE_LEN;
-    const std::uint8_t* tag =
-        ciphertext + ciphertext_length;
-
-    CipherCtxPtr context(
-        EVP_CIPHER_CTX_new(),
-        &EVP_CIPHER_CTX_free);
-
-    if (!context)
-        throw_openssl_error("EVP_CIPHER_CTX_new failed");
-
-    if (EVP_DecryptInit_ex2(
-        context.get(),
-        EVP_aes_256_gcm(),
-        nullptr,
-        nullptr,
-        nullptr) != 1) {
-        throw_openssl_error("EVP_DecryptInit_ex2 failed");
-    }
-
-    if (EVP_CIPHER_CTX_ctrl(
-        context.get(),
-        EVP_CTRL_AEAD_SET_IVLEN,
-        static_cast<int>(AES_GCM_NONCE_LEN),
-        nullptr) != 1) {
-        throw_openssl_error(
-            "Cannot set AES-GCM nonce length");
-    }
-
-    if (EVP_DecryptInit_ex2(
-        context.get(),
-        nullptr,
-        key.data(),
-        nonce,
-        nullptr) != 1) {
-        throw_openssl_error(
-            "Cannot initialize AES-GCM key and nonce");
-    }
-
-    int produced = 0;
-
-    if (aad_length != 0 &&
-        EVP_DecryptUpdate(
-            context.get(),
-            nullptr,
-            &produced,
-            aad,
-            aad_length_int) != 1) {
-        throw_openssl_error("AES-GCM AAD update failed");
-    }
-
-    std::vector<std::uint8_t> plaintext(
-        ciphertext_length + EVP_MAX_BLOCK_LENGTH);
-
-    int total = 0;
-
-    if (ciphertext_length != 0) {
-        if (EVP_DecryptUpdate(
-            context.get(),
-            plaintext.data(),
-            &produced,
-            ciphertext,
-            ciphertext_length_int) != 1) {
-            secure_wipe(plaintext);
-            throw_openssl_error(
-                "AES-GCM ciphertext processing failed");
-        }
-
-        total = produced;
-    }
-
-    if (EVP_CIPHER_CTX_ctrl(
-        context.get(),
-        EVP_CTRL_AEAD_SET_TAG,
-        static_cast<int>(AES_GCM_TAG_LEN),
-        const_cast<std::uint8_t*>(tag)) != 1) {
-        secure_wipe(plaintext);
-        throw_openssl_error(
-            "Cannot set AES-GCM authentication tag");
-    }
-
-    const int final_result =
-        EVP_DecryptFinal_ex(
-            context.get(),
-            plaintext.data() + total,
-            &produced);
-
-    if (final_result <= 0) {
-        secure_wipe(plaintext);
-        return std::nullopt;
-    }
-
-    total += produced;
-    plaintext.resize(static_cast<std::size_t>(total));
-    return plaintext;
+    std::vector<std::uint8_t> out(input.size() - overhead);
+    const std::size_t written = aes256_gcm_open(
+        key, input.data(), input.size(), aad, aad_length,
+        out.data(), out.size());
+    if (written == 0)
+        return std::nullopt;   // tag 校验失败：静默语义
+    out.resize(written);
+    return out;
 }
 
 std::vector<std::uint8_t> build_inner_packet(

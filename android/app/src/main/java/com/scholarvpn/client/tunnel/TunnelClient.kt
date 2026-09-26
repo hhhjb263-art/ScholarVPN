@@ -62,11 +62,18 @@ class TunnelClient(
         IOException(if (reasonCode == 1) "注册令牌无效或已使用" else "身份未注册（先在服务端 --gen-token 注册）")
 
     companion object {
-        private const val AUTH_TIMEOUT_MS = 5_000L     // 每阶段总超时（对齐 C++ kAuthTimeout）
+        // 每阶段总超时：8s（原 5s，对齐 C++ 端 kAuthTimeout）。移动网实测
+        // 一次成功握手要 3~4s（RTT 2~4s + 丢包重传），5s 只剩几百毫秒余量，
+        // 链路稍差就整轮失败重连。8s × 3 阶段 < 服务端未认证会话 30s 的清理窗口，
+        // 不会出现"客户端还在握手、服务端已把会话清掉"的错配。
+        private const val AUTH_TIMEOUT_MS = 8_000L
         private const val AUTH_RETRY_MS = 500L         // 重传间隔（对齐 kAuthRetryInterval）
-        private const val AUTH_MAX_RETRIES = 10        // 对齐 kAuthMaxRetries
+        private const val AUTH_MAX_RETRIES = 16        // 与 8s 预算一致（16 × 500ms）
         private const val HEARTBEAT_INTERVAL_MS = 1_000L
-        private const val HEARTBEAT_TIMEOUT_MS = 5_000L
+        // 15s（原 5s）：移动网 RTT 2~4s + 丢包时，5s 内没收到任何一个可解密报文
+        // 很常见，会把正在工作的连接误判为失联而断开重连（表现为"连上过一会儿就断"）。
+        // 服务端心跳 10s 一次、失联判定 30s，客户端取 15s：够宽松，又早于服务端判死。
+        private const val HEARTBEAT_TIMEOUT_MS = 15_000L
         private const val TCP_CONNECT_TIMEOUT_MS = 4_000
     }
 
@@ -129,14 +136,9 @@ class TunnelClient(
         // ---- 阶段2：X25519 ECDH + HKDF 派生方向性密钥（无报文交互）----
         state.set(State.DerivingKeys)
         val (dhCliPriv, dhCliPub) = TunnelCrypto.generateX25519KeyPair()
-        rawSendFrame(Protocol.TYPE_AUTH_CLIENT_HELLO, dhCliPub)
-        val sharedSecret = TunnelCrypto.x25519(dhCliPriv, dhSrvPub)
-        val (tx, rx) = TunnelCrypto.deriveSessionKeys(sharedSecret, nonceC, nonceS)
-        keyTx = tx; keyRx = rx
-        keysReady.set(true)
-
-        // ---- 阶段3：密文身份报文 → identity_ok / identity_deny ----
-        state.set(State.Authenticating)
+        // 阶段3 的身份报文（含 Ed25519 签名）先算好，再发 auth_client_hello：
+        // 手机上 BouncyCastle 签名要几百毫秒，夹在两帧之间会白白推迟身份报文上行的
+        // 时机（服务端的握手窗口从收到 auth_hello 起算，能省一点是一点）。
         val identityPayload = Protocol.buildIdentityPayload(
             nonceC, nonceS, dhCliPub, dhSrvPub,
             TunnelCrypto.ed25519PubFromSeed(identityPrivSeed), clientId)
@@ -146,8 +148,24 @@ class TunnelClient(
             identityPayload = identityPayload,
             signature = TunnelCrypto.ed25519Sign(identityPrivSeed, identityPayload),
         )
+        rawSendFrame(Protocol.TYPE_AUTH_CLIENT_HELLO, dhCliPub)
+        val sharedSecret = TunnelCrypto.x25519(dhCliPriv, dhSrvPub)
+        val (tx, rx) = TunnelCrypto.deriveSessionKeys(sharedSecret, nonceC, nonceS)
+        keyTx = tx; keyRx = rx
+        keysReady.set(true)
+
+        // ---- 阶段3：密文身份报文 → identity_ok / identity_deny ----
+        state.set(State.Authenticating)
         val auth = retryLoop("阶段3（身份认证）",
-            resend = { sendEncrypted(Protocol.TYPE_IDENTITY, body) },
+            resend = {
+                // 与 C++ 端一致：重传身份报文的同时也重传 auth_client_hello（本端临时
+                // DH 公钥）。这一帧在阶段2 只发一次，UDP 上丢一次服务端就永远派生不出
+                // 会话密钥，之后所有密文帧（含身份报文）都会在解密前被丢弃，表现为
+                // 握手超时后断开重连。服务端对该帧有阶段机保护（非 HELLO 阶段
+                // 直接拒绝，不会覆盖已派生密钥），所以重传幂等且安全。
+                rawSendFrame(Protocol.TYPE_AUTH_CLIENT_HELLO, dhCliPub)
+                sendEncrypted(Protocol.TYPE_IDENTITY, body)
+            },
             wait = { identityResult.await() })
 
         authenticated.set(auth)
@@ -157,7 +175,7 @@ class TunnelClient(
 
     /**
      * 阶段重传循环：立即发一次，之后每 500ms 重传一次；
-     * 总超时 5s / 最多 10 次（对齐 C++ 端 kAuthTimeout/kAuthRetryInterval/kAuthMaxRetries）。
+     * 总超时 8s / 最多 16 次（AUTH_TIMEOUT_MS / AUTH_RETRY_MS / AUTH_MAX_RETRIES）。
      * 响应到达时 wait() 返回；认证被拒（deferred 异常完成）时异常直接穿透。
      */
     private suspend fun <T> retryLoop(
@@ -172,6 +190,11 @@ class TunnelClient(
             try {
                 return withTimeout(AUTH_RETRY_MS) { wait() }
             } catch (_: TimeoutCancellationException) {
+                // 链路已经死了（recv 循环读到 EOF/出错、或心跳判死）：继续重传毫无意义，
+                // 立刻抛出以让上层尽快重连，而不是把整个超时预算耗光后再重连
+                if (deadNotified.get()) {
+                    throw IOException("$label 中断：链路已失效（${state.get()}）")
+                }
                 if (System.currentTimeMillis() - start >= AUTH_TIMEOUT_MS || ++retries > AUTH_MAX_RETRIES) {
                     throw IOException("$label 超时（服务端无响应，检查 IP/端口/防火墙）")
                 }
@@ -230,14 +253,17 @@ class TunnelClient(
             return   // 非法帧：丢弃
         }
         if (header.version != wireVersion) return   // 传输不匹配（对应 C++ 版本校验）
-        lastRxMs.set(System.currentTimeMillis())
 
         if (header.type in Protocol.ENCRYPTED_TYPES) {
             if (!keysReady.get()) return   // 密钥未就绪：丢弃
-            // 反重放：序号过滑窗（重放帧在解密前即丢弃；AAD 保证序号不可篡改）
-            if (!replayWindow.accept(header.sequence.toLong() and 0xFFFFFFFFL)) return
+            val seq = header.sequence.toLong() and 0xFFFFFFFFL
+            // 反重放分两步：解密前只做"不修改状态"的过旧预检（未认证报文
+            // 不能污染窗口），GCM 验证成功后才提交窗口与存活时间
+            if (replayWindow.isStale(seq)) return
             val inner = TunnelCrypto.gcmOpen(keyRx, buf, Protocol.HEADER_SIZE, len - Protocol.HEADER_SIZE, buf, 0)
-                ?: return   // 解密失败静默丢弃
+                ?: return   // 解密失败静默丢弃（不推进窗口、不刷新存活）
+            if (!replayWindow.accept(seq)) return   // 重放帧：静默丢弃
+            lastRxMs.set(System.currentTimeMillis())   // 仅已认证报文刷新存活
             handleInner(inner[0], inner, 1, inner.size - 1)
         } else if (header.type == Protocol.TYPE_AUTH_SERVER_HELLO) {
             handleServerHello(buf.copyOfRange(Protocol.HEADER_SIZE, len))
@@ -310,9 +336,16 @@ class TunnelClient(
      */
     private fun sendEncryptedSeg(type: Byte, data: ByteArray, off: Int, len: Int) {
         if (!keysReady.get()) throw IOException("密钥未就绪")
+        // 序号安全上限（=2^31）：触发重连换新会话（新密钥=新反重放窗口），
+        // 防止 32 位序号回绕被滑窗误判
+        val seqNum = sequence.getAndIncrement().toLong() and 0xFFFFFFFFL
+        if (seqNum >= 0x80000000L) {
+            notifyDead("发送序号空间耗尽，重连换新会话密钥")
+            return
+        }
         val sealedLen = 1 + len + Protocol.GCM_NONCE_LEN + Protocol.GCM_TAG_LEN
         val frame = ByteArray(Protocol.HEADER_SIZE + sealedLen)
-        Protocol.encodeHeaderInto(frame, 0, wireVersion, type, sealedLen, sequence.getAndIncrement())
+        Protocol.encodeHeaderInto(frame, 0, wireVersion, type, sealedLen, seqNum.toInt())
         TunnelCrypto.gcmSealInto(keyTx, type, data, off, len, frame, 0, frame, Protocol.HEADER_SIZE)
         rawSend(frame)
     }
@@ -320,6 +353,10 @@ class TunnelClient(
     /** 上行数据面：VpnService 桥接线程调用（tun fd 读到的 IP 包，不复制直接加密发送） */
     fun sendData(buf: ByteArray, off: Int = 0, len: Int = buf.size): Boolean {
         if (!isAlive || len <= 0 || len > Protocol.MAX_DATA_PAYLOAD) return false
+        // 只转发 IPv4：tun 上还有系统自己产生的 IPv6 链路本地报文（MLD/NDP 等
+        // 48~76 字节控制报文），服务端隧道的 tun 只有 IPv4，塞进去必被逐包拒收
+        // （白耗流量 + 刷服务端日志）。本地丢弃，对齐服务端的 IPv4-only 校验。
+        if (len < 20 || (buf[off].toInt() and 0xF0) != 0x40) return false
         return runCatching {
             sendEncryptedSeg(Protocol.TYPE_DATA, buf, off, len)
             true

@@ -10,11 +10,15 @@
 //     其余                      → 静默丢弃（不断连，防注入式 DoS）
 // 线程约定：handle_frame 仅在 recv 线程执行（天然串行），无需加锁；
 //           与服务端 Session::ReplayWindow 语义一致（64 位位图）。
+// 重要：accept() 会修改状态，必须在 AES-GCM 验证成功【之后】调用；
+//       解密前只允许 too_old()（不修改状态）做廉价预检——未认证报文
+//       不能推进窗口（否则伪造高序号会污染窗口，合法报文被误判太旧）。
 // 实例随隧道连接重置（新会话新密钥，init()/stop() 调 reset()）。
 // ============================================================================
 class ReplayWindow {
 public:
-    // seq 为主机序；返回 true = 放行，false = 重放帧（丢弃）
+    // seq 为主机序；返回 true = 放行，false = 重放帧（丢弃）。
+    // 只应在帧通过 GCM 验证后调用
     bool accept(uint32_t seq)
     {
         const uint64_t s = seq;
@@ -37,6 +41,18 @@ public:
             return false;   // 已见过：重放
         m_window |= bit;
         return true;
+    }
+
+    // 不修改状态的"过旧"预检（解密前调用）：未初始化/比最高序号新/窗口内
+    // 均返回 false；已见最高序号之外太旧的返回 true
+    bool too_old(uint32_t seq) const
+    {
+        if (m_highest == kNone)
+            return false;
+        const uint64_t s = seq;
+        if (s > m_highest)
+            return false;
+        return (m_highest - s) >= kWindow;
     }
 
     void reset()

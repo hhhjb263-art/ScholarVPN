@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <string>
 #include <sys/stat.h>   // umask
+#include <fcntl.h>      // open
+#include <sys/file.h>   // flock
 #include <system_error>
 #include <unistd.h>   // pause()
 
@@ -111,10 +113,12 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
         }else if(arg == "--transport"){
             const char *v = next("both|udp|tcp");
             if(!v) return false;
-            // 当前版本实现同端口双栈（both）：UDP 与 TCP 同时监听，
-            // 客户端按条目选择传输；单栈开关留待后续
-            if(std::string(v) != "both")
-                fprintf(stderr, "[main] 提示: 当前实现为同端口双栈（both），参数 '%s' 暂被忽略\n", v);
+            const std::string mode(v);
+            if(mode != "both" && mode != "udp" && mode != "tcp"){
+                fprintf(stderr, "非法 --transport 值: %s（both|udp|tcp）\n", v);
+                return false;
+            }
+            cfg.transport_mode = mode;
         }else{
             fprintf(stderr, "未知选项: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -149,9 +153,27 @@ int main(int argc, char *argv[])
         }
         std::filesystem::create_directories(keys_dir, ec);
         const std::string tokens_path = (keys_dir / "register_tokens.txt").string();
+        // 与服务端消费令牌（file_remove_line 的原子替换）跨进程互斥：
+        // 双方都 flock <tokens>.lock，令牌文件本体只会被原子的
+        // rename 替换，追加/替换并发不会互相丢失数据
+        const std::string lock_path = tokens_path + ".lock";
+        const int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (lock_fd < 0) {
+            fprintf(stderr, "[main] 无法打开锁文件 %s: %s\n",
+                    lock_path.c_str(), strerror(errno));
+            return 1;
+        }
+        if (::flock(lock_fd, LOCK_EX) != 0) {
+            fprintf(stderr, "[main] flock(%s) 失败: %s\n",
+                    lock_path.c_str(), strerror(errno));
+            ::close(lock_fd);
+            return 1;
+        }
         FILE *f = std::fopen(tokens_path.c_str(), "a");
         if(f == nullptr){
             fprintf(stderr, "[main] 无法写入 %s\n", tokens_path.c_str());
+            ::flock(lock_fd, LOCK_UN);
+            ::close(lock_fd);
             return 1;
         }
         for(int i = 0; i < cfg.gen_tokens; ++i){
@@ -160,6 +182,8 @@ int main(int argc, char *argv[])
             std::printf("register_token: %s\n", tok.c_str());
         }
         std::fclose(f);
+        ::flock(lock_fd, LOCK_UN);
+        ::close(lock_fd);
         std::printf("[main] 已生成 %d 个注册令牌并追加到 %s\n",
                     cfg.gen_tokens, tokens_path.c_str());
         return 0;

@@ -107,17 +107,20 @@ bool VpnCore::init(const Config &cfg)
         fprintf(stderr, "[VpnCore] 警告: 未配置服务器身份私钥，身份认证不可用\n");
     }
 
-    // 5) 启动 UDP 隧道（服务端绑定监听，多用户：最大会话数 + 虚拟 IP 池）
+    // 5) 启动 UDP 隧道（服务端绑定监听，多用户：最大会话数 + 虚拟 IP 池）；
+    //    --transport tcp 时跳过 UDP 监听（会话机制仍服务 TCP 会话）
     if(!m_udp.start(m_cfg.listen_ip, m_cfg.listen_port,
-                    m_cfg.tun_ip, m_cfg.tun_prefix, m_cfg.max_clients)){
+                    m_cfg.tun_ip, m_cfg.tun_prefix, m_cfg.max_clients,
+                    m_cfg.transport_mode != "tcp")){
         fprintf(stderr, "[VpnCore] udp.start(%s:%u) failed\n",
                 m_cfg.listen_ip.c_str(), m_cfg.listen_port);
         stop();
         return false;
     }
     // 6) 启动 TCP 监听（同端口双栈）：运营商丢 UDP 的备用通道；
-    //    会话表/认证/加密/心跳与 UDP 共用，客户端按条目选择传输
-    if(!m_tcp.start(m_cfg.listen_ip, m_cfg.listen_port)){
+    //    会话表/认证/加密/心跳与 UDP 共用，客户端按条目选择传输；
+    //    --transport udp 时关闭 TCP 监听
+    if(m_cfg.transport_mode != "udp" && !m_tcp.start(m_cfg.listen_ip, m_cfg.listen_port)){
         fprintf(stderr, "[VpnCore] tcp.start(%s:%u) failed\n",
                 m_cfg.listen_ip.c_str(), m_cfg.listen_port);
         stop();
@@ -159,10 +162,12 @@ void VpnCore::stop()
     if(m_thread_u2t.joinable()){
         m_thread_u2t.join();
     }
-    // 停止 TCP 监听（epoll 事件线程退出并统一关闭全部连接）
-    m_tcp.stop();
-    // 停止 UDP 收发线程
+    // 先停 UDP 收发线程：send_work/heartbeat 是 TCP 发送唤醒钩子的生产者
+    // （tcp_tx_wake → TCPServer eventfd），生产者先停，事件线程与钩子
+    // 注销的生命周期才无竞争
     m_udp.stop();
+    // 再停止 TCP 监听（epoll 事件线程退出并统一关闭全部连接 + 注销唤醒钩子）
+    m_tcp.stop();
     // 清理路由与网卡（仅在 TUN 创建成功后才做网卡操作）
     if(m_cfg.add_default_route){
         m_adapter.route_del("0.0.0.0", 0);

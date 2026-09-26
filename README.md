@@ -1,8 +1,3 @@
-# ScholarVPN
-
-> ⚠️ **仅供学习研究使用** —— 请先阅读下方的「法律声明」，确认你的使用方式合法合规。
-
-ScholarVPN 是一个**学习实验性质**的项目，用于理解网络通信、加密协议与 VPN 的工作原理。包含 **Windows 客户端**（Wintun 虚拟网卡 + UDP/TCP 双传输隧道）与 **Linux 服务端**（TUN 虚拟网卡 + UDP/TCP 同端口双栈隧道）。隧道使用自研三阶段身份认证协议：Ed25519 签名防中间人 + 临时 X25519 前向安全密钥交换 + HKDF 密钥派生 + AES-256-GCM 认证加密，客户端/服务器身份均需注册准入。
 
 ---
 
@@ -22,8 +17,6 @@ ScholarVPN 是一个**学习实验性质**的项目，用于理解网络通信�
 
 **合规使用示例（仅供学习）：**
 
-- ✅ 在**自有、可控的实验环境**（本机虚拟机 / 实验室局域网）中学习 TUN/Wintun 虚拟网卡与 UDP 隧道原理；
-- ✅ 研究加密协议（Ed25519 / X25519 / HKDF / AES-256-GCM）与身份认证流程的实现细节；
 - ✅ 用于课堂教学、学术研究与代码阅读。
 
 > 若你无法确保使用方式合法合规，请勿下载、编译或运行本项目。
@@ -40,45 +33,6 @@ ScholarVPN 是一个**学习实验性质**的项目，用于理解网络通信�
 - **服务端传输层**：UDP 会话表 / 认证 / 加密 / 心跳与 TCP 完全共用；TCP 监听为 **epoll 事件驱动**（单线程管理全部连接，替代每连接一线程），读事件排空内核缓冲一次处理所有完整帧。发送队列满或对端持续不收（>5s）即主动断开该连接，避免半死连接无限堆积拖慢其他会话。
 
 客户端为 **Qt 图形界面程序**：主界面显示当前服务器卡片（连接/断开/编辑）与实时上下行速率曲线；通过「Switch Server」覆盖层管理多台服务器，点击卡片即切换。断开/崩溃均自动恢复网卡 DNS（防泄漏守卫 + 崩溃看门狗）。
-
-### 目录结构
-
-```
-ScholarVPN/
-├── src/                       客户端源码
-│   ├── main.cpp               Qt 入口：QApplication + 主窗口 + 日志初始化
-│   ├── gui/                   Qt 界面层
-│   │   ├── QtWidgetsClass.*   主窗口：服务器卡片 / Switch 覆盖层 / 速率曲线（QPainter 自绘）
-│   │   ├── AppBridge.*        QObject 桥：ClientApp 回调转 Qt 信号（跨线程安全）
-│   │   └── style.qss          全局样式表
-│   ├── client/                ClientApp：核心封装（init/start/stop、TUN↔UDP 桥接线程、流量统计）
-│   ├── tun.cpp                Wintun 虚拟网卡读写
-│   ├── UDP.cpp                隧道基类（三阶段身份认证、心跳、收发线程、加密分发）
-│   ├── tcp.cpp                TCP 隧道（继承 UDP 基类，仅覆写传输钩子；非阻塞 + poll）
-│   ├── Crypt.cpp              Ed25519 + 临时X25519 + HKDF-SHA256 + AES-256-GCM 加密
-│   ├── AdapterConfig.cpp      网卡 IP / DNS / MTU / 路由度量配置
-│   ├── route_manager.cpp      路由管理（服务器绕过路由 + 默认路由）
-│   ├── reconnect_manager.cpp  断线自动重连（指数退避状态机）
-│   ├── DnsLeakGuard.*         防 DNS 泄漏（备份/恢复物理网卡 DNS + 崩溃看门狗自愈）
-│   └── tunnel_protoco.h       隧道协议头定义
-├── server/                    Linux 服务端（CMake 工程，各模块功能如下）
-│   ├── main.cpp               服务端入口（CLI 解析 + --gen-token）
-│   ├── Buffer/                数据缓冲（PacketBuffer / QueueBuffer）与隧道协议头
-│   ├── UDP/                   传输层：Session 多用户会话模型 + 三阶段认证 / 心跳 / 收发线程
-│   │   └── Session.h          会话模型（每个客户端一个 Session，含认证状态与密钥）
-│   ├── TCP/                   TCP 监听（epoll 事件驱动，同端口双栈；会话/认证/加密与 UDP 共用）
-│   ├── tun/                   TUN 虚拟网卡读写
-│   ├── LinuxAdapter/          网卡 IP / MTU / 路由配置
-│   ├── core/                  VpnCore 转发层（TUN ↔ UDP 桥接，认证通过前禁止转发）
-│   ├── Crypt/                 加密层（Ed25519 / 临时 X25519 / HKDF / AES-256-GCM）
-│   ├── keys/                  身份密钥与客户端准入数据库（不入库，说明见 keys/README.txt）
-│   └── start.sh / vpn-server.service   部署脚本与 systemd 服务模板
-├── include/                    公共头文件
-├── third_party/                OpenSSL 3.5.6、Wintun 0.14.1
-├── Config.cpp / Config.h       客户端 INI 配置读写（多服务器列表）
-├── docs/                       项目文档
-└── x64/                        Visual Studio 构建输出
-```
 
 ### 隧道协议与加密（概述）
 

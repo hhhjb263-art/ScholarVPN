@@ -104,4 +104,7 @@ private:
 	std::atomic<ConnState> m_state{ ConnState::Stopped };
 	std::atomic<uint64_t> m_txBytes{ 0 }, m_rxBytes{ 0 };
 	std::atomic<uint64_t> m_txPkts{ 0 }, m_rxPkts{ 0 };
+	// 本地丢弃的非 IPv4 报文计数（Wintun 网卡上的 IPv6 链路本地控制报文等）：
+	// 隧道只承载 IPv4，这类报文不该上行（服务端必拒），限流日志用
+	std::atomic<uint32_t> m_nonIpv4Dropped{ 0 };
 };

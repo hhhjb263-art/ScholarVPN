@@ -43,6 +43,9 @@ public:
 
         // 管理员：--gen-token 一次性注册令牌数量（>0 时生成后退出）
         int gen_tokens = 0;
+
+        // 传输开关：both（默认，同端口双栈）/ udp（禁用 TCP 监听）/ tcp（禁用 UDP 监听）
+        std::string transport_mode = "both";
     };
 
 public:

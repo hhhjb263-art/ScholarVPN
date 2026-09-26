@@ -61,6 +61,28 @@ std::optional<std::vector<std::uint8_t>> aes256_gcm_decrypt(
     const std::uint8_t* aad,
     std::size_t aad_length);
 
+// 热路径零拷贝版：复用线程本地 EVP_CIPHER_CTX，输出直写调用方缓冲区，
+// 不产生任何临时 vector（数据面每包一次，老 vector 版本逐包 4-5 次分配）。
+//
+// seal：out = nonce(12) || ct(pt1 || pt2) || tag(16)（与旧 encrypt 线格式一致），
+//       返回写入总长度；out_cap 不足抛 std::length_error。
+//       plaintext2 可为 nullptr/0（两段明文让"内层 type 字节 + 载荷"免拼接加密）。
+// open：明文直写 out（长度 = sealed_len - nonce/tag），返回明文长度；
+//       tag 校验失败返回 0（静默丢弃语义）；sealed 结构非法返回 0；
+//       空间不足抛 std::length_error。
+std::size_t aes256_gcm_seal(
+    const std::vector<std::uint8_t>& key,
+    const std::uint8_t* plaintext1, std::size_t plaintext1_length,
+    const std::uint8_t* plaintext2, std::size_t plaintext2_length,
+    const std::uint8_t* aad, std::size_t aad_length,
+    std::uint8_t* out, std::size_t out_cap);
+
+std::size_t aes256_gcm_open(
+    const std::vector<std::uint8_t>& key,
+    const std::uint8_t* sealed, std::size_t sealed_length,
+    const std::uint8_t* aad, std::size_t aad_length,
+    std::uint8_t* out, std::size_t out_capacity);
+
 std::vector<std::uint8_t> build_inner_packet(
     std::uint8_t packet_type,
     const std::vector<std::uint8_t>& payload);

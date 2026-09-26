@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.scholarvpn.client.MainActivity
@@ -56,20 +57,59 @@ class ScholarVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 每条启动来源都记一行日志：下次"它又自己连上了"可以直接从 logcat 看出是谁拉起的
         when (intent?.action) {
             ACTION_DISCONNECT -> {
+                Log.i(TAG, "onStartCommand: 断开（用户点击/通知按钮）")
                 stopVpn()
                 return START_NOT_STICKY
             }
-            else -> startVpn()
+            ACTION_CONNECT -> {
+                Log.i(TAG, "onStartCommand: 连接（用户点击）")
+                startVpn("连接中…")
+            }
+            // 系统拉起：VpnService.SERVICE_INTERFACE = "android.net.VpnService"。
+            // 「始终开启的 VPN」（Always-on）在 VPN 被断开后、以及系统重启后，
+            // 都会用这个 action 让系统重新拉起本服务——它**不是**用户点了连接。
+            // 之前这里落进 else 分支静默 startVpn()，表现为"每次点断开，它又自己连上"。
+            VpnService.SERVICE_INTERFACE -> {
+                if (isAlwaysOnVpn()) {
+                    Log.i(TAG, "onStartCommand: 系统「始终开启的 VPN」拉起，自动重连")
+                    startVpn("系统常驻 VPN（始终开启的 VPN）自动连接中…")
+                } else {
+                    // 系统重启后的恢复等：同样不是在用户点击下发生的
+                    Log.i(TAG, "onStartCommand: 系统拉起（非用户点击），自动连接")
+                    startVpn("连接中…")
+                }
+            }
+            else -> {
+                Log.i(TAG, "onStartCommand: 非用户 action=${intent?.action}（如 START_STICKY 重启），自动连接")
+                startVpn("连接中…")
+            }
         }
         return START_STICKY
     }
 
-    private fun startVpn() {
+    /**
+     * 本应用是否被设为「始终开启的 VPN」（Android 的 Always-on VPN）。
+     *
+     * 为什么需要它：Always-on 模式下用户/应用断开 VPN 后，系统会立刻重新拉起本服务
+     * （onStartCommand 收到 "android.net.VpnService"），用户看到的现象就是
+     * "点了断开它又自己连上"。这是系统策略、不是 bug——能做的就是解释清楚，
+     * 并告诉用户去哪里关（系统设置 → 网络 → VPN → 始终开启的 VPN）。
+     *
+     * 用字面量读 Settings.Secure：ALWAYS_ON_VPN_APP 常量是 @hide，直接引用会编译不过。
+     */
+    private fun isAlwaysOnVpn(): Boolean = try {
+        Settings.Secure.getString(contentResolver, "always_on_vpn_app") == packageName
+    } catch (_: Exception) {
+        false   // 读不到就当作没开（不弹误导性提示）
+    }
+
+    private fun startVpn(statusText: String = "连接中…") {
         startForeground()   // Android 12+ 要求启动后尽快进入前台状态
         if (!running.compareAndSet(false, true)) return
-        updateStatus(VpnStatus.Phase.CONNECTING, "连接中…")
+        updateStatus(VpnStatus.Phase.CONNECTING, statusText)
         runSessionLoop()
     }
 
@@ -165,6 +205,14 @@ class ScholarVpnService : VpnService() {
             .setMtu(1400)
             .addAddress(auth.ipString, auth.prefix)
             .addRoute("0.0.0.0", 0)                 // 接管默认路由（IPv4）
+            // 注意：**不要**在这里加 .addRoute("::", 0)（IPv6 kill-switch）。
+            // 2026-09-25 实测回归：加了 ::/0 之后，V6 优先的应用（国内 App、QUIC/HTTP3）
+            // 的包被拉进 tun 后由客户端本地静默丢弃（TunnelClient.sendData 的 IPv4-only
+            // 过滤），应用要等连接超时（10~20s）才回落 IPv4 —— 表现为"VPN 连上了但
+            // 很多 App 打不开/很慢"。改回不接管 IPv6（IPv6 走物理网卡）后恢复正常。
+            // 代价是 IPv6 流量会绕过隧道、泄漏真实出口 IP；要既堵泄漏又不卡，正确做法是
+            // 对 IPv6 包回 ICMPv6 Destination Unreachable / TCP RST（让应用快速失败），
+            // 这需要在真机上验证，尚未实现。
             .addDnsServer("8.8.8.8")                // DNS 强制走隧道（防泄漏）
             .addDnsServer("1.1.1.1")
             // 关键：把本应用自身流量排除出隧道（等价 Windows 端 route_manager
@@ -222,9 +270,16 @@ class ScholarVpnService : VpnService() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         VpnStatus.phase.value = VpnStatus.Phase.IDLE
-        VpnStatus.message.value = "未连接"
         VpnStatus.busyIndex.value = -1
-        Log.i(TAG, "VPN 已断开")
+        // 开了「始终开启的 VPN」时，系统会在断开后立刻重新拉起本服务（见 onStartCommand），
+        // 因此这里必须把原因说清楚，否则用户只会看到"点了断开它又自己连上"
+        val alwaysOn = isAlwaysOnVpn()
+        VpnStatus.message.value = if (alwaysOn)
+            "已断开。但系统已开启「始终开启的 VPN」，会立刻自动重连；要彻底关闭请到 " +
+                "系统设置 → 网络和互联网 → VPN → 关闭「始终开启的 VPN」"
+        else
+            "未连接"
+        Log.i(TAG, if (alwaysOn) "VPN 已断开（检测到 Always-on VPN，系统会立即重连）" else "VPN 已断开")
     }
 
     private fun updateStatus(phase: VpnStatus.Phase, text: String) {

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include "Crypt.h"
 #include <openssl/rand.h>
@@ -115,9 +116,9 @@ bool UDP::init()
 	}
 	// 放大收发缓冲：Windows 默认 8KB，突发流量下 UDP 直接丢包、
 	// TCP 拥塞窗口收缩，表现为"连接正常但网速很慢"。
-	// 缓冲对 UDP/TCP 两种传输都生效（TCP 单连接实际受系统限制，无副作用）。
+	// 8MB 对 1Gbps×~50ms RTT 的带宽延迟积留出余量；无 Linux 式 rmem_max 钳制
 	{
-		const int bufsize = 4 * 1024 * 1024;
+		const int bufsize = 8 * 1024 * 1024;
 		setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF,
 			reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
 		setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF,
@@ -284,6 +285,13 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 	header.type = type;
 	header.payload_len = htons(static_cast<uint16_t>(len));
 	uint32_t seq = m_seq.fetch_add(1);
+	// 序号安全上限：达到 2^31 标记重连（新会话=新密钥=新反重放窗口），
+	// 防止 32 位序号回绕后被滑窗误判
+	if (seq >= kSeqRekeyLimit) {
+		LOG_ERR("[UDP] 发送序号达到安全上限，触发重连换会话\n");
+		m_need_reconnect.store(true);
+		return false;
+	}
 	header.sequence = htonl(seq);
 
 	memcpy(sendbuf.data(), &header, Ktunnel_header);
@@ -302,30 +310,31 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 			return false;
 		header.payload_len = htons(static_cast<uint16_t>(enc_len));
 		memcpy(sendbuf.data(), &header, Ktunnel_header);
-		std::vector<uint8_t> inner;
-		inner.reserve(1 + len);
-		inner.push_back(type);
-		if (len)
-			inner.insert(inner.end(), data, data + len);
-		std::vector<uint8_t> enc;
+		// 零临时 vector：内层 type 字节作第一段明文、载荷作第二段直接加密，
+		// 输出（nonce||ct||tag）直写 sendbuf 帧头之后。
+		// 注意必须先按密文尺寸扩容：out_cap = 明文长度会把 seal 撑爆
+		// （曾因此所有密文发送抛 length_error，服务端永远收不到身份报文）
+		sendbuf.resize(Ktunnel_header + enc_len);
+		size_t sealed_len = 0;
 		try
 		{
-			// 客户端发送方向 = key_tx（m_key_c2s）
-			enc = aes256_gcm_encrypt(
+			// 客户端发送方向 = key_tx（m_key_c2s）；AAD = 帧头
+			sealed_len = aes256_gcm_seal(
 				m_key_c2s,
-				inner.data(), inner.size(),
-				sendbuf.data(), Ktunnel_header);
+				&type, 1,
+				len ? data : nullptr, len,
+				sendbuf.data(), Ktunnel_header,
+				sendbuf.data() + Ktunnel_header, sendbuf.size() - Ktunnel_header);
 		}
 		catch (const std::exception& e)
 		{
 			LOG_ERR("[UDP] 加密失败: %s\n", e.what());
 			return false;
 		}
-		if (enc.size() != enc_len)
+		if (sealed_len != enc_len)
 			return false;
-		sendbuf.resize(Ktunnel_header + enc.size());
-		memcpy(sendbuf.data() + Ktunnel_header, enc.data(), enc.size());
-		total_len = Ktunnel_header + enc.size();
+		sendbuf.resize(Ktunnel_header + sealed_len);
+		total_len = Ktunnel_header + sealed_len;
 		// 发送差异走钩子：UDP = sendto（数据报）；TCP = send_all（流式循环写）。
 		// 这里绝不能硬编码 sendto——TCP 子类覆写的 raw_send 才是流式发送：
 		// 否则阶段3身份报文/心跳/数据面等密文帧在 TCP socket 上 sendto 失败
@@ -609,6 +618,16 @@ void UDP::send_work()
 					m_need_reconnect.store(true);
 					break;
 				}
+				// 同时重传 auth_client_hello（本端临时 DH 公钥）：这一帧只在阶段1b
+				// 发过一次，UDP 上丢一次，服务端就永远派生不出会话密钥（s.enc_ready
+				// 恒为 false），之后所有密文帧——包括身份报文——都被服务端在解密
+				// 之前丢弃，表现为 5s 握手超时后断开重连，且每次重连都重演。
+				// 服务端对该帧有阶段机保护（非 HELLO 阶段直接拒绝，不会覆盖已派生
+				// 密钥），所以重传是幂等且安全的。
+				if (!m_dh_cli_pub.empty()) {
+					send_packet(static_cast<uint8_t>(m_auth_client_hello),
+						m_dh_cli_pub.data(), m_dh_cli_pub.size(), sendbuf);
+				}
 				send_packet(static_cast<uint8_t>(m_identity), identity_msg.data(), identity_msg.size(), sendbuf);
 				last_id = now;
 			}
@@ -651,10 +670,14 @@ void UDP::send_work()
 			send_packet(static_cast<uint8_t>(m_heart), nullptr, 0, sendbuf);
 			last_heart = now;
 		}
-		// 心跳超时：超过 kHeartbeatTimeout 未收到对端任何报文 -> 判定链路失效
+		// 心跳超时：超过 kHeartbeatTimeout 未收到【能通过认证的】对端报文 -> 判定链路失效
 		if (m_last_rx_ms.load() != 0 &&
 			now - std::chrono::steady_clock::time_point(std::chrono::milliseconds(m_last_rx_ms.load())) > kHeartbeatTimeout) {
-			LOG_ERR("[UDP] heartbeat timeout, peer unreachable, reconnecting\n");
+			// 注意措辞：这条不等于"对端不可达"——本端解密失败或被反重放窗口丢弃的帧
+			// 同样不刷新存活时间（上面两条限流日志会给出真正原因），故两者都列出
+			LOG_ERR("[UDP] heartbeat timeout: %lldms 内未收到任何通过认证的对端报文"
+				"（对端不可达，或本端解密失败/被反重放丢弃），重连\n",
+				static_cast<long long>(kHeartbeatTimeout.count() * 1000));
 			m_need_reconnect.store(true);
 			break;
 		}
@@ -756,8 +779,8 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 	size_t payload_len, std::vector<uint8_t>& sendbuf)
 {
 	const uint8_t* aad = payload - Ktunnel_header;
-	// 任何合法报文都视为对端存活
-	m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	// 存活时间不再在此无条件刷新：未认证报文（伪造/扫描）不应阻止心跳
+	// 超时清理；密文帧在 GCM 验证成功后才刷新 m_last_rx_ms
 
 		// 密文类型：密钥就绪后 data/heart/identity/disconnect 等均为 AES-GCM 密文，先解密再按内层类型分发
 		if (header.type == static_cast<uint8_t>(m_data) ||
@@ -772,35 +795,70 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			{
 				return; // 密钥未就绪前收到的数据/心跳一律丢弃
 			}
-			// 反重放：对端密文帧序号过滑窗（重放/复制帧在解密前即静默丢弃；
-			// 序号在 AAD 内不可篡改，静默丢弃不断连——防注入式 DoS）
-			if (!m_replay.accept(ntohl(header.sequence))) {
+			const uint32_t seq_host = ntohl(header.sequence);
+			// 反重放分两步：解密前只做"不修改状态"的过旧预检（未认证报文
+			// 不能污染窗口），GCM 验证成功后才提交窗口与存活时间
+			if (m_replay.too_old(seq_host)) {
 				return;
 			}
-			std::vector<uint8_t> enc(payload, payload + payload_len);
-			std::optional<std::vector<uint8_t>> plain;
+			// 零临时 vector：密文段（nonce||ct||tag）直接从接收缓冲解密到栈上
+			// 明文缓冲（内层明文 = type(1)+载荷 ≤ KMax_data_payload）
+			uint8_t plain[KMax_data_payload + 1];
+			size_t plain_len = 0;
 			try
 			{
 				// 客户端接收方向 = key_rx（m_key_s2c）；AAD = 帧头
-				plain = aes256_gcm_decrypt(
+				plain_len = aes256_gcm_open(
 					m_key_s2c,
-					enc, aad, Ktunnel_header);
+					payload, payload_len,
+					aad, Ktunnel_header,
+					plain, sizeof(plain));
 			}
 			catch (const std::exception& e)
 			{
 				LOG_ERR("[UDP] 解密异常: %s\n", e.what());
 				return;
 			}
-			if (!plain)
+			if (plain_len == 0)
 			{
-				return; // 认证失败，静默丢弃
-			}
-			uint8_t inner_type = 0;
-			std::vector<uint8_t> inner_payload;
-			if (!parse_inner_packet(*plain, inner_type, inner_payload))
-			{
+				// 认证失败（GCM tag 不匹配 / 密钥不一致）：不推进窗口、不刷新存活。
+				// 限流报前 3 条——静默丢弃会让"密钥/帧有问题"看起来和"对端不可达"一样
+				const uint32_t n = m_auth_fail_logged.fetch_add(1);
+				if (n < 3)
+				{
+					LOG_ERR("[UDP] 收到的密文帧认证失败（密钥不匹配/帧被篡改），丢弃%s",
+						(n == 2) ? "（同类日志已抑制）" : "");
+				}
 				return;
 			}
+			// 验证通过才提交反重放窗口 + 刷新存活时间
+			if (!m_replay.accept(seq_host)) {
+				// 重放/乱序过旧帧：静默丢弃会让"被丢帧"看起来像"对端不可达"
+				const uint32_t n = m_replay_reject_logged.fetch_add(1);
+				if (n < 3)
+				{
+					LOG_ERR("[UDP] 帧被反重放窗口拒绝（seq=%u），丢弃%s",
+						seq_host, (n == 2) ? "（同类日志已抑制）" : "");
+				}
+				return;
+			}
+			m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+			if (plain_len < 1)
+				return;
+			const uint8_t inner_type = plain[0];
+			// 数据面（热路径）直接从栈缓冲零拷贝入队；其余小载荷（心跳/身份）
+			// 拷进临时 vector 走原有分发逻辑
+			if (inner_type == static_cast<uint8_t>(m_data))
+			{
+				if (plain_len <= 1)
+					return;
+				{
+					packet_buffer pbuf(plain + 1, plain_len - 1);
+					m_recvqueue.push(std::move(pbuf));
+				}
+				return;
+			}
+			std::vector<uint8_t> inner_payload(plain + 1, plain + plain_len);
 			switch (inner_type)
 			{
 			case m_data:
@@ -884,8 +942,12 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 				sig_ok = false;
 			}
 			if (!sig_ok) {
-				// 中间人攻击：服务器签名校验失败，直接断开
-				LOG_ERR("[UDP] SIG_SRV_PUB 验签失败：无法确认服务器身份，断开连接\n");
+				// 可能是中间人，也可能是"用来验签的公钥与服务器身份不一致"
+				//（服务器条目留空 ServerPubKey 时用的是内置固定公钥；
+				//  服务器换了身份密钥也会这样）。两种都表现为握手刚起步就断开
+				LOG_ERR("[UDP] SIG_SRV_PUB 验签失败：无法确认服务器身份，断开连接\n"
+					"      请核对本条目是否配了正确的 ServerPubKey（留空 = 用内置固定公钥），\n"
+					"      以及服务端 keys/server_sig.pub 是否与之一致（服务端启动日志会打印指纹）\n");
 				m_auth_failed.store(true);
 				break;
 			}

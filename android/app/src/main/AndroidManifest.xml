@@ -7,7 +7,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- allowBackup=false：应用私有数据（服务器列表/ClientID/RegisterToken 等）
+         不经 adb backup / 云备份 / 换机迁移外流。客户端身份私钥本身已由 Keystore
+         加密（换机后也解不开），但配置没必要跟着离开设备，直接禁掉最干净。
+         Android 12+ 的 dataExtractionRules 不设时 allowBackup=false 同样覆盖 D2D。 -->
     <application
+        android:allowBackup="false"
         android:label="@string/app_name"
         android:icon="@android:drawable/sym_def_app_icon"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">

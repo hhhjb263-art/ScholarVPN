@@ -17,7 +17,7 @@
 
 **合规使用示例（仅供学习）：**
 
-- ✅ 用于课堂教学、学术研究与代码阅读。
+- ✅ 用于学术研究与代码阅读。
 
 > 若你无法确保使用方式合法合规，请勿下载、编译或运行本项目。
 
@@ -49,7 +49,7 @@
 - 每个客户端（按 UDP 源 IP+端口 识别）对应一个独立 `Session`，认证状态、会话密钥、发送队列与心跳完全隔离；
 - **虚拟 IP 自动分配**：客户端认证通过后，服务端在 TUN 网段内自动分配唯一地址并通告给客户端，客户端连接成功后自动采用；
 - **epoll 事件驱动**：TCP 连接由单线程 epoll 事件循环统一 accept / 读 / 断开收尾（连接 fd 非阻塞，其他线程通过断开标志请求关闭，无跨线程 close 竞争），并发连接数不再受线程数限制；
-- **同身份互踢**：同一 `ClientID` 重复登录时旧的在线会话自动下线；
+- **同身份互踢**：同一**身份（Ed25519 公钥）**重复登录时，旧的在线会话自动下线（按公钥判定，与 `ClientID` 无关）；
 - **会话上限与清理**：`--max-clients` 限制并发数（默认 64），未认证会话与失联会话按超时自动清理；
 - TUN 下行按**目的虚拟 IP** 查表转发到对应客户端。
 
@@ -82,7 +82,7 @@ Name=公司服务器            # 显示名（留空默认 computer+N）
 ServerIP=1.2.3.4
 ServerPort=51820
 Transport=0                # 传输方式：0=UDP（默认） 1=TCP（运营商丢 UDP 时用，可配合 443 端口）
-ClientID=user1             # 该服务器的客户端标识（登录/注册用）
+ClientID=user1             # 显示名，仅用于日志/界面；不参与认证，可随意填写、无需唯一（≤255 字节）
 RegisterToken=             # 首次注册填管理员下发的令牌，注册成功自动清空即登录模式
 ServerPubKey=              # 可选：该服务器 Ed25519 公钥 base64（44 字符）；留空=用内置公钥
 
@@ -175,7 +175,7 @@ sudo ./start.sh doctor     # 诊断环境，排查断开问题
 - **systemd 运行参数透传**：`install` 会把当前配置固化为 `/etc/default/vpn-server`（systemd `EnvironmentFile`），使 `--max-clients` 等参数在 systemd 模式下同样生效；可直接编辑该文件后 `systemctl restart vpn-server`；
 - 日志：`logs/vpn-server-YYYYMMDD.log`（按天轮转）；systemd 模式下写 `logs/systemd.log`，也可 `journalctl -u vpn-server -f` 查看。
 
-首次启动会自动生成服务器身份密钥对 `keys/server_sig.key` / `keys/server_sig.pub`，请把 `server_sig.pub` 内容硬编码进客户端 `src/main.cpp` 的 `kServerSigPubPem` 常量（客户端用它验证服务器签名，防中间人）。密钥与客户端准入数据库（`register_tokens.txt` / `registered_clients.txt`）说明见 `server/keys/README.txt`。
+首次启动会自动生成服务器身份密钥对 `keys/server_sig.key` / `keys/server_sig.pub`，请把 `server_sig.pub` 内容硬编码进客户端 `src/client/ClientApp.cpp` 的 `kServerSigPubPem` 常量（客户端用它验证服务器签名，防中间人）。密钥与客户端准入数据库（`register_tokens.txt` / `registered_clients.txt`）说明见 `server/keys/README.txt`。
 
 ### 身份认证与注册
 
@@ -210,7 +210,7 @@ sudo ./build/vpn_server --gen-token 5
 | 名称 | 可选，留空自动命名 `computer+N`（显示在卡片与头像上） |
 | 服务器 IP | 必填，如 `1.2.3.4` |
 | 传输方式 | 下拉选择 UDP（默认）/ TCP；TCP 用于运营商丢 UDP 的网络，可配合 443 端口（服务端需 `--transport both|tcp`） |
-| ClientID | 必填，你在该服务器上的身份标识 |
+| ClientID | 必填；客户端显示名，不参与认证（真正身份是本机 Ed25519 密钥），可随意填写、无需唯一 |
 | RegisterToken | 首次注册填管理员下发的令牌；之后留空即登录模式 |
 | 服务器公钥 | 可选，粘贴该服务器 `server_sig.pub` 完整内容；留空用客户端内置公钥 |
 
@@ -219,7 +219,7 @@ sudo ./build/vpn_server --gen-token 5
 ### 注册与登录
 
 - **注册**：令牌填入 RegisterToken 后连接，认证通过即注册成功（令牌一次性，客户端自动清空）；
-- **登录**：之后连接令牌留空，直接以 ClientID + 本机身份密钥登录；
+- **登录**：之后连接令牌留空，直接以本机身份密钥登录（`ClientID` 仅作显示）；
 - 每台服务器独立注册，互不影响。
 
 ### 连接 / 断开
@@ -246,7 +246,7 @@ sudo ./build/vpn_server --gen-token 5
 - **客户端 IOCP 模型**：客户端收发目前为线程模型（收发等待已事件驱动），后续可引入 I/O 完成端口（IOCP），提升高并发、高吞吐场景下的性能
 - **智能分流**：按规则分流流量，如国内直连、国外走隧道，避免全局代理
 - **日志窗口与流量统计**：GUI 内查看连接日志；累计流量统计与限速（实时速率曲线已完成）
-- **系统托盘**：最小化到托盘、开机自启等
+- **开机自启**：开机自动启动、启动时自动连接等（系统托盘 / 最小化到托盘已实现）
 
 ## 许可证
 

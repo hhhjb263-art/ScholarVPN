@@ -71,12 +71,16 @@
       <Command>xcopy /Y /D "$(ProjectDir)third_party\openssl\bin\libcrypto-3-x64.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)third_party\wintun-0.14.1\wintun\bin\amd64\wintun.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)src\gui\style.qss" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)source\icon.ico" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Widgetsd.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Guid.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Cored.dll" "$(OutDir)"
 
 if not exist "$(OutDir)platforms" mkdir "$(OutDir)platforms"
-xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindowsd.dll" "$(OutDir)platforms\"</Command>
+xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindowsd.dll" "$(OutDir)platforms\"
+
+if not exist "$(OutDir)imageformats" mkdir "$(OutDir)imageformats"
+xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qicod.dll" "$(OutDir)imageformats\"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -105,11 +109,15 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindowsd.dll" "$(OutDir)
       <Command>xcopy /Y /D "$(ProjectDir)third_party\openssl\bin\libcrypto-3-x64.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)third_party\wintun-0.14.1\wintun\bin\amd64\wintun.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)src\gui\style.qss" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)source\icon.ico" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Widgets.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Gui.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Core.dll" "$(OutDir)"
 if not exist "$(OutDir)platforms" mkdir "$(OutDir)platforms"
-xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindows.dll" "$(OutDir)platforms\"</Command>
+xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\platforms\qwindows.dll" "$(OutDir)platforms\"
+
+if not exist "$(OutDir)imageformats" mkdir "$(OutDir)imageformats"
+xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)imageformats\"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>

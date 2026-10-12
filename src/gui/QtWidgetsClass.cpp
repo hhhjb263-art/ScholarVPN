@@ -11,6 +11,10 @@
 #include <QRegularExpression>
 #include <QStyle>
 #include<QComboBox>
+#include <QApplication>  
+#include <QAction>       
+#include <QCoreApplication> 
+#include <QIcon>
 
 
 
@@ -18,6 +22,8 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	: QWidget(parent)
 {
 	ui.setupUi(this);
+
+	
 	this->setFixedSize(430, 750);
 	this->setWindowTitle("ScholarVPN");
 
@@ -396,6 +402,7 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	speedTimer->start(1000);
 
 	Read_iniFile();   // 读 config，为每台服务器建卡
+	createtray();
 }
 
 QtWidgetsClass::~QtWidgetsClass()
@@ -892,6 +899,86 @@ void QtWidgetsClass::resizeEvent(QResizeEvent* ev)
 	QWidget::resizeEvent(ev);
 	if (m_diaCard && !m_diaCard->isHidden())
 		m_diaCard->setGeometry(this->rect());
+}
+
+void QtWidgetsClass::createtray()
+{
+	if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+		qDebug() << "系统托盘不可用，跳过托盘初始化";
+		return;
+	}
+
+	m_trayicon = new QSystemTrayIcon(this);
+
+	// 托盘图标：优先 Qt 资源，其次相对路径查找（基准为 exe 所在目录），
+	// 最后回退系统标准图标。
+	// 注意：本工程没有 .qrc，":/source/icon.ico" 实际取不到
+	QIcon trayIcon(":/source/icon.ico");
+	if (trayIcon.isNull()) {
+		const QString dir = QCoreApplication::applicationDirPath();
+		const QString candidates[] = {
+			dir + "/icon.ico",                    // 相对 exe 目录：PostBuild 拷贝来的 icon.ico
+			dir + "/source/icon.ico",             // 相对 exe 目录：exe 旁若有 source 子目录
+			QStringLiteral("source/icon.ico")     // 相对当前工作目录（VS 调试时 cwd = 工程根）
+		};
+		for (const QString& p : candidates) {
+			QIcon candidate(p);
+			if (!candidate.isNull()) { trayIcon = candidate; break; }
+		}
+	}
+	if (trayIcon.isNull()) {
+		qDebug() << "托盘图标加载失败（无 .qrc 且未找到 icon.ico），使用系统默认图标";
+		trayIcon = style()->standardIcon(QStyle::SP_ComputerIcon);
+	}
+	m_trayicon->setIcon(trayIcon);           
+	m_trayicon->setToolTip("ScholarVPN");
+
+	m_menu = new QMenu(this);
+	m_actionShow = new QAction(QStringLiteral("显示主窗口"), this);
+	m_actionQuit = new QAction(QStringLiteral("退出"), this);
+	m_menu->addAction(m_actionShow);
+	m_menu->addSeparator();
+	m_menu->addAction(m_actionQuit);
+
+	m_trayicon->setContextMenu(m_menu);
+
+	connect(m_actionShow, &QAction::triggered, this, [this] {
+		this->showNormal();
+		this->raise();
+		this->activateWindow();
+	});
+	connect(m_actionQuit, &QAction::triggered, qApp, &QApplication::quit);
+	connect(m_trayicon, &QSystemTrayIcon::activated, this,
+		[this](QSystemTrayIcon::ActivationReason reason) {
+			if (reason == QSystemTrayIcon::Trigger) //左键单击
+			{
+				// 最小化的窗口 isVisible() 仍为 true，只判断 isVisible 会"点了没反应"
+				if (this->isVisible() && !this->isMinimized())
+					this->hide();
+				else
+				{
+					this->showNormal();
+					this->raise();
+					this->activateWindow();
+				}
+			}
+		});
+	m_trayicon->show();
+}	
+
+
+void QtWidgetsClass::closeEvent(QCloseEvent* event)
+{
+	if (m_trayicon && m_trayicon->isVisible())
+	{
+		hide();
+		m_trayicon->showMessage("提示", "程序最小化到托盘，右键托盘图标操作");
+		event->ignore(); // 忽略关闭事件，不退出
+	}
+	else
+	{
+		event->accept();
+	}
 }
 
 void QtWidgetsClass::edit_card()

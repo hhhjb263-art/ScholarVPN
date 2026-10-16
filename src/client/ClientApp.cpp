@@ -109,9 +109,36 @@ void ClientApp::save_config()
     config.SaveClientConfig(m_cfg);
 }
 
+// 当前进程是否已提权（管理员）。用令牌 TokenElevation 判定：即使登录账户是管理员，
+// 只要未提权（UAC 未过），TokenIsElevated 仍为 0，此时同样无法创建网卡/改路由。
+bool ClientApp::is_elevated()
+{
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
+    {
+        return false;
+    }
+    TOKEN_ELEVATION elev{};
+    DWORD ret = 0;
+    const BOOL ok = ::GetTokenInformation(token, TokenElevation, &elev, sizeof(elev), &ret);
+    ::CloseHandle(token);
+    return ok != FALSE && elev.TokenIsElevated != 0;
+}
+
 bool ClientApp::init()
 {
     Logger::Init();
+
+    // 免 UAC 启动：普通用户也能运行本程序（界面/托盘可用），但创建 Wintun 网卡、
+    // 改路由、改 DNS 都需要管理员权限，连接功能因此不可用。这里提前拦截并给出明确
+    // 原因——否则要走到 WintunTun::init_tun() 才失败，而 GUI 未接日志，用户只会看到
+    // "点了没反应"。
+    if (!is_elevated())
+    {
+        LOG_ERR("[权限] 当前以普通用户运行：创建虚拟网卡 / 修改路由 / 修改 DNS 需要管理员权限，"
+                "连接功能不可用。请右键程序选择「以管理员身份运行」后重试。");
+        return false;
+    }
 
     // 启动兜底清扫（只执行一次，且在 bridge 工作线程，不会卡 GUI）：
     // 上次进程异常退出（崩溃/被杀/断电）时，黑洞 DNS / DisableSmartNameResolution

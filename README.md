@@ -194,7 +194,7 @@ sudo ./build/vpn_server --gen-token 5
 
 ### 首次运行
 
-1. **以管理员身份运行** `ScholarVPN.exe`（程序清单已要求管理员权限：创建 Wintun 虚拟网卡、改路由、改 DNS 均需要）；
+1. 可直接双击运行 `ScholarVPN.exe`（**免 UAC**，普通用户即可启动，界面与托盘可用）；但**建立连接需要管理员权限**（创建 Wintun 虚拟网卡、改路由、改 DNS 均需要），连接前请右键选择「以管理员身份运行」；
 2. 首次运行自动生成 Ed25519 身份密钥（位于 `%APPDATA%\ScholarVPN\`）：
    - `client.id.pub`：明文公钥（交给服务器管理员登记）
    - `client.id.enc`：私钥（Windows DPAPI 加密，绑定当前 Windows 用户，磁盘不落明文）

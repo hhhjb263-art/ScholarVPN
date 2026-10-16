@@ -282,6 +282,15 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 			return;
 		const ServerEntry entry = m_cardServers[m_selectedCard];
 		if (m_state == ConnState::Stopped) {
+			// 免 UAC 启动：普通用户可运行本程序（界面/托盘可用），但建立连接需要
+			// 管理员权限（建 Wintun 网卡 / 改路由 / 改 DNS）。这里先拦截并明确告知，
+			// 否则初始化在后台失败、日志又没接到界面上，用户只看到"点了没反应"。
+			if (!ClientApp::is_elevated()) {
+				QMessageBox::information(this, QStringLiteral("需要管理员权限"),
+					QStringLiteral("建立 VPN 需要创建虚拟网卡、修改路由与 DNS，这些操作需要管理员权限。\n\n"
+						"请关闭本程序，右键 ScholarVPN.exe →「以管理员身份运行」后再点击连接。"));
+				return;
+			}
 			m_activeCard = m_selectedCard;
 			// 必须投递到 bridge 所在线程（moveToThread 只作用于信号槽连接，直接调用
 			// 会在 GUI 线程同步执行 init()/建网卡/restore() 等重型操作 → 界面卡死无响应）

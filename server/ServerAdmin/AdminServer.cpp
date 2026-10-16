@@ -362,6 +362,7 @@ pre{white-space:pre-wrap;margin:6px 0}
 <fieldset><legend>注册令牌</legend>
 <div class="row">数量 <input id="count" type="number" min="1" max="1000" value="5"><button id="gen">申请</button><span id="msg" class="err"></span></div>
 <div id="tokens">加载中…</div>
+<div class="row" style="margin-top:8px"><button id="export">一键导出（公钥 + 令牌）</button></div>
 </fieldset>
 <script>
 const TKEY='admin_token';
@@ -428,6 +429,17 @@ document.getElementById('gen').onclick=async()=>{
 document.querySelectorAll('[data-copy]').forEach(b=>b.onclick=()=>{
   navigator.clipboard.writeText(document.getElementById(b.dataset.copy).textContent);
 });
+document.getElementById('export').onclick=async()=>{
+  try{
+    const j=await api('GET','/api/export');
+    const blob=new Blob([JSON.stringify(j,null,2)],{type:'application/json'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='scholarvpn-export.json';
+    document.body.appendChild(a);a.click();a.remove();
+    URL.revokeObjectURL(a.href);
+  }catch(e){msg(e.message);}
+};
 loadInfo();loadTokens();
 </script>
 </body>
@@ -757,11 +769,13 @@ protected:
             return {401, "{\"error\":\"unauthorized\"}"};
         }
         if (req.method == "GET" && req.path == "/api/tokens") return apiList();
+        if (req.method == "GET" && req.path == "/api/export") return apiExport();
         if (req.method == "POST" && req.path == "/api/tokens") return apiGen(req, ip);
         if (req.method == "DELETE" && req.path.rfind("/api/tokens/", 0) == 0) return apiDel(req, ip);
         if (req.path.rfind("/api/", 0) == 0) {
             // 认识的路径但方法不对 → 405；纯未知路径 → 404（spec 9：路由精确到方法+路径）
             const bool known = req.path == "/api/info" || req.path == "/api/tokens"
+                            || req.path == "/api/export"
                             || req.path.rfind("/api/tokens/", 0) == 0;
             if (known) return {405, "{\"error\":\"method not allowed\"}"};
         }
@@ -780,6 +794,28 @@ private:
         return {200, "{\"version\":\"1.0\"," + pk +
                      ",\"ip\":\"" + jsonEscape(vpn_ip_) +
                      "\",\"port\":" + std::to_string(vpn_port_) + "}"};
+    }
+
+    // GET /api/export —— 一键导出：公钥（PEM+hex）+ 监听信息 + 未消费令牌，一次拿全。
+    // 管理端「一键导出」按钮直接下载本接口的 JSON。令牌被消费后由服务端删行，
+    // 所以这里天然只含未消费令牌（与 /api/tokens 同源）。
+    HttpReply apiExport() const {
+        std::string pem, hex;
+        std::string pk = "\"pubkey_pem\":null,\"pubkey_hex\":null";
+        if (readPubkey(pubkey_path_, pem, hex))
+            pk = "\"pubkey_pem\":\"" + jsonEscape(pem) + "\",\"pubkey_hex\":\"" + hex + "\"";
+        bool ok = false;
+        const std::vector<std::string> toks = listTokens(tokens_path_, ok);
+        if (!ok) return {500, "{\"error\":\"read tokens failed\"}"};
+        std::string body = "{\"version\":\"1.0\"," + pk +
+                           ",\"ip\":\"" + jsonEscape(vpn_ip_) +
+                           "\",\"port\":" + std::to_string(vpn_port_) +
+                           ",\"tokens\":[";
+        for (size_t i = 0; i < toks.size(); ++i) {
+            if (i) body += ",";
+            body += "\"" + toks[i] + "\"";
+        }
+        return {200, body + "]}"};
     }
 
     HttpReply apiList() const {

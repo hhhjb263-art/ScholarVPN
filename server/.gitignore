@@ -18,3 +18,8 @@ keys/*
 
 # 运行时产物（watchdog 脚本 / PID / 停止标志）
 run/
+
+# 后台管理组件（admin-vpn.sh / admin-relay.sh）的运行时产物
+logs/
+agents.txt
+relay_admin_token.txt

@@ -102,23 +102,7 @@ bool send_all(int fd, const std::string& data)
     return true;
 }
 
-// 收一帧：1=取到 0=超时 -1=连接坏
-int recv_frame(int fd, wire::Framer& fr, std::string& frame, int timeout_ms)
-{
-    if (fr.next(frame)) return 1;
-    pollfd p{}; p.fd = fd; p.events = POLLIN;
-    const int pr = ::poll(&p, 1, timeout_ms);
-    if (pr == 0) return 0;
-    if (pr < 0) return (errno == EINTR) ? 0 : -1;
-    if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
-    char buf[4096];
-    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-    if (n == 0) return -1;
-    if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
-    fr.feed(buf, size_t(n));
-    if (fr.bad()) return -1;
-    return fr.next(frame) ? 1 : 0;
-}
+// 收一帧见 AdminWire.h 的 wire::recv_frame（循环读到凑齐或超时）
 
 // 解析 HTTP 响应（Connection: close 语义：头 + 之后全是 body）
 bool parse_http(const std::string& raw, int& status, std::string& body)
@@ -268,7 +252,7 @@ bool Agent::connect_and_serve()
     std::string frame, type;
 
     // 1) 等 controller 下发的挑战
-    if (recv_frame(fd, fr, frame, wire::kTimeoutMs) != 1 ||
+    if (wire::recv_frame(fd, fr, frame, wire::kTimeoutMs) != 1 ||
         !wire::get_string(frame, "type", type) || type != "challenge") {
         fprintf(stderr, "[agent] 未收到 challenge\n");
         ::close(fd);
@@ -279,19 +263,30 @@ bool Agent::connect_and_serve()
 
     // 2) 签名 + hello（上报公钥指纹，controller 据此比对白名单）
     const std::string sig = sign_challenge(nonce);
-    if (sig.empty() ||
-        !wire::send_frame(fd, wire::Json().str("type", "hello")
+    if (sig.empty()) {
+        fprintf(stderr, "[agent] 挑战签名失败\n");
+        ::close(fd);
+        return false;
+    }
+    if (!wire::send_frame(fd, wire::Json().str("type", "hello")
                                   .str("pubkey_hex", pub_hex_)
                                   .str("sig", sig)
                                   .str("name", opt_.name)
                                   .done())) {
+        fprintf(stderr, "[agent] 发送 hello 失败\n");
         ::close(fd);
         return false;
     }
 
     // 3) 等准入结果
-    if (recv_frame(fd, fr, frame, wire::kTimeoutMs) != 1 ||
-        !wire::get_string(frame, "type", type)) {
+    const int wr = wire::recv_frame(fd, fr, frame, wire::kTimeoutMs);
+    if (wr != 1) {
+        fprintf(stderr, "[agent] 等待准入结果%s\n", wr == 0 ? "超时" : "时连接断开");
+        ::close(fd);
+        return false;
+    }
+    if (!wire::get_string(frame, "type", type)) {
+        fprintf(stderr, "[agent] 准入结果帧格式不对\n");
         ::close(fd);
         return false;
     }
@@ -307,7 +302,7 @@ bool Agent::connect_and_serve()
     // 4) 心跳 + 命令循环
     auto last_hb = std::chrono::steady_clock::now();
     while (running_.load()) {
-        const int r = recv_frame(fd, fr, frame, kPollSliceMs);
+        const int r = wire::recv_frame(fd, fr, frame, kPollSliceMs);
         if (r < 0) { ::close(fd); return false; }
         if (r == 1) {
             std::string t;

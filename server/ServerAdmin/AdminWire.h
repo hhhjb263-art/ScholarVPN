@@ -8,12 +8,14 @@
 // ============================================================================
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>     // strtoll
 #include <cstring>
 #include <string>
 
 #include <errno.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -169,5 +171,46 @@ private:
     std::string buf_;
     bool bad_ = false;
 };
+
+// ---------------------------------------------------------------- 收帧
+// 收一帧：1=取到完整帧 0=timeout_ms 内没凑齐 -1=连接坏。
+// 必须循环读而不是单次 recv：send_frame 的长度头(4B)与载荷是两个 send，
+// TCP 可能分两段到达——只拿到半帧时不能当成连接故障，否则握手会随
+// 分片时序随机失败（表现为 agent 连上瞬间断开、退避重连的死循环）。
+// 另外对端"发完就关"（reject 后 close）时 revents 会带 POLLHUP：
+// 不能见 HUP 就返回 -1，要把已到达的字节读出来；recv 返回 0 才算断开。
+inline int recv_frame(int fd, Framer& fr, std::string& frame, int timeout_ms)
+{
+    if (fr.next(frame)) return 1;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        const auto remain =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        pollfd p{};
+        p.fd = fd;
+        p.events = POLLIN;
+        const int pr = ::poll(&p, 1, remain > 0 ? static_cast<int>(remain) : 1);
+        if (pr == 0) return 0;
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (p.revents & (POLLERR | POLLNVAL)) return -1;
+
+        char buf[4096];
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n == 0) return -1;   // 对端关闭（缓冲数据已读完）
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            return -1;
+        }
+        fr.feed(buf, static_cast<size_t>(n));
+        if (fr.bad()) return -1;
+        if (fr.next(frame)) return 1;
+    }
+}
 
 }  // namespace wire

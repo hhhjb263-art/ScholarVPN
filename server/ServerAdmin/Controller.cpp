@@ -99,23 +99,7 @@ bool send_all(int fd, const std::string& data)
     return true;
 }
 
-// 收一帧：1=取到 0=超时 -1=连接坏
-int recv_frame(int fd, wire::Framer& fr, std::string& frame, int timeout_ms)
-{
-    if (fr.next(frame)) return 1;
-    pollfd p{}; p.fd = fd; p.events = POLLIN;
-    const int pr = ::poll(&p, 1, timeout_ms);
-    if (pr == 0) return 0;
-    if (pr < 0) return (errno == EINTR) ? 0 : -1;
-    if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
-    char buf[4096];
-    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-    if (n == 0) return -1;
-    if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
-    fr.feed(buf, size_t(n));
-    if (fr.bad()) return -1;
-    return fr.next(frame) ? 1 : 0;
-}
+// 收一帧见 AdminWire.h 的 wire::recv_frame（循环读到凑齐或超时）
 
 const char* reason_phrase(int status)
 {
@@ -276,7 +260,7 @@ void Controller::agent_loop()
         }
         wire::Framer fr;
         std::string frame, type, pub_hex, sig_hex, name;
-        if (recv_frame(cfd, fr, frame, wire::kTimeoutMs) != 1 ||
+        if (wire::recv_frame(cfd, fr, frame, wire::kTimeoutMs) != 1 ||
             !wire::get_string(frame, "type", type) || type != "hello" ||
             !wire::get_string(frame, "pubkey_hex", pub_hex) ||
             !wire::get_string(frame, "sig", sig_hex)) {
@@ -333,7 +317,7 @@ void Controller::agent_loop()
 
         // ---- 长连接：收心跳 / 命令回执，直到断开或心跳超时 ----
         while (running_.load()) {
-            const int r = recv_frame(cfd, ag->fr, frame, kPollSliceMs);
+            const int r = wire::recv_frame(cfd, ag->fr, frame, kPollSliceMs);
             if (r < 0) break;
             if (r == 0) {
                 if (now_ms() - ag->last_seen > kHeartbeatGap) {

@@ -6,7 +6,11 @@
 #include <QSettings>
 #include <QFont>
 #include <QDialog>
+#include <QCheckBox>
 #include <QMessageBox>
+#include <QDir>
+#include <QListWidget>
+#include <QStackedWidget>
 #include <QPlainTextEdit>
 #include <QRegularExpression>
 #include <QStyle>
@@ -84,9 +88,35 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	)");
 
 
-	auto* leftPad = new QWidget(this);
-	leftPad->setFixedWidth(34);                      // 与"+"按钮同宽，保证对称
-	topBar->addWidget(leftPad);
+	// 设置按钮（齿轮）：打开设置子页面（含「通用」栏 / 开机自启动）。
+	// 放品牌左侧，与右侧"添加服务器"按钮对称，样式保持一致。
+	QPushButton* btn_setting = new QPushButton(QStringLiteral("⚙"), this);
+	btn_setting->setFixedSize(34, 34);
+	btn_setting->setCursor(Qt::PointingHandCursor);
+	btn_setting->setToolTip(QStringLiteral("设置"));
+	btn_setting->setStyleSheet(R"(
+	QPushButton{
+		background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #3b82f6,stop:1 #2563eb);
+		border:none;
+		border-radius:17px;
+		color:white;
+		font-size:13pt;
+		text-align:center;
+		padding:0 0 2px 0;
+	}
+	QPushButton:hover{
+		background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #4f8ef7,stop:1 #2f6fe8);
+	}
+	QPushButton:pressed{
+		background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #2b6fd4,stop:1 #1e56b8);
+	}
+	)");
+	connect(btn_setting, &QPushButton::clicked, this, [this]() {
+		Setting dlg(this);
+		dlg.exec();
+	});
+
+	topBar->addWidget(btn_setting);
 	topBar->addStretch(1);
 	topBar->addLayout(brand);
 	topBar->addStretch(1);
@@ -1261,5 +1291,188 @@ void QtWidgetsClass::update_speed()
 	}
 	m_rxLast = rx;
 	m_txLast = tx;
+}
+
+
+namespace {
+
+// 开机自启动：用 QSettings 写当前用户注册表 Run 键（HKCU，无需管理员权限）。
+// 值 = "<exe 完整路径>"，用户登录时由系统拉起。
+const QString kRunKey =
+	QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const QString kRunValue = QStringLiteral("ScholarVPN");
+
+// 带引号的 exe 路径（防路径含空格）
+QString autostart_command()
+{
+	return QLatin1Char('"')
+		+ QDir::toNativeSeparators(QCoreApplication::applicationFilePath())
+		+ QLatin1Char('"');
+}
+
+bool autostart_is_enabled()
+{
+	QSettings reg(kRunKey, QSettings::NativeFormat);
+	const QString value = reg.value(kRunValue).toString();
+	if (value.isEmpty())
+		return false;
+	// 用 exe 路径判定：程序挪过位置则视为未启用（重新勾选会写入新路径）
+	return value.contains(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()),
+		Qt::CaseInsensitive);
+}
+
+bool autostart_set(bool enable)
+{
+	QSettings reg(kRunKey, QSettings::NativeFormat);
+	if (enable)
+		reg.setValue(kRunValue, autostart_command());
+	else
+		reg.remove(kRunValue);
+	reg.sync();
+	return reg.status() == QSettings::NoError;
+}
+
+} // namespace
+
+Setting::Setting(QWidget* parent)
+	: QDialog(parent)
+{
+	create_setting();
+}
+
+Setting::~Setting() = default;
+
+void Setting::create_setting()
+{
+	setWindowTitle(QStringLiteral("设置"));
+
+	constexpr int SETTING_DLG_MIN_WIDTH = 430;
+	constexpr int SETTING_DLG_MAX_WIDTH = 520;
+	constexpr int SETTING_DLG_HEIGHT = 380;
+	constexpr int NAV_WIDTH = 112;
+
+	int dlgWidth = SETTING_DLG_MIN_WIDTH;
+	if (parentWidget())
+	{
+		dlgWidth = qMin(parentWidget()->width(), SETTING_DLG_MAX_WIDTH);
+	}
+	setFixedSize(dlgWidth, SETTING_DLG_HEIGHT);
+
+	// 窗口居中到父窗口
+	if (parentWidget())
+	{
+		this->move(parentWidget()->window()->frameGeometry().center() - this->frameGeometry().center());
+	}
+
+	setStyleSheet("QDialog{ background-color:#f7f8fc; }");
+	auto* root = new QVBoxLayout(this);
+	root->setContentsMargins(18, 16, 18, 16);
+	root->setSpacing(12);
+
+	QLabel* title = new QLabel(QStringLiteral("设置"), this);
+	title->setStyleSheet("font-size:15pt; font-weight:bold; color:#1f2937; background:transparent;");
+	root->addWidget(title);
+
+	auto* body = new QHBoxLayout;
+	body->setSpacing(14);
+
+	QListWidget* nav = new QListWidget(this);
+	nav->setFixedWidth(NAV_WIDTH);
+	nav->setFrameShape(QFrame::NoFrame);
+	nav->setStyleSheet(R"(
+    QListWidget{ background:transparent; border:none; outline:none; }
+    QListWidget::item{ height:36px; border-radius:10px; padding-left:12px; color:#5b6472; font-size:10pt; }
+    QListWidget::item:selected{ background-color:#e8f0fe; color:#2563eb; font-weight:bold; }
+    QListWidget::item:hover{ background-color:#eef2fa; }
+    )");
+	nav->addItem(QStringLiteral("通用"));
+	nav->setCurrentRow(0);
+
+	QStackedWidget* stack = new QStackedWidget(this);
+
+	QWidget* generalPage = new QWidget;
+	auto* genLay = new QVBoxLayout(generalPage);
+	genLay->setContentsMargins(0, 0, 0, 0);
+	genLay->setSpacing(8);
+
+	QFrame* card = new QFrame(generalPage);
+	card->setObjectName("setCard");
+	card->setStyleSheet(R"(
+    QFrame#setCard{ background-color:#ffffff; border:1px solid #e8ecf3; border-radius:12px; }
+    )");
+	auto* cardLay = new QVBoxLayout(card);
+	cardLay->setContentsMargins(14, 12, 14, 12);
+	cardLay->setSpacing(6);
+
+	m_chkAutoStart = new QCheckBox(QStringLiteral("开机自启动"), card);
+	m_chkAutoStart->setCursor(Qt::PointingHandCursor);
+	m_chkAutoStart->setStyleSheet("font-size:10pt; color:#1f2937; background:transparent;");
+	m_chkAutoStart->setChecked(autostart_is_enabled());
+	cardLay->addWidget(m_chkAutoStart);
+
+	QLabel* hint = new QLabel(
+		QStringLiteral("开机后自动启动 ScholarVPN（当前用户，无需管理员权限）"), card);
+	hint->setStyleSheet("font-size:8pt; color:#9aa3b8; background:transparent;");
+	hint->setWordWrap(true);
+	cardLay->addWidget(hint);
+
+	genLay->addWidget(card);
+	genLay->addStretch();
+	stack->addWidget(generalPage);
+
+	connect(nav, &QListWidget::currentRowChanged, stack, &QStackedWidget::setCurrentIndex);
+	body->addWidget(nav);
+	body->addWidget(stack, 1);
+	root->addLayout(body, 1);
+
+	auto* btnRow = new QHBoxLayout;
+	btnRow->setSpacing(10);
+	btnRow->addStretch();
+
+	QPushButton* btnCancel = new QPushButton(QStringLiteral("取消"), this);
+	btnCancel->setFixedSize(96, 36);
+	btnCancel->setCursor(Qt::PointingHandCursor);
+	btnCancel->setStyleSheet(R"(
+    QPushButton{
+        background-color:#ffffff;
+        border:1px solid #e2e6ee;
+        border-radius:18px;
+        color:#5b6472;
+        font-size:10pt;
+    }
+    QPushButton:hover{ border:1px solid #3b82f6; color:#2563eb; }
+    QPushButton:pressed{ background-color:#eef2fa; }
+    )");
+	connect(btnCancel, &QPushButton::clicked, this, &QDialog::reject);
+
+	QPushButton* btnOk = new QPushButton(QStringLiteral("确认"), this);
+	btnOk->setFixedSize(96, 36);
+	btnOk->setCursor(Qt::PointingHandCursor);
+	btnOk->setDefault(true);
+	btnOk->setStyleSheet(R"(
+    QPushButton{
+        background-color:#2563eb;
+        border:none;
+        border-radius:18px;
+        color:white;
+        font-size:10pt;
+        font-weight:bold;
+    }
+    QPushButton:hover{ background-color:#2f6fe8; }
+    QPushButton:pressed{ background-color:#1e56b8; }
+    )");
+	connect(btnOk, &QPushButton::clicked, this, [this]() {
+		if (!autostart_set(m_chkAutoStart->isChecked()))
+		{
+			QMessageBox::warning(this, QStringLiteral("设置失败"),
+				QStringLiteral("无法写入开机自启动项（注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run）。"));
+			return;
+		}
+		accept();
+		});
+
+	btnRow->addWidget(btnCancel);
+	btnRow->addWidget(btnOk);
+	root->addLayout(btnRow);
 }
 

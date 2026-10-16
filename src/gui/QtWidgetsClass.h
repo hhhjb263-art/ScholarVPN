@@ -6,6 +6,8 @@
 #include <QVBoxLayout>
 #include "ui_QtWidgetsClass.h"
 #include <QFrame>
+#include <QDialog>
+#include <QCheckBox>
 #include <QLabel>
 #include <QPushButton>
 #include <QThread>
@@ -194,4 +196,13 @@ private:
 	QAction* m_actionShow = nullptr;
 	QAction* m_actionQuit = nullptr;
 
+};
+
+class Setting : public QDialog {
+public:
+	explicit Setting(QWidget* parent = nullptr);
+	~Setting();
+private:
+	void create_setting();
+	QCheckBox* m_chkAutoStart = nullptr;
 };

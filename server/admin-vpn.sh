@@ -109,19 +109,35 @@ check_deps() {
 }
 
 # ---------------------------------------------------------------- 构建
-build_if_needed() {
-    if [ -x "$ADMIN_BIN" ] && [ -x "$AGENT_BIN" ]; then
-        ok "可执行文件已存在，跳过构建（强制重建：rm -rf build）"
-        return 0
-    fi
-    info "构建 admin_server / admin_agent ..."
-    cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
+build_targets() {   # 配置 + 编译两个组件（build / rebuild / start 自动构建共用）
+    info "构建 admin_server / admin_agent（BUILD_TYPE=${BUILD_TYPE-Release}）..."
+    cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="${BUILD_TYPE-Release}" \
         || die "cmake 配置失败（先跑 ./admin-vpn.sh doctor 看依赖）"
     cmake --build "$BUILD_DIR" --target admin_server admin_agent \
         -j"$(nproc 2>/dev/null || echo 2)" || die "编译失败"
     [ -x "$ADMIN_BIN" ] || die "构建后仍找不到 $ADMIN_BIN"
     [ -x "$AGENT_BIN" ] || die "构建后仍找不到 $AGENT_BIN"
+}
+
+build_if_needed() {
+    if [ -x "$ADMIN_BIN" ] && [ -x "$AGENT_BIN" ]; then
+        ok "可执行文件已存在，跳过构建（强制重建：./admin-vpn.sh rebuild）"
+        return 0
+    fi
+    build_targets
     ok "构建完成"
+}
+
+do_build() {
+    check_deps || die "依赖检查未通过（执行 ./admin-vpn.sh doctor 看详情）"
+    build_targets
+    ok "构建完成"
+}
+
+do_rebuild() {
+    info "清空 $BUILD_DIR 后重新编译 ..."
+    rm -rf "$BUILD_DIR" || die "删除 $BUILD_DIR 失败"
+    do_build
 }
 
 # ---------------------------------------------------------------- 首次运行准备
@@ -167,11 +183,15 @@ read_token() {
 }
 
 # ---------------------------------------------------------------- 进程
+# 判存在用 /proc 而不是 kill -0：PID 文件里若是别的属主（曾用 sudo 起过）的进程，
+# kill -0 会因 EPERM 失败被误判成"未运行"。只要进程存在，/proc/<pid> 一定在。
+proc_alive() { [ -n "${1:-}" ] && [ -d "/proc/$1" ]; }
+
 is_running() {
     local pidfile="$1" p
     [ -f "$pidfile" ] || return 1
     p="$(cat "$pidfile" 2>/dev/null)"
-    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+    proc_alive "$p"
 }
 
 wait_log() {   # wait_log <日志文件> <关键字> <最多等几次×0.2s>
@@ -224,15 +244,23 @@ stop_one() {   # stop_one <名字> <pid文件>
     local name="$1" pid="$2" p i=0
     if ! [ -f "$pid" ]; then warn "$name 未运行"; return 0; fi
     p="$(cat "$pid" 2>/dev/null)"
-    if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+    if ! proc_alive "$p"; then
         warn "$name 未运行（残留 pid $p，已清理）"; rm -f "$pid"; return 0
     fi
-    kill "$p" 2>/dev/null
-    while kill -0 "$p" 2>/dev/null && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
-    if kill -0 "$p" 2>/dev/null; then
+    if ! kill "$p" 2>/dev/null; then
+        warn "$name 发送 TERM 失败（pid $p，多半是权限不足）"
+    fi
+    while proc_alive "$p" && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
+    if proc_alive "$p"; then
         warn "$name 未响应 TERM，改用 KILL"
         kill -9 "$p" 2>/dev/null
-        sleep 0.3
+        i=0                              # KILL 后最多再等 1.5s 确认它真的消失
+        while proc_alive "$p" && [ "$i" -lt 15 ]; do sleep 0.1; i=$((i + 1)); done
+    fi
+    # 最终校验：没死就报失败并保留 pid 文件，绝不删了 pid 谎报"已停止"
+    if proc_alive "$p"; then
+        err "$name 仍在运行 (pid $p) —— 确认进程属主，必要时 sudo"
+        return 1
     fi
     rm -f "$pid"
     ok "$name 已停止"
@@ -241,24 +269,27 @@ stop_one() {   # stop_one <名字> <pid文件>
 # 找出匹配某模式的进程 PID（排除自身）。
 # 优先 pgrep；精简系统没有 pgrep 时退化为 ps+awk。
 # 退化路径的关键：先把 ps 快照取完再 awk —— 否则 awk 自己的命令行里就含这个模式，
-# 会把自己也算成"残留进程"然后自杀。用 index() 做字面子串匹配，避免路径里的正则元字符。
-find_pids() {   # find_pids <模式>
+# 会把自己也算成"残留进程"然后自杀。模式按 ERE 处理（pgrep/awk ~ 都是 ERE 语义）。
+find_pids() {   # find_pids <ERE 模式>
     local pat="$1" snap
     if have pgrep; then
         pgrep -f "$pat" 2>/dev/null
     else
         snap="$(ps -eo pid=,args= 2>/dev/null || true)"
-        printf '%s\n' "$snap" | awk -v p="$pat" 'index($0, p) { print $1 }'
+        printf '%s\n' "$snap" | awk -v p="$pat" '$0 ~ p { print $1 }'
     fi | awk -v me="$$" 'NF && $1 != me { print $1 }'
 }
 
 # 兜底清扫：PID 文件可能丢失（旧脚本起的 / 手动起的），只按 pid 文件停会留下孤儿进程
 # —— 也就是"退都没退干净"。
 sweep_orphans() {   # sweep_orphans <可执行文件绝对路径>
-    local pat="$1" pids
+    local bin="$1" pat pids
+    # 同时匹配绝对路径启动和 ./basename / basename 启动（旧脚本、手动起的常见）；
+    # 边界 (^|/)...( |$) 保证不误伤 admin_server.log、admin_server_old 之类。
+    pat="(^|/)${bin##*/}( |\$)"
     pids="$(find_pids "$pat")"
     [ -n "$pids" ] || return 0
-    warn "发现残留进程，一并清理：$pat"
+    warn "发现残留进程，一并清理：$bin"
     printf '%s\n' "$pids" | sed 's/^/    pid /' >&2
     # shellcheck disable=SC2086
     kill $pids 2>/dev/null || true
@@ -268,6 +299,12 @@ sweep_orphans() {   # sweep_orphans <可执行文件绝对路径>
         warn "仍未退出，改用 KILL"
         # shellcheck disable=SC2086
         kill -9 $pids 2>/dev/null || true
+        sleep 0.3
+        pids="$(find_pids "$pat")"
+    fi
+    if [ -n "$pids" ]; then                # 复核后仍在 = 清理失败（多半权限不足）
+        warn "仍有残留未清理（权限不足？）：$(printf '%s' "$pids" | tr '\n' ' ')"
+        return 1
     fi
     return 0
 }
@@ -282,25 +319,31 @@ do_start() {
     local fp tok
     fp="$(fingerprint)" || die "无法获取身份指纹"
 
-    # 端口预检：给出可操作的错误，而不是让 admin_server 自己报 bind 失败
-    if port_in_use "$ADMIN_PORT"; then
-        err "端口 $ADMIN_PORT 已被占用（多半是上次没退干净的 admin_server）"
-        pgrep -af 'admin_server' >&2 || true
-        die "先执行 ./admin-vpn.sh stop，或 pkill -f build/admin_server"
-    fi
+    # 先看自己的 pid 文件：已经在跑就幂等跳过（否则端口预检会把自己占的端口报成冲突）
+    if is_running "$AS_PID"; then
+        warn "admin_server 已在运行 (pid $(cat "$AS_PID"))，跳过启动"
+        info "改了 ADMIN_BIND/ADMIN_PORT 等环境变量需 restart 才生效： ./admin-vpn.sh restart"
+    else
+        # 端口预检：给出可操作的错误，而不是让 admin_server 自己报 bind 失败
+        if port_in_use "$ADMIN_PORT"; then
+            err "端口 $ADMIN_PORT 已被占用（多半是上次没退干净的 admin_server）"
+            pgrep -af 'admin_server' >&2 || true
+            die "先执行 ./admin-vpn.sh stop，或 pkill -f build/admin_server"
+        fi
 
-    # admin_server：显式摘掉 ADMIN_TOKEN，保证它一定去读/写 TOKEN_FILE
-    info "启动 admin_server  ($ADMIN_BIND:$ADMIN_PORT)"
-    start_one admin_server "$AS_PID" "$AS_LOG" \
-        env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN" \
-        || die "启动 admin_server 失败（见上）"
-    if ! wait_log_ok "$AS_LOG" "Server start" "bind failed" 60; then
-        err "admin_server 启动失败，日志："
-        tail -n 20 "$AS_LOG" >&2
-        do_stop >/dev/null 2>&1
-        die "启动失败"
+        # admin_server：显式摘掉 ADMIN_TOKEN，保证它一定去读/写 TOKEN_FILE
+        info "启动 admin_server  ($ADMIN_BIND:$ADMIN_PORT)"
+        start_one admin_server "$AS_PID" "$AS_LOG" \
+            env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN" \
+            || die "启动 admin_server 失败（见上）"
+        if ! wait_log_ok "$AS_LOG" "Server start" "bind failed" 60; then
+            err "admin_server 启动失败，日志："
+            tail -n 20 "$AS_LOG" >&2
+            do_stop >/dev/null 2>&1
+            die "启动失败"
+        fi
+        ok "admin_server 就绪"
     fi
-    ok "admin_server 就绪"
 
     tok="$(read_token)" || die "读不到管理令牌 $TOKEN_FILE"
     [ -n "$tok" ] || die "管理令牌为空"
@@ -387,25 +430,35 @@ do_fg() {
 }
 
 do_stop() {
-    stop_one admin_agent "$AG_PID"
-    stop_one admin_server "$AS_PID"
+    local rc=0
+    stop_one admin_agent "$AG_PID"  || rc=1
+    stop_one admin_server "$AS_PID" || rc=1
     # 兜底：PID 文件缺失时（旧脚本 / 手动起的）只按 pid 文件会漏，扫一遍按名字杀
-    sweep_orphans "$AGENT_BIN"
-    sweep_orphans "$ADMIN_BIN"
+    sweep_orphans "$AGENT_BIN"      || rc=1
+    sweep_orphans "$ADMIN_BIN"      || rc=1
+    return "$rc"
 }
 
 do_kill() {   # 强制清理：不看 PID 文件，直接按可执行路径杀
+    local rc=0
     info "强制清理所有 admin_server / admin_agent 进程"
-    sweep_orphans "$AGENT_BIN"
-    sweep_orphans "$ADMIN_BIN"
+    sweep_orphans "$AGENT_BIN" || rc=1
+    sweep_orphans "$ADMIN_BIN" || rc=1
     rm -f "$AS_PID" "$AG_PID"
-    ok "清理完成"
+    if [ "$rc" -eq 0 ]; then
+        ok "清理完成"
+    else
+        err "清理未完全成功（见上），如需强制请确认权限后用 sudo"
+    fi
+    return "$rc"
 }
 
 do_status() {
     local rc=0
     for pair in "admin_server:$AS_PID:$ADMIN_PORT" "admin_agent:$AG_PID:-"; do
-        local name="${pair%%:*}" rest="${pair#*:}" pid="${rest%%:*}" port="${rest##*:}"
+        # 拆两条 local：同一条里 ${rest} 会在 rest 赋值前被展开，set -u 下直接报错
+        local name="${pair%%:*}" rest="${pair#*:}"
+        local pid="${rest%%:*}" port="${rest##*:}"
         if is_running "$pid"; then
             ok "$name 运行中 (pid $(cat "$pid"))"
         else
@@ -485,6 +538,8 @@ usage() {
 # ---------------------------------------------------------------- 分发
 cmd="${1:-help}"; shift 2>/dev/null || true
 case "$cmd" in
+    build)       do_build ;;
+    rebuild)     do_rebuild ;;
     start)       do_start ;;
     fg)          do_fg ;;
     stop)        do_stop ;;

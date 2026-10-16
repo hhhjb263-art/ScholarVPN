@@ -165,11 +165,15 @@ count_agents() {   # 白名单条数（非空行）。
 }
 
 # ---------------------------------------------------------------- 进程
+# 判存在用 /proc 而不是 kill -0：PID 文件里若是别的属主（曾用 sudo 起过）的进程，
+# kill -0 会因 EPERM 失败被误判成"未运行"。只要进程存在，/proc/<pid> 一定在。
+proc_alive() { [ -n "${1:-}" ] && [ -d "/proc/$1" ]; }
+
 is_running() {
     local pidfile="$1" p
     [ -f "$pidfile" ] || return 1
     p="$(cat "$pidfile" 2>/dev/null)"
-    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+    proc_alive "$p"
 }
 
 wait_log() {
@@ -221,14 +225,23 @@ stop_one() {
     local name="$1" pid="$2" p i=0
     if ! [ -f "$pid" ]; then warn "$name 未运行"; return 0; fi
     p="$(cat "$pid" 2>/dev/null)"
-    if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+    if ! proc_alive "$p"; then
         warn "$name 未运行（残留 pid $p，已清理）"; rm -f "$pid"; return 0
     fi
-    kill "$p" 2>/dev/null
-    while kill -0 "$p" 2>/dev/null && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
-    if kill -0 "$p" 2>/dev/null; then
+    if ! kill "$p" 2>/dev/null; then
+        warn "$name 发送 TERM 失败（pid $p，多半是权限不足）"
+    fi
+    while proc_alive "$p" && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
+    if proc_alive "$p"; then
         warn "$name 未响应 TERM，改用 KILL"
-        kill -9 "$p" 2>/dev/null; sleep 0.3
+        kill -9 "$p" 2>/dev/null
+        i=0                              # KILL 后最多再等 1.5s 确认它真的消失
+        while proc_alive "$p" && [ "$i" -lt 15 ]; do sleep 0.1; i=$((i + 1)); done
+    fi
+    # 最终校验：没死就报失败并保留 pid 文件，绝不删了 pid 谎报"已停止"
+    if proc_alive "$p"; then
+        err "$name 仍在运行 (pid $p) —— 确认进程属主，必要时 sudo"
+        return 1
     fi
     rm -f "$pid"
     ok "$name 已停止"
@@ -237,24 +250,27 @@ stop_one() {
 # 找出匹配某模式的进程 PID（排除自身）。
 # 优先 pgrep；精简系统没有 pgrep 时退化为 ps+awk。
 # 退化路径的关键：先把 ps 快照取完再 awk —— 否则 awk 自己的命令行里就含这个模式，
-# 会把自己也算成"残留进程"然后自杀。用 index() 做字面子串匹配，避免路径里的正则元字符。
-find_pids() {   # find_pids <模式>
+# 会把自己也算成"残留进程"然后自杀。模式按 ERE 处理（pgrep/awk ~ 都是 ERE 语义）。
+find_pids() {   # find_pids <ERE 模式>
     local pat="$1" snap
     if have pgrep; then
         pgrep -f "$pat" 2>/dev/null
     else
         snap="$(ps -eo pid=,args= 2>/dev/null || true)"
-        printf '%s\n' "$snap" | awk -v p="$pat" 'index($0, p) { print $1 }'
+        printf '%s\n' "$snap" | awk -v p="$pat" '$0 ~ p { print $1 }'
     fi | awk -v me="$$" 'NF && $1 != me { print $1 }'
 }
 
 # 兜底清扫：PID 文件可能丢失（旧脚本起的 / 手动起的），只按 pid 文件停会留下孤儿进程
 # —— 也就是"退都没退干净"。
 sweep_orphans() {   # sweep_orphans <可执行文件绝对路径>
-    local pat="$1" pids
+    local bin="$1" pat pids
+    # 同时匹配绝对路径启动和 ./basename / basename 启动（旧脚本、手动起的常见）；
+    # 边界 (^|/)...( |$) 保证不误伤 vpn_controller.log、vpn_controller_old 之类。
+    pat="(^|/)${bin##*/}( |\$)"
     pids="$(find_pids "$pat")"
     [ -n "$pids" ] || return 0
-    warn "发现残留进程，一并清理：$pat"
+    warn "发现残留进程，一并清理：$bin"
     printf '%s\n' "$pids" | sed 's/^/    pid /' >&2
     # shellcheck disable=SC2086
     kill $pids 2>/dev/null || true
@@ -264,6 +280,12 @@ sweep_orphans() {   # sweep_orphans <可执行文件绝对路径>
         warn "仍未退出，改用 KILL"
         # shellcheck disable=SC2086
         kill -9 $pids 2>/dev/null || true
+        sleep 0.3
+        pids="$(find_pids "$pat")"
+    fi
+    if [ -n "$pids" ]; then                # 复核后仍在 = 清理失败（多半权限不足）
+        warn "仍有残留未清理（权限不足？）：$(printf '%s' "$pids" | tr '\n' ' ')"
+        return 1
     fi
     return 0
 }
@@ -281,32 +303,38 @@ do_start() {
         warn "白名单为空，任何 agent 都会被拒。先跑： ./admin-relay.sh add-agent 后跟 64 位指纹"
     fi
 
-    # 端口预检：给出可操作的错误，而不是让 controller 自己报 bind 失败
-    local prt
-    for prt in "$AGENT_PORT" "$HTTP_PORT"; do
-        if port_in_use "$prt"; then
-            err "端口 $prt 已被占用（多半是上次没退干净的 vpn_controller）"
-            pgrep -af 'vpn_controller' >&2 || true
-            die "先执行 ./admin-relay.sh stop，或 pkill -f build/vpn_controller"
-        fi
-    done
+    # 先看自己的 pid 文件：已经在跑就幂等跳过（否则端口预检会把自己占的端口报成冲突）
+    if is_running "$CTL_PID"; then
+        warn "vpn_controller 已在运行 (pid $(cat "$CTL_PID"))，跳过启动"
+        info "改了端口/白名单等参数需 restart 才生效： ./admin-relay.sh restart"
+    else
+        # 端口预检：给出可操作的错误，而不是让 controller 自己报 bind 失败
+        local prt
+        for prt in "$AGENT_PORT" "$HTTP_PORT"; do
+            if port_in_use "$prt"; then
+                err "端口 $prt 已被占用（多半是上次没退干净的 vpn_controller）"
+                pgrep -af 'vpn_controller' >&2 || true
+                die "先执行 ./admin-relay.sh stop，或 pkill -f build/vpn_controller"
+            fi
+        done
 
-    info "启动 vpn_controller  agent=$AGENT_BIND:$AGENT_PORT  http=$HTTP_BIND:$HTTP_PORT  白名单 $n 条"
-    start_one vpn_controller "$CTL_PID" "$CTL_LOG" \
-        "$CTL_BIN" --agent-bind "$AGENT_BIND" --agent-port "$AGENT_PORT" \
-                   --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
-                   --admin-token "$RELAY_TOKEN" \
-                   --agents "$AGENTS_FILE" \
-        || die "启动 vpn_controller 失败（见上）"
-    # 成功标志用「白名单」——失败信息里不含这三个字，不会被误判
-    if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
-        err "vpn_controller 启动失败，日志："
-        tail -n 20 "$CTL_LOG" >&2
-        do_stop >/dev/null 2>&1
-        die "启动失败"
+        info "启动 vpn_controller  agent=$AGENT_BIND:$AGENT_PORT  http=$HTTP_BIND:$HTTP_PORT  白名单 $n 条"
+        start_one vpn_controller "$CTL_PID" "$CTL_LOG" \
+            "$CTL_BIN" --agent-bind "$AGENT_BIND" --agent-port "$AGENT_PORT" \
+                       --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
+                       --admin-token "$RELAY_TOKEN" \
+                       --agents "$AGENTS_FILE" \
+            || die "启动 vpn_controller 失败（见上）"
+        # 成功标志用「白名单」——失败信息里不含这三个字，不会被误判
+        if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
+            err "vpn_controller 启动失败，日志："
+            tail -n 20 "$CTL_LOG" >&2
+            do_stop >/dev/null 2>&1
+            die "启动失败"
+        fi
+        ok "vpn_controller 就绪"
+        grep -E 'agent 通道|agent 接入|拒绝' "$CTL_LOG" | sed 's/^/    /'
     fi
-    ok "vpn_controller 就绪"
-    grep -E 'agent 通道|agent 接入|拒绝' "$CTL_LOG" | sed 's/^/    /'
     printf '\n'
     info "HTTP 入口令牌: $RELAY_TOKEN"
     info "测试： curl -H 'Authorization: Bearer $RELAY_TOKEN' http://$HTTP_BIND:$HTTP_PORT/api/servers"
@@ -353,15 +381,23 @@ do_fg() {
 }
 
 do_stop() {
-    stop_one vpn_controller "$CTL_PID"
-    sweep_orphans "$CTL_BIN"      # 兜底：PID 文件缺失时（旧脚本 / 手动起的）也能清掉
+    local rc=0
+    stop_one vpn_controller "$CTL_PID" || rc=1
+    sweep_orphans "$CTL_BIN"           || rc=1   # 兜底：PID 文件缺失时（旧脚本 / 手动起的）也能清掉
+    return "$rc"
 }
 
 do_kill() {   # 强制清理：不看 PID 文件，直接按可执行路径杀
+    local rc=0
     info "强制清理所有 vpn_controller 进程"
-    sweep_orphans "$CTL_BIN"
+    sweep_orphans "$CTL_BIN" || rc=1
     rm -f "$CTL_PID"
-    ok "清理完成"
+    if [ "$rc" -eq 0 ]; then
+        ok "清理完成"
+    else
+        err "清理未完全成功（见上），如需强制请确认权限后用 sudo"
+    fi
+    return "$rc"
 }
 
 do_status() {

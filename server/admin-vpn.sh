@@ -169,6 +169,24 @@ wait_log() {   # wait_log <日志文件> <关键字> <最多等几次×0.2s>
     return 1
 }
 
+# 等「成功标志」；若先出现「失败标志」则立刻返回非 0，不干等到超时。
+# 注意失败关键字要选得足够精确：admin_server 的 "setsockopt ... failed" 是非致命的，
+# 用它当失败标志会误杀；所以这里只认 "bind failed"。
+wait_log_ok() {   # wait_log_ok <日志> <成功关键字> <失败关键字> <最多等几次×0.2s>
+    local f="$1" ok="$2" bad="${3:-失败}" n="${4:-60}" i=0
+    while [ "$i" -lt "$n" ]; do
+        grep -q "$ok"  "$f" 2>/dev/null && return 0
+        grep -q "$bad" "$f" 2>/dev/null && return 1
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+
+port_in_use() {   # 只依赖 ss；没有 ss 就返回"未占用"（不阻塞启动）
+    have ss || return 1
+    ss -ltn 2>/dev/null | grep -q ":$1 "
+}
+
 start_one() {  # start_one <名字> <pid文件> <日志文件> <命令...>
     local name="$1" pid="$2" log="$3"; shift 3
     if is_running "$pid"; then warn "$name 已在运行 (pid $(cat "$pid"))"; return 0; fi
@@ -206,12 +224,19 @@ do_start() {
     local fp tok
     fp="$(fingerprint)" || die "无法获取身份指纹"
 
+    # 端口预检：给出可操作的错误，而不是让 admin_server 自己报 bind 失败
+    if port_in_use "$ADMIN_PORT"; then
+        err "端口 $ADMIN_PORT 已被占用（多半是上次没退干净的 admin_server）"
+        pgrep -af 'admin_server' >&2 || true
+        die "先执行 ./admin-vpn.sh stop，或 pkill -f build/admin_server"
+    fi
+
     # admin_server：显式摘掉 ADMIN_TOKEN，保证它一定去读/写 TOKEN_FILE
     info "启动 admin_server  ($ADMIN_BIND:$ADMIN_PORT)"
     start_one admin_server "$AS_PID" "$AS_LOG" \
         env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN"
-    if ! wait_log "$AS_LOG" "Server start" 60; then
-        err "admin_server 未在 12s 内就绪，日志末尾："
+    if ! wait_log_ok "$AS_LOG" "Server start" "bind failed" 60; then
+        err "admin_server 启动失败，日志："
         tail -n 20 "$AS_LOG" >&2
         do_stop >/dev/null 2>&1
         die "启动失败"
@@ -230,8 +255,14 @@ do_start() {
         ok "admin_agent 已接入中转"
     else
         warn "agent 尚未接入中转（它会自动退避重连，不算致命）"
-        warn "常见原因：中转端没启动 / 指纹没在中转端登记。日志末尾："
-        tail -n 20 "$AG_LOG" >&2
+        if grep -q "准入被拒" "$AG_LOG" 2>/dev/null; then
+            err "中转明确拒绝了它 —— 指纹不在白名单里"
+            warn "到中转端执行： ./admin-relay.sh add-agent $fp"
+        elif grep -q "连接 controller.*失败" "$AG_LOG" 2>/dev/null; then
+            err "连不上中转 $RELAY_HOST:$RELAY_PORT —— 中转端起了吗？防火墙放行了吗？"
+        fi
+        warn "日志末尾："
+        tail -n 10 "$AG_LOG" >&2
     fi
 
     printf '\n'
@@ -252,7 +283,7 @@ do_fg() {
 
     start_one admin_server "$AS_PID" "$AS_LOG" \
         env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN"
-    if ! wait_log "$AS_LOG" "Server start" 60; then
+    if ! wait_log_ok "$AS_LOG" "Server start" "bind failed" 60; then
         tail -n 20 "$AS_LOG" >&2
         do_stop >/dev/null 2>&1
         die "admin_server 启动失败"

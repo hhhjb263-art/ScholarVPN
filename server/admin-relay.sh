@@ -172,6 +172,23 @@ wait_log() {
     return 1
 }
 
+# 等日志里出现「成功标志」；若先出现「失败标志」则立刻返回非 0，不用干等到超时。
+# 签名与 admin-vpn.sh 保持一致：<日志> <成功关键字> <失败关键字> <最多等几次×0.2s>
+wait_log_ok() {
+    local f="$1" ok="$2" bad="${3:-失败}" n="${4:-60}" i=0
+    while [ "$i" -lt "$n" ]; do
+        grep -q "$ok"  "$f" 2>/dev/null && return 0
+        grep -q "$bad" "$f" 2>/dev/null && return 1
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+
+port_in_use() {   # 只依赖 ss；没有 ss 就返回"未占用"（不阻塞启动）
+    have ss || return 1
+    ss -ltn 2>/dev/null | grep -q ":$1 "
+}
+
 start_one() {
     local name="$1" pid="$2" log="$3"; shift 3
     if is_running "$pid"; then warn "$name 已在运行 (pid $(cat "$pid"))"; return 0; fi
@@ -208,8 +225,18 @@ do_start() {
     local n
     n="$(count_agents)"
     if [ "$n" -eq 0 ]; then
-        warn "白名单为空，任何 agent 都会被拒。先跑： ./admin-relay.sh add-agent <指纹>"
+        warn "白名单为空，任何 agent 都会被拒。先跑： ./admin-relay.sh add-agent 后跟 64 位指纹"
     fi
+
+    # 端口预检：给出可操作的错误，而不是让 controller 自己报 bind 失败
+    local prt
+    for prt in "$AGENT_PORT" "$HTTP_PORT"; do
+        if port_in_use "$prt"; then
+            err "端口 $prt 已被占用（多半是上次没退干净的 vpn_controller）"
+            pgrep -af 'vpn_controller' >&2 || true
+            die "先执行 ./admin-relay.sh stop，或 pkill -f build/vpn_controller"
+        fi
+    done
 
     info "启动 vpn_controller  agent=$AGENT_BIND:$AGENT_PORT  http=$HTTP_BIND:$HTTP_PORT  白名单 $n 条"
     start_one vpn_controller "$CTL_PID" "$CTL_LOG" \
@@ -217,8 +244,9 @@ do_start() {
                    --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
                    --admin-token "$RELAY_TOKEN" \
                    --agents "$AGENTS_FILE"
-    if ! wait_log "$CTL_LOG" "agent 通道" 60; then
-        err "vpn_controller 未在 12s 内就绪，日志末尾："
+    # 成功标志用「白名单」——失败信息里不含这三个字，不会被误判
+    if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
+        err "vpn_controller 启动失败，日志："
         tail -n 20 "$CTL_LOG" >&2
         do_stop >/dev/null 2>&1
         die "启动失败"
@@ -242,7 +270,7 @@ do_fg() {
                    --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
                    --admin-token "$RELAY_TOKEN" \
                    --agents "$AGENTS_FILE"
-    if ! wait_log "$CTL_LOG" "agent 通道" 60; then
+    if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
         tail -n 20 "$CTL_LOG" >&2; do_stop >/dev/null 2>&1; die "启动失败"
     fi
     info "前台运行中，Ctrl+C 退出（日志 $CTL_LOG）"

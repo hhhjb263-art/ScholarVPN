@@ -10,6 +10,8 @@
 #       纯测后台管理链路时不需要跑 vpn_server，也就不需要 root。
 #
 # 用法：
+#   ./admin-vpn.sh build              编译 admin_server + admin_agent（增量，先查依赖）
+#   ./admin-vpn.sh rebuild            清空 build/ 后重新编译（换了编译器/依赖时用）
 #   ./admin-vpn.sh start              后台启动 admin_server + admin_agent
 #   ./admin-vpn.sh fg                 前台启动（Ctrl+C 一起退出，便于调试）
 #   ./admin-vpn.sh stop               停止
@@ -20,7 +22,11 @@
 #   ./admin-vpn.sh fingerprint        打印本机身份指纹（拿去中转端 add-agent）
 #   ./admin-vpn.sh token              打印管理令牌（admin_cli / curl 用）
 #
+# 注：start / fg 在发现可执行文件缺失时会自动编译，所以 build 不是必须的；
+#     但想单独编译、或想看完整编译输出时用它。
+#
 # 环境变量（都有默认值，可前缀覆盖）：
+#   BUILD_TYPE=Release         编译类型（Release / Debug / RelWithDebInfo / 留空=无优化）
 #   ADMIN_BIND=127.0.0.1       admin_server 监听地址（强烈建议保持环回）
 #   ADMIN_PORT=18080           admin_server 监听端口
 #   ADMIN_NAME=vpn-1           上报给中转的展示名（中转那边拿它当 server id）
@@ -120,6 +126,13 @@ build_if_needed() {
 # ---------------------------------------------------------------- 首次运行准备
 prepare_dirs() {
     mkdir -p "$KEYS_DIR" "$LOGS_DIR" "$RUN_DIR" || die "创建目录失败（$KEYS_DIR / $LOGS_DIR / $RUN_DIR）"
+    local d
+    for d in "$KEYS_DIR" "$LOGS_DIR" "$RUN_DIR"; do
+        if [ ! -w "$d" ]; then
+            err "目录不可写: $d   属主=$(stat -c '%U:%G' "$d" 2>/dev/null)"
+            die "多半是之前用 sudo 跑过留下的。修复： sudo chown -R \$USER:\$USER '$SCRIPT_DIR'"
+        fi
+    done
 }
 
 ensure_keys() {
@@ -190,9 +203,19 @@ port_in_use() {   # 只依赖 ss；没有 ss 就返回"未占用"（不阻塞启
 start_one() {  # start_one <名字> <pid文件> <日志文件> <命令...>
     local name="$1" pid="$2" log="$3"; shift 3
     if is_running "$pid"; then warn "$name 已在运行 (pid $(cat "$pid"))"; return 0; fi
-    : > "$log"
+    if ! : > "$log" 2>/dev/null; then
+        err "$name 无法写入日志文件: $log"
+        return 1
+    fi
     "$@" >>"$log" 2>&1 &
-    echo $! > "$pid"
+    local child=$!
+    # PID 文件写不进去必须当失败处理：否则进程活着但 stop/status 永远管不到它
+    if ! echo "$child" > "$pid" 2>/dev/null; then
+        err "$name 已启动 (pid $child) 但 PID 文件写入失败: $pid"
+        err "→ stop/status 会失效，正在回滚（杀掉该进程）"
+        kill "$child" 2>/dev/null
+        return 1
+    fi
     return 0
 }
 
@@ -234,7 +257,8 @@ do_start() {
     # admin_server：显式摘掉 ADMIN_TOKEN，保证它一定去读/写 TOKEN_FILE
     info "启动 admin_server  ($ADMIN_BIND:$ADMIN_PORT)"
     start_one admin_server "$AS_PID" "$AS_LOG" \
-        env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN"
+        env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN" \
+        || die "启动 admin_server 失败（见上）"
     if ! wait_log_ok "$AS_LOG" "Server start" "bind failed" 60; then
         err "admin_server 启动失败，日志："
         tail -n 20 "$AS_LOG" >&2
@@ -250,7 +274,8 @@ do_start() {
     start_one admin_agent "$AG_PID" "$AG_LOG" \
         "$AGENT_BIN" --controller "$RELAY_HOST:$RELAY_PORT" \
                      --admin "$ADMIN_BIND:$ADMIN_PORT" \
-                     --key "$SIG_KEY" --token "$tok" --name "$ADMIN_NAME"
+                     --key "$SIG_KEY" --token "$tok" --name "$ADMIN_NAME" \
+        || die "启动 admin_agent 失败（见上）"
     if wait_log "$AG_LOG" "已接入 controller" 100; then
         ok "admin_agent 已接入中转"
     else
@@ -282,7 +307,8 @@ do_fg() {
     trap 'printf "\n"; info "收到中断，正在停止 ..."; do_stop; exit 0' INT TERM
 
     start_one admin_server "$AS_PID" "$AS_LOG" \
-        env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN"
+        env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN" \
+        || die "启动 admin_server 失败（见上）"
     if ! wait_log_ok "$AS_LOG" "Server start" "bind failed" 60; then
         tail -n 20 "$AS_LOG" >&2
         do_stop >/dev/null 2>&1
@@ -293,7 +319,8 @@ do_fg() {
     start_one admin_agent "$AG_PID" "$AG_LOG" \
         "$AGENT_BIN" --controller "$RELAY_HOST:$RELAY_PORT" \
                      --admin "$ADMIN_BIND:$ADMIN_PORT" \
-                     --key "$SIG_KEY" --token "$tok" --name "$ADMIN_NAME"
+                     --key "$SIG_KEY" --token "$tok" --name "$ADMIN_NAME" \
+        || die "启动 admin_agent 失败（见上）"
 
     printf '\n'
     ok "本机身份指纹: $fp"

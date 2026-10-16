@@ -117,7 +117,15 @@ build_if_needed() {
 # ---------------------------------------------------------------- 首次运行准备
 prepare_dirs() {
     mkdir -p "$LOGS_DIR" "$RUN_DIR" || die "创建目录失败（$LOGS_DIR / $RUN_DIR）"
-    [ -f "$AGENTS_FILE" ] || : > "$AGENTS_FILE"
+    local d
+    for d in "$LOGS_DIR" "$RUN_DIR"; do
+        if [ ! -w "$d" ]; then
+            err "目录不可写: $d   属主=$(stat -c '%U:%G' "$d" 2>/dev/null)"
+            die "多半是之前用 sudo 跑过留下的。修复： sudo chown -R \$USER:\$USER '$SCRIPT_DIR'"
+        fi
+    done
+    [ -f "$AGENTS_FILE" ] || : > "$AGENTS_FILE" \
+        || die "无法创建白名单 $AGENTS_FILE（所在目录不可写？）"
 }
 
 ensure_relay_token() {
@@ -192,9 +200,19 @@ port_in_use() {   # 只依赖 ss；没有 ss 就返回"未占用"（不阻塞启
 start_one() {
     local name="$1" pid="$2" log="$3"; shift 3
     if is_running "$pid"; then warn "$name 已在运行 (pid $(cat "$pid"))"; return 0; fi
-    : > "$log"
+    if ! : > "$log" 2>/dev/null; then
+        err "$name 无法写入日志文件: $log"
+        return 1
+    fi
     "$@" >>"$log" 2>&1 &
-    echo $! > "$pid"
+    local child=$!
+    # PID 文件写不进去必须当失败处理：否则进程活着但 stop/status 永远管不到它
+    if ! echo "$child" > "$pid" 2>/dev/null; then
+        err "$name 已启动 (pid $child) 但 PID 文件写入失败: $pid"
+        err "→ stop/status 会失效，正在回滚（杀掉该进程）"
+        kill "$child" 2>/dev/null
+        return 1
+    fi
     return 0
 }
 
@@ -243,7 +261,8 @@ do_start() {
         "$CTL_BIN" --agent-bind "$AGENT_BIND" --agent-port "$AGENT_PORT" \
                    --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
                    --admin-token "$RELAY_TOKEN" \
-                   --agents "$AGENTS_FILE"
+                   --agents "$AGENTS_FILE" \
+        || die "启动 vpn_controller 失败（见上）"
     # 成功标志用「白名单」——失败信息里不含这三个字，不会被误判
     if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
         err "vpn_controller 启动失败，日志："
@@ -269,7 +288,8 @@ do_fg() {
         "$CTL_BIN" --agent-bind "$AGENT_BIND" --agent-port "$AGENT_PORT" \
                    --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
                    --admin-token "$RELAY_TOKEN" \
-                   --agents "$AGENTS_FILE"
+                   --agents "$AGENTS_FILE" \
+        || die "启动 vpn_controller 失败（见上）"
     if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
         tail -n 20 "$CTL_LOG" >&2; do_stop >/dev/null 2>&1; die "启动失败"
     fi

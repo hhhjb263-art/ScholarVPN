@@ -185,8 +185,6 @@ bool ServerAdmin::sendMsg(const std::string& msg)
                 char tmp[4096];
                 ssize_t nr = recv(m_fd, tmp, sizeof(tmp), 0);
                 if(nr == 0){                  // 对端关闭连接 = 本轮回合结束
-                    std::cout << "recv done, " << recvbuf.size() << " 字节: "
-                              << recvbuf << std::endl;
                     return true;
                 }
                 if(nr < 0){

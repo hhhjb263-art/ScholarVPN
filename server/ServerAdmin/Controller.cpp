@@ -144,6 +144,29 @@ std::string make_http_response(int status, const std::string& body)
     return r;
 }
 
+// 从已收齐的请求头块（raw[0..he) 为头，he = "\r\n\r\n" 的位置）里取 Content-Length。
+// 缺省/非法按 0 处理。存在的意义：body 可能落在后续 TCP 段里，必须知道还要读多少。
+size_t header_content_length(const std::string& raw, size_t he)
+{
+    long long cl = 0;
+    size_t pos = raw.find("\r\n");
+    if (pos == std::string::npos) return 0;
+    pos += 2;
+    while (pos < he) {
+        const size_t eol = raw.find("\r\n", pos);
+        if (eol == std::string::npos || eol > he) break;
+        const std::string h = raw.substr(pos, eol - pos);
+        const size_t c = h.find(':');
+        if (c != std::string::npos) {
+            std::string k = h.substr(0, c);
+            for (char& ch : k) if (ch >= 'A' && ch <= 'Z') ch = char(ch + 32);
+            if (k == "content-length") cl = std::atoll(h.c_str() + c + 1);
+        }
+        pos = eol + 2;
+    }
+    return cl > 0 ? static_cast<size_t>(cl) : 0;
+}
+
 Controller* g_ctl = nullptr;         // 供信号处理
 void on_signal(int) { if (g_ctl != nullptr) g_ctl->stop(); }
 
@@ -406,16 +429,32 @@ void Controller::http_loop()
         const int cfd = ::accept(http_fd_, reinterpret_cast<sockaddr*>(&clt), &cl);
         if (cfd < 0) continue;
 
-        // 读全一条请求（头 + Content-Length 指定的 body）
+        // 读全一条请求：先读到头部结束（\r\n\r\n），再按 Content-Length 把 body 读满。
+        // 不能一见到 \r\n\r\n 就收手——body 完全可能落在后续 TCP 段里
+        // （POST /api/servers/{id}/tokens 的 {"count":N} 正是靠它）。
         std::string raw;
         char buf[4096];
         size_t he = std::string::npos;
-        while (raw.size() < kMaxHttpReq) {
+        size_t need = 0;                 // 头 + body 的完整长度（算出前为 0）
+        bool too_large = false;
+        for (;;) {
+            if (he == std::string::npos) {
+                he = raw.find("\r\n\r\n");
+                if (he != std::string::npos) {
+                    need = he + 4 + header_content_length(raw, he);
+                    if (need > kMaxHttpReq) { too_large = true; break; }
+                }
+            }
+            if (he != std::string::npos && raw.size() >= need) break;   // 整条收齐
+            if (raw.size() >= kMaxHttpReq) break;                       // 头都没读完就超限
             const ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
             if (n <= 0) break;
             raw.append(buf, size_t(n));
-            he = raw.find("\r\n\r\n");
-            if (he != std::string::npos) break;
+        }
+        if (too_large) {
+            send_all(cfd, make_http_response(413, "{\"error\":\"request too large\"}"));
+            ::close(cfd);
+            continue;
         }
         if (he == std::string::npos) {
             send_all(cfd, make_http_response(400, "{\"error\":\"bad request\"}"));

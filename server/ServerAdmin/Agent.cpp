@@ -11,8 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>   // std::exception（catch 签名要求显式可见）
 #include <string>
 #include <thread>
+#include <utility>     // std::move
 #include <vector>
 
 #include <arpa/inet.h>

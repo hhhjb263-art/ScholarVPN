@@ -64,11 +64,13 @@ add_executable(admin_agent
     ServerAdmin/Agent.cpp
 )
 target_link_libraries(admin_agent PRIVATE vpn_modules)
+target_compile_options(admin_agent PRIVATE -Wall -Wextra)
 
 add_executable(vpn_controller
     ServerAdmin/Controller.cpp
 )
 target_link_libraries(vpn_controller PRIVATE vpn_modules)
+target_compile_options(vpn_controller PRIVATE -Wall -Wextra)
 
 # ============================================================
 # 4) 本地管理服务 + 命令行客户端（各 VPN 服务器上运行）

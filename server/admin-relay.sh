@@ -13,8 +13,9 @@
 #
 # 用法：
 #   ./admin-relay.sh start                     后台启动 vpn_controller
-#   ./admin-relay.sh fg                        前台启动（Ctrl+C 退出）
-#   ./admin-relay.sh stop                      停止
+#   ./admin-relay.sh fg                        前台启动并一直等着（Ctrl+C 干净退出）
+#   ./admin-relay.sh stop                      停止（含兜底清扫孤儿进程）
+#   ./admin-relay.sh kill                      强制清理：不看 PID 文件，直接按名字杀
 #   ./admin-relay.sh restart                   重启
 #   ./admin-relay.sh status                    查看状态 + 已接入 agent
 #   ./admin-relay.sh logs                      跟踪日志
@@ -233,6 +234,40 @@ stop_one() {
     ok "$name 已停止"
 }
 
+# 找出匹配某模式的进程 PID（排除自身）。
+# 优先 pgrep；精简系统没有 pgrep 时退化为 ps+awk。
+# 退化路径的关键：先把 ps 快照取完再 awk —— 否则 awk 自己的命令行里就含这个模式，
+# 会把自己也算成"残留进程"然后自杀。用 index() 做字面子串匹配，避免路径里的正则元字符。
+find_pids() {   # find_pids <模式>
+    local pat="$1" snap
+    if have pgrep; then
+        pgrep -f "$pat" 2>/dev/null
+    else
+        snap="$(ps -eo pid=,args= 2>/dev/null || true)"
+        printf '%s\n' "$snap" | awk -v p="$pat" 'index($0, p) { print $1 }'
+    fi | awk -v me="$$" 'NF && $1 != me { print $1 }'
+}
+
+# 兜底清扫：PID 文件可能丢失（旧脚本起的 / 手动起的），只按 pid 文件停会留下孤儿进程
+# —— 也就是"退都没退干净"。
+sweep_orphans() {   # sweep_orphans <可执行文件绝对路径>
+    local pat="$1" pids
+    pids="$(find_pids "$pat")"
+    [ -n "$pids" ] || return 0
+    warn "发现残留进程，一并清理：$pat"
+    printf '%s\n' "$pids" | sed 's/^/    pid /' >&2
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    sleep 0.5
+    pids="$(find_pids "$pat")"
+    if [ -n "$pids" ]; then
+        warn "仍未退出，改用 KILL"
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- 子命令
 do_start() {
     check_deps || die "依赖检查未通过（执行 ./admin-relay.sh doctor 看详情）"
@@ -277,12 +312,22 @@ do_start() {
     info "测试： curl -H 'Authorization: Bearer $RELAY_TOKEN' http://$HTTP_BIND:$HTTP_PORT/api/servers"
 }
 
+FG_TAIL_PID=""
+fg_cleanup() {
+    printf '\n'
+    info "收到中断，正在停止 ..."
+    do_stop
+    if [ -n "$FG_TAIL_PID" ]; then kill "$FG_TAIL_PID" 2>/dev/null || true; fi
+    ok "已退出"
+    exit 0
+}
+
 do_fg() {
     check_deps || die "依赖检查未通过"
     build_if_needed
     prepare_dirs
     ensure_relay_token
-    trap 'printf "\n"; info "收到中断，正在停止 ..."; do_stop; exit 0' INT TERM
+    trap fg_cleanup INT TERM
 
     start_one vpn_controller "$CTL_PID" "$CTL_LOG" \
         "$CTL_BIN" --agent-bind "$AGENT_BIND" --agent-port "$AGENT_PORT" \
@@ -293,13 +338,31 @@ do_fg() {
     if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
         tail -n 20 "$CTL_LOG" >&2; do_stop >/dev/null 2>&1; die "启动失败"
     fi
-    info "前台运行中，Ctrl+C 退出（日志 $CTL_LOG）"
+    info "前台运行中 —— Ctrl+C 会干净退出"
     printf '\n'
     tail -n 0 -f "$CTL_LOG" &
-    wait
+    FG_TAIL_PID=$!
+
+    while is_running "$CTL_PID"; do
+        sleep 1
+    done
+    warn "vpn_controller 已退出，开始收尾"
+    do_stop
+    if [ -n "$FG_TAIL_PID" ]; then kill "$FG_TAIL_PID" 2>/dev/null || true; fi
+    ok "已退出"
 }
 
-do_stop() { stop_one vpn_controller "$CTL_PID"; }
+do_stop() {
+    stop_one vpn_controller "$CTL_PID"
+    sweep_orphans "$CTL_BIN"      # 兜底：PID 文件缺失时（旧脚本 / 手动起的）也能清掉
+}
+
+do_kill() {   # 强制清理：不看 PID 文件，直接按可执行路径杀
+    info "强制清理所有 vpn_controller 进程"
+    sweep_orphans "$CTL_BIN"
+    rm -f "$CTL_PID"
+    ok "清理完成"
+}
 
 do_status() {
     local rc=0
@@ -428,6 +491,7 @@ case "$cmd" in
     start)        do_start ;;
     fg)           do_fg ;;
     stop)         do_stop ;;
+    kill)         do_kill ;;
     restart)      do_stop; do_start ;;
     status)       ensure_relay_token >/dev/null 2>&1 || true; do_status ;;
     logs)         do_logs ;;

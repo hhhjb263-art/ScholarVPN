@@ -13,8 +13,9 @@
 #   ./admin-vpn.sh build              编译 admin_server + admin_agent（增量，先查依赖）
 #   ./admin-vpn.sh rebuild            清空 build/ 后重新编译（换了编译器/依赖时用）
 #   ./admin-vpn.sh start              后台启动 admin_server + admin_agent
-#   ./admin-vpn.sh fg                 前台启动（Ctrl+C 一起退出，便于调试）
-#   ./admin-vpn.sh stop               停止
+#   ./admin-vpn.sh fg                 前台启动并一直等着（Ctrl+C 一起干净退出）
+#   ./admin-vpn.sh stop               停止（含兜底清扫孤儿进程）
+#   ./admin-vpn.sh kill               强制清理：不看 PID 文件，直接按名字杀
 #   ./admin-vpn.sh restart            重启
 #   ./admin-vpn.sh status             查看状态
 #   ./admin-vpn.sh logs [组件]        跟踪日志（组件=admin_server|admin_agent，默认两者）
@@ -237,6 +238,40 @@ stop_one() {   # stop_one <名字> <pid文件>
     ok "$name 已停止"
 }
 
+# 找出匹配某模式的进程 PID（排除自身）。
+# 优先 pgrep；精简系统没有 pgrep 时退化为 ps+awk。
+# 退化路径的关键：先把 ps 快照取完再 awk —— 否则 awk 自己的命令行里就含这个模式，
+# 会把自己也算成"残留进程"然后自杀。用 index() 做字面子串匹配，避免路径里的正则元字符。
+find_pids() {   # find_pids <模式>
+    local pat="$1" snap
+    if have pgrep; then
+        pgrep -f "$pat" 2>/dev/null
+    else
+        snap="$(ps -eo pid=,args= 2>/dev/null || true)"
+        printf '%s\n' "$snap" | awk -v p="$pat" 'index($0, p) { print $1 }'
+    fi | awk -v me="$$" 'NF && $1 != me { print $1 }'
+}
+
+# 兜底清扫：PID 文件可能丢失（旧脚本起的 / 手动起的），只按 pid 文件停会留下孤儿进程
+# —— 也就是"退都没退干净"。
+sweep_orphans() {   # sweep_orphans <可执行文件绝对路径>
+    local pat="$1" pids
+    pids="$(find_pids "$pat")"
+    [ -n "$pids" ] || return 0
+    warn "发现残留进程，一并清理：$pat"
+    printf '%s\n' "$pids" | sed 's/^/    pid /' >&2
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    sleep 0.5
+    pids="$(find_pids "$pat")"
+    if [ -n "$pids" ]; then
+        warn "仍未退出，改用 KILL"
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- 子命令
 do_start() {
     check_deps || die "依赖检查未通过（执行 ./admin-vpn.sh doctor 看详情）"
@@ -296,6 +331,16 @@ do_start() {
     info "管理令牌文件: $TOKEN_FILE"
 }
 
+FG_TAIL_PID=""
+fg_cleanup() {
+    printf '\n'
+    info "收到中断，正在停止 ..."
+    do_stop
+    if [ -n "$FG_TAIL_PID" ]; then kill "$FG_TAIL_PID" 2>/dev/null || true; fi
+    ok "已全部退出"
+    exit 0
+}
+
 do_fg() {
     check_deps || die "依赖检查未通过"
     build_if_needed
@@ -304,7 +349,7 @@ do_fg() {
 
     local fp tok
     fp="$(fingerprint)" || die "无法获取身份指纹"
-    trap 'printf "\n"; info "收到中断，正在停止 ..."; do_stop; exit 0' INT TERM
+    trap fg_cleanup INT TERM
 
     start_one admin_server "$AS_PID" "$AS_LOG" \
         env -u ADMIN_TOKEN ADMIN_BIND="$ADMIN_BIND" ADMIN_PORT="$ADMIN_PORT" KEYS_DIR="$KEYS_DIR" "$ADMIN_BIN" \
@@ -314,6 +359,7 @@ do_fg() {
         do_stop >/dev/null 2>&1
         die "admin_server 启动失败"
     fi
+    ok "admin_server 就绪"
 
     tok="$(read_token)" || die "读不到管理令牌 $TOKEN_FILE"
     start_one admin_agent "$AG_PID" "$AG_LOG" \
@@ -324,15 +370,36 @@ do_fg() {
 
     printf '\n'
     ok "本机身份指纹: $fp"
-    info "前台运行中，Ctrl+C 一起退出（日志见 $LOGS_DIR/）"
+    info "前台运行中 —— Ctrl+C 会把两个进程一起停掉"
     printf '\n'
     tail -n 0 -f "$AS_LOG" "$AG_LOG" &
-    wait
+    FG_TAIL_PID=$!
+
+    # 轮询等"任一服务退出"（Ctrl+C 走 trap）。
+    # 不用 wait：它会连 tail 一起等，且任一子进程退出就返回，语义不清晰。
+    while is_running "$AS_PID" && is_running "$AG_PID"; do
+        sleep 1
+    done
+    warn "有服务已退出，开始收尾"
+    do_stop
+    if [ -n "$FG_TAIL_PID" ]; then kill "$FG_TAIL_PID" 2>/dev/null || true; fi
+    ok "已全部退出"
 }
 
 do_stop() {
     stop_one admin_agent "$AG_PID"
     stop_one admin_server "$AS_PID"
+    # 兜底：PID 文件缺失时（旧脚本 / 手动起的）只按 pid 文件会漏，扫一遍按名字杀
+    sweep_orphans "$AGENT_BIN"
+    sweep_orphans "$ADMIN_BIN"
+}
+
+do_kill() {   # 强制清理：不看 PID 文件，直接按可执行路径杀
+    info "强制清理所有 admin_server / admin_agent 进程"
+    sweep_orphans "$AGENT_BIN"
+    sweep_orphans "$ADMIN_BIN"
+    rm -f "$AS_PID" "$AG_PID"
+    ok "清理完成"
 }
 
 do_status() {
@@ -421,6 +488,7 @@ case "$cmd" in
     start)       do_start ;;
     fg)          do_fg ;;
     stop)        do_stop ;;
+    kill)        do_kill ;;
     restart)     do_stop; do_start ;;
     status)      do_status ;;
     logs)        do_logs "${1:-all}" ;;

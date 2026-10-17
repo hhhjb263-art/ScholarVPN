@@ -449,3 +449,6 @@ GEMINI.md
 .agents/
 AGENTS.md
 .mcp.json
+# Python 缓存
+tools/webadmin/__pycache__/
+*.pyc

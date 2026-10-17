@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScholarVPN 后台管理</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a21; --panel2:#1c212b; --line:#262c38;
+    --txt:#e6e9ef; --dim:#8b94a6; --dim2:#5d6675;
+    --acc:#4b8bf5; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif}
+  header{display:flex;align-items:center;gap:16px;padding:14px 20px;
+         border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+  .brand{font-weight:600;letter-spacing:.3px}
+  .brand small{color:var(--dim2);font-weight:400;margin-left:8px}
+  header .grow{flex:1}
+  .ctl{color:var(--dim);font:12px/1.5 var(--mono)}
+  button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+         border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit}
+  button:hover:not(:disabled){border-color:var(--acc);color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+  button.primary:hover:not(:disabled){background:#5f9aff}
+  button.danger:hover:not(:disabled){border-color:var(--err);color:var(--err)}
+  button.sm{padding:2px 8px;font-size:12px;border-radius:6px}
+
+  .bar{display:flex;align-items:center;gap:10px;padding:10px 20px;
+       background:#1a1f2b;border-bottom:1px solid var(--line);font-size:13px}
+  .bar input{flex:0 0 340px;background:var(--bg);border:1px solid var(--line);
+             border-radius:8px;padding:6px 10px;color:var(--txt);font:13px var(--mono)}
+  .hidden{display:none!important}
+
+  #alert{margin:14px 20px 0;padding:10px 14px;border-radius:10px;font-size:13px;
+         border:1px solid;white-space:pre-wrap}
+  #alert.err{background:#2a1416;border-color:#5c2124;color:#ffb4ae}
+  #alert.warn{background:#2a2210;border-color:#5c4a1c;color:#f0d089}
+  #alert.ok{background:#0f2417;border-color:#1c4a2c;color:#8fe0a5}
+
+  main{display:grid;grid-template-columns:280px 1fr;gap:0;min-height:calc(100vh - 118px)}
+  aside{border-right:1px solid var(--line);padding:14px;overflow:auto}
+  aside h2{font-size:12px;color:var(--dim2);letter-spacing:1px;margin:0 0 10px;font-weight:500}
+  .srv{padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+       margin-bottom:8px;cursor:pointer;background:var(--panel)}
+  .srv:hover{border-color:#33405a}
+  .srv.on{border-color:var(--acc);background:#182236}
+  .srv .name{display:flex;align-items:center;gap:8px;font-weight:500}
+  .srv .sub{color:var(--dim2);font:11px/1.5 var(--mono);margin-top:4px;
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:0 0 auto;
+       box-shadow:0 0 0 3px rgba(63,185,80,.15)}
+
+  section{padding:20px;overflow:auto}
+  .empty{color:var(--dim2);padding:40px 0;text-align:center}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:16px;margin-bottom:16px}
+  .card h3{margin:0 0 12px;font-size:13px;font-weight:500;color:var(--dim);
+           letter-spacing:.5px;display:flex;align-items:center;gap:10px}
+  .card h3 .grow{flex:1}
+  .kv{display:grid;grid-template-columns:110px 1fr;gap:6px 14px;font-size:13px}
+  .kv .k{color:var(--dim2)}
+  .kv .v{font-family:var(--mono);word-break:break-all}
+  pre{margin:8px 0 0;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+      padding:10px 12px;font:11px/1.6 var(--mono);color:#c9d1d9;
+      white-space:pre-wrap;word-break:break-all;max-height:170px;overflow:auto}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--dim2);font-weight:500;font-size:12px;
+     padding:6px 8px;border-bottom:1px solid var(--line)}
+  td{padding:6px 8px;border-bottom:1px solid #1d222c}
+  td.tok{font-family:var(--mono);font-size:12px;word-break:break-all}
+  tr:last-child td{border-bottom:none}
+
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  input.num{width:76px;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+            padding:5px 8px;color:var(--txt);font:13px var(--mono)}
+  .hint{color:var(--dim2);font-size:12px}
+  .toast{position:fixed;right:20px;bottom:20px;background:var(--panel2);
+         border:1px solid var(--line);border-radius:10px;padding:10px 14px;
+         font-size:13px;opacity:0;transform:translateY(8px);transition:.18s;pointer-events:none}
+  .toast.show{opacity:1;transform:translateY(0)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">ScholarVPN 后台管理 <small>vpn_controller</small></div>
+  <div class="grow"></div>
+  <span class="ctl" id="ctl">—</span>
+  <button id="btnToken" title="设置管理令牌">令牌</button>
+  <button id="btnRefresh" class="primary">刷新</button>
+</header>
+
+<div class="bar hidden" id="tokenBar">
+  <span>管理令牌</span>
+  <input id="tokenInput" type="password" placeholder="controller 的 ADMIN_TOKEN" autocomplete="off">
+  <button id="btnSaveToken" class="primary">保存</button>
+  <span class="hint">只存在本浏览器 sessionStorage，关闭标签页即失效</span>
+</div>
+
+<div id="alert" class="hidden"></div>
+
+<main>
+  <aside>
+    <h2>服务器</h2>
+    <div id="servers"><div class="empty" style="padding:20px 0">加载中…</div></div>
+  </aside>
+  <section id="detail">
+    <div class="empty">← 先在左侧选一台服务器</div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const state = { servers: [], current: null, token: sessionStorage.getItem("admin_token") || "" };
+
+/* ------------------------------------------------------------------ 基础 */
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove("show"), 1600);
+}
+
+function alertBox(kind, text) {
+  const a = $("alert");
+  if (!kind) { a.className = "hidden"; a.textContent = ""; return; }
+  a.className = kind;
+  a.textContent = text;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("已复制");
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); toast("已复制"); }
+    catch { toast("复制失败，请手动选中"); }
+    ta.remove();
+  }
+}
+
+/* ------------------------------------------------------------------ API */
+/* 状态码语义见 docs/客户端实现方案接口.md 2.6；401 有二义性，要分开提示 */
+function explain(status, body) {
+  const err = (body && body.error) || "";
+  if (status === 401) return "401 未授权 —— 可能是【中转站令牌】错（页面右上「令牌」），\n" +
+    "也可能是【agent 启动时的 --token】与本机 admin_server 不一致（看 agent 日志）。";
+  if (status === 403) return "403 禁止访问。";
+  if (status === 404) return "404 未找到 —— 路径不认识，或令牌已被消费（两侧都可能产生 404）。";
+  if (status === 413) return "413 请求过大 —— controller 上限 8KB。";
+  if (status === 502) return "502 —— " + (body && body.hint ? body.hint : "代理连不上中转站或本机 AdminServer。");
+  if (status === 503) return "503 agent 离线 —— 该服务器当前没有在线连接，controller 不排队。\n" +
+    "检查：agent 是否在跑、指纹是否已 add-agent、controller 是否重启过。";
+  if (status === 504) return "504 agent 超时 —— 命令已发出，10 秒内没收到回执。";
+  return status + " " + (err || "请求失败");
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ "Accept": "application/json" }, opts.headers || {});
+  if (state.token) headers["X-Admin-Token"] = state.token;
+  if (opts.body) headers["Content-Type"] = "application/json";
+
+  const res = await fetch(path, {
+    method: opts.method || "GET",
+    headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+
+  let data = null;
+  const text = await res.text();
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+
+  if (!res.ok) {
+    const e = new Error(explain(res.status, data));
+    e.status = res.status;
+    throw e;
+  }
+  return data;
+}
+
+/* ------------------------------------------------------------------ 列表 */
+async function loadServers() {
+  const box = $("servers");
+  try {
+    const data = await api("/api/servers");
+    state.servers = data.servers || [];
+    alertBox(null);
+
+    if (state.servers.length === 0) {
+      box.innerHTML = "";
+      const d = document.createElement("div");
+      d.className = "empty";
+      d.style.padding = "20px 0";
+      d.textContent = "没有在线 agent";
+      box.appendChild(d);
+      alertBox("warn",
+        "在线 agent 为空。常见原因：\n" +
+        "· agent 没启动，或连不上 controller（看 agent 日志）\n" +
+        "· 指纹没登记：controller --add-agent <64hex>\n" +
+        "· 登记后没重启 controller（白名单只在启动时读一次）\n" +
+        "· 一期 controller 只支持单 agent 连接，第二台会一直等第一台断开");
+      return;
+    }
+
+    box.innerHTML = "";
+    for (const s of state.servers) {
+      const el = document.createElement("div");
+      el.className = "srv" + (state.current === s.id ? " on" : "");
+      el.onclick = () => selectServer(s.id);
+
+      const name = document.createElement("div");
+      name.className = "name";
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.title = "在线";
+      name.appendChild(dot);
+      name.appendChild(document.createTextNode(s.id));
+
+      const sub = document.createElement("div");
+      sub.className = "sub";
+      sub.textContent = s.ip + " · " + String(s.pubkey_hex || "").slice(0, 16) + "…";
+      /* last_seen 是 controller 的单调时钟毫秒，不能格式化成日期 —— 只做 tooltip */
+      sub.title = "last_seen（单调时钟 ms，非墙钟）: " + s.last_seen;
+
+      el.appendChild(name);
+      el.appendChild(sub);
+      box.appendChild(el);
+    }
+  } catch (e) {
+    box.innerHTML = "";
+    if (e.status === 401) showTokenBar();
+    alertBox("err", e.message);
+  }
+}
+
+/* ------------------------------------------------------------------ 详情 */
+async function selectServer(id) {
+  state.current = id;
+  document.querySelectorAll(".srv").forEach((el, i) => {
+    el.classList.toggle("on", state.servers[i] && state.servers[i].id === id);
+  });
+  $("detail").innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const [info, toks] = await Promise.all([
+      api(`/api/servers/${encodeURIComponent(id)}/info`).catch((e) => ({ __err: e })),
+      api(`/api/servers/${encodeURIComponent(id)}/tokens`).catch((e) => ({ __err: e })),
+    ]);
+    renderDetail(id, info, toks);
+    alertBox(null);
+  } catch (e) {
+    alertBox("err", e.message);
+  }
+}
+
+function kv(parent, k, v) {
+  const kd = document.createElement("div"); kd.className = "k"; kd.textContent = k;
+  const vd = document.createElement("div"); vd.className = "v"; vd.textContent = v;
+  parent.appendChild(kd); parent.appendChild(vd);
+}
+
+function renderDetail(id, info, toks) {
+  const root = $("detail");
+  root.innerHTML = "";
+
+  /* ---- 公钥 / 监听信息 ---- */
+  const c1 = document.createElement("div"); c1.className = "card";
+  const h1 = document.createElement("h3");
+  h1.appendChild(document.createTextNode("公钥与监听信息"));
+  const g1 = document.createElement("span"); g1.className = "grow"; h1.appendChild(g1);
+  c1.appendChild(h1);
+
+  if (info && info.__err) {
+    const p = document.createElement("div");
+    p.className = "hint";
+    p.textContent = info.__err.message;
+    c1.appendChild(p);
+  } else if (info) {
+    const grid = document.createElement("div"); grid.className = "kv";
+    kv(grid, "版本", info.version || "—");
+    kv(grid, "监听", (info.ip || "?") + ":" + (info.port != null ? info.port : "?"));
+    kv(grid, "指纹 (hex)", info.pubkey_hex || "—");
+    c1.appendChild(grid);
+
+    if (info.pubkey_hex) {
+      const b = document.createElement("button");
+      b.className = "sm"; b.textContent = "复制指纹";
+      b.onclick = () => copyText(info.pubkey_hex);
+      c1.appendChild(Object.assign(document.createElement("div"),
+        { className: "row", style: "margin-top:10px" }));
+      c1.lastChild.appendChild(b);
+    }
+
+    if (info.pubkey_pem) {
+      const pre = document.createElement("pre");
+      pre.textContent = info.pubkey_pem;
+      c1.appendChild(pre);
+      const b2 = document.createElement("button");
+      b2.className = "sm"; b2.textContent = "复制公钥 PEM";
+      b2.style.marginTop = "8px";
+      b2.onclick = () => copyText(info.pubkey_pem);
+      c1.appendChild(b2);
+    }
+  }
+  root.appendChild(c1);
+
+  /* ---- 令牌 ---- */
+  const c2 = document.createElement("div"); c2.className = "card";
+  const h2 = document.createElement("h3");
+  h2.appendChild(document.createTextNode("未消费令牌"));
+  const g2 = document.createElement("span"); g2.className = "grow"; h2.appendChild(g2);
+
+  const inp = document.createElement("input");
+  inp.className = "num"; inp.type = "number"; inp.min = "1"; inp.max = "1000"; inp.value = "1";
+  const btnGen = document.createElement("button");
+  btnGen.className = "primary sm"; btnGen.textContent = "申请";
+  btnGen.onclick = async () => {
+    const n = parseInt(inp.value, 10);
+    if (!(n >= 1 && n <= 1000)) { alertBox("warn", "数量需在 1–1000 之间"); return; }
+    btnGen.disabled = true;
+    try {
+      const r = await api(`/api/servers/${encodeURIComponent(id)}/tokens`,
+        { method: "POST", body: { count: n } });
+      toast(`已申请 ${(r.tokens || []).length} 个令牌`);
+      selectServer(id);
+    } catch (e) { alertBox("err", e.message); }
+    finally { btnGen.disabled = false; }
+  };
+  const btnExport = document.createElement("button");
+  btnExport.className = "sm"; btnExport.textContent = "导出 JSON";
+  btnExport.onclick = () => exportJSON(id, info, toks);
+
+  h2.appendChild(inp); h2.appendChild(btnGen); h2.appendChild(btnExport);
+  c2.appendChild(h2);
+
+  if (toks && toks.__err) {
+    const p = document.createElement("div"); p.className = "hint";
+    p.textContent = toks.__err.message; c2.appendChild(p);
+  } else {
+    const list = (toks && toks.tokens) || [];
+    if (list.length === 0) {
+      const p = document.createElement("div"); p.className = "hint";
+      p.textContent = "暂无未消费令牌。点上方「申请」生成。";
+      c2.appendChild(p);
+    } else {
+      const t = document.createElement("table");
+      const thead = document.createElement("thead");
+      thead.innerHTML = "<tr><th style='width:46px'>#</th><th>令牌</th><th style='width:130px'></th></tr>";
+      t.appendChild(thead);
+      const tb = document.createElement("tbody");
+      list.forEach((tok, i) => {
+        const tr = document.createElement("tr");
+        const td0 = document.createElement("td"); td0.textContent = i + 1;
+        const td1 = document.createElement("td"); td1.className = "tok"; td1.textContent = tok;
+        const td2 = document.createElement("td");
+        const bc = document.createElement("button");
+        bc.className = "sm"; bc.textContent = "复制"; bc.style.marginRight = "6px";
+        bc.onclick = () => copyText(tok);
+        const bd = document.createElement("button");
+        bd.className = "sm danger"; bd.textContent = "删除";
+        bd.onclick = async () => {
+          if (!confirm("删除该令牌？\n" + tok)) return;
+          bd.disabled = true;
+          try {
+            await api(`/api/servers/${encodeURIComponent(id)}/tokens/${encodeURIComponent(tok)}`,
+              { method: "DELETE" });
+            toast("已删除");
+            selectServer(id);
+          } catch (e) { alertBox("err", e.message); bd.disabled = false; }
+        };
+        td2.appendChild(bc); td2.appendChild(bd);
+        tr.appendChild(td0); tr.appendChild(td1); tr.appendChild(td2);
+        tb.appendChild(tr);
+      });
+      t.appendChild(tb);
+      c2.appendChild(t);
+      if (list.length > 800) {
+        const w = document.createElement("div");
+        w.className = "hint"; w.style.marginTop = "10px";
+        w.textContent = "⚠ 令牌数接近 950 时单帧会超过 64KB 上限，agent 会断开重连。请尽快分发。";
+        c2.appendChild(w);
+      }
+    }
+  }
+  root.appendChild(c2);
+}
+
+function exportJSON(id, info, toks) {
+  const payload = {
+    exported_at: new Date().toISOString(),
+    server_id: id,
+    info: (info && !info.__err) ? info : null,
+    tokens: (toks && toks.tokens) || [],
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `scholarvpn-${id}-${Date.now()}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(a.href);
+  toast("已导出");
+}
+
+/* ------------------------------------------------------------------ 令牌输入 */
+function showTokenBar() {
+  $("tokenBar").classList.remove("hidden");
+  $("tokenInput").value = state.token;
+  $("tokenInput").focus();
+}
+
+$("btnToken").onclick = () => $("tokenBar").classList.toggle("hidden");
+$("btnSaveToken").onclick = () => {
+  state.token = $("tokenInput").value.trim();
+  sessionStorage.setItem("admin_token", state.token);
+  $("tokenBar").classList.add("hidden");
+  loadServers();
+};
+$("tokenInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("btnSaveToken").click();
+});
+$("btnRefresh").onclick = () => loadServers();
+
+/* ------------------------------------------------------------------ 启动 */
+$("ctl").textContent = location.origin;
+if (!state.token) {
+  /* 服务端可能已经配好令牌；先静默试一次，401 再弹输入框 */
+}
+loadServers();
+setInterval(() => { if (!document.hidden) loadServers(); }, 15000);
+</script>
+</body>
+</html>

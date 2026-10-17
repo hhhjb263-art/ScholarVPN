@@ -4,6 +4,14 @@
 * text=auto
 
 ###############################################################################
+# Shell 脚本必须是 LF。
+# 服务端是 Linux-only 工程，CRLF 会让 #!/usr/bin/env bash 变成
+# "bad interpreter: No such file or directory"，脚本直接跑不起来。
+# 显式 eol=lf 覆盖上面 * text=auto 的自动转换。
+###############################################################################
+*.sh text eol=lf
+
+###############################################################################
 # Set default behavior for command prompt diff.
 #
 # This is need for earlier builds of msysgit that does not have it on by

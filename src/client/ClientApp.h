@@ -50,6 +50,10 @@ public:
 	bool start();           // 启动 ReconnectManager + 桥接线程
 	void stop();            
 
+	// 当前进程是否已提权（管理员）。创建 Wintun 网卡 / 改路由 / 改 DNS 都需要，
+	// 因此普通用户（免 UAC）启动时返回 false，init() 会失败、连接功能不可用。
+	static bool is_elevated();
+
 	// 多服务器：在 init() 之后、start() 之前调用，
 	// 切换目标服务器及其各自的认证身份（ClientID/RegisterToken）
 	void set_server(const ServerEntry& entry);

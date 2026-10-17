@@ -6,12 +6,17 @@
 #include <QVBoxLayout>
 #include "ui_QtWidgetsClass.h"
 #include <QFrame>
+#include <QDialog>
+#include <QCheckBox>
 #include <QLabel>
 #include <QPushButton>
 #include <QThread>
 #include<qlineedit.h>
 #include <QPainter>
 #include <QTimer>
+#include <QSystemTrayIcon>
+#include <QMenu>
+#include <QCloseEvent>
 
 class SpeedChart : public QWidget
 {
@@ -138,7 +143,9 @@ private:
 	void update_dia_highlight();       // 刷新 dia 卡片列表的选中高亮
 	bool eventFilter(QObject* obj, QEvent* ev) override;
 	void resizeEvent(QResizeEvent* ev) override;   // 覆盖层随主窗口尺寸同步
-	
+	void createtray();
+protected:
+	void closeEvent(QCloseEvent * event) override;
 private:
 	Config* m_cfg = nullptr;
 	Ui::QtWidgetsClassClass ui;
@@ -184,5 +191,18 @@ private:
 	QThread* m_thread_start = nullptr;
 
 	QPushButton* m_btnSwitch = nullptr;   // Switch Server 按钮（主界面，控制弹窗显隐）
+	QSystemTrayIcon* m_trayicon = nullptr;
+	QMenu* m_menu = nullptr;
+	QAction* m_actionShow = nullptr;
+	QAction* m_actionQuit = nullptr;
 
+};
+
+class Setting : public QDialog {
+public:
+	explicit Setting(QWidget* parent = nullptr);
+	~Setting();
+private:
+	void create_setting();
+	QCheckBox* m_chkAutoStart = nullptr;
 };

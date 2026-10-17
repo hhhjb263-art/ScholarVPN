@@ -26,7 +26,8 @@
   .msg{min-height:20px;margin-top:12px;font-size:13px;color:var(--err);white-space:pre-wrap}
   .msg.ok{color:var(--ok)}
   .hint{color:var(--dim);font-size:12px;margin-top:14px;text-align:center}
-  .hint a{color:var(--acc);text-decoration:none}
+  .hint code{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--txt);
+             word-break:break-all;display:inline-block;margin-top:6px}
   .hidden{display:none!important}
 </style>
 </head>
@@ -42,7 +43,10 @@
     <button id="btn" type="submit">登录</button>
   </form>
   <div id="msg" class="msg"></div>
-  <p id="initHint" class="hint hidden">首次使用？<a href="/register">创建第一个管理员</a></p>
+  <p id="noAdmin" class="hint hidden">
+    尚未创建管理员。请服务器管理员执行：<br>
+    <code>cd /root/ScholarVPN/tools/webadmin &amp;&amp; python3 manage.py create-admin &lt;用户名&gt;</code>
+  </p>
 </div>
 <script>
 "use strict";
@@ -52,11 +56,13 @@ function show(text, ok) {
   m.textContent = text || "";
   m.className = "msg" + (ok ? " ok" : "");
 }
+const query = new URLSearchParams(location.search);
+if (query.get("changed") === "1") show("密码已修改，请用新密码登录", true);
 (async () => {
   try {
     const r = await fetch("/api/auth/status", { headers: { "Accept": "application/json" } });
     const j = await r.json();
-    if (j && j.initialized === false) $("initHint").classList.remove("hidden");
+    if (j && j.initialized === false) $("noAdmin").classList.remove("hidden");
   } catch (_) { /* 忽略：登录仍可尝试 */ }
 })();
 $("form").addEventListener("submit", async (e) => {

@@ -10,9 +10,9 @@
 #   · 会话令牌随机 256-bit，数据库只存 SHA-256；Cookie 为 HttpOnly/Secure/
 #     SameSite=Strict；登录时换新令牌（防会话固定）。
 #   · CSRF：会话内随机 token，所有写操作必须带 X-CSRF-Token。
-#   · 登录/注册失败限速；登录错误统一提示，避免用户名枚举。
-#   · 首次管理员只能通过一次性初始化令牌创建；之后注册关闭，由已登录管理员
-#     创建更多账号。
+#   · 登录失败限速；登录错误统一提示，避免用户名枚举。
+#   · 不开放公开注册：首个管理员由服务器 root 执行 manage.py create-admin 创建；
+#     后续账号由已登录管理员在网页里创建。
 # ============================================================================
 from __future__ import annotations
 
@@ -201,16 +201,6 @@ def create_admin(path: str, username: str, password: str) -> int:
         return _insert_admin(conn, username, password)
 
 
-def create_first_admin(path: str, username: str, password: str) -> int:
-    """只在系统没有任何管理员时创建；用写事务避免并发抢注。"""
-    with _db(path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        n = conn.execute("SELECT COUNT(*) AS n FROM admins").fetchone()["n"]
-        if int(n) != 0:
-            raise PermissionError("registration closed")
-        return _insert_admin(conn, username, password)
-
-
 def authenticate(path: str, username: str, password: str) -> dict | None:
     """成功返回 {id, username}；失败返回 None。"""
     if not isinstance(username, str) or not isinstance(password, str):
@@ -254,6 +244,29 @@ def set_password(path: str, username: str, password: str) -> bool:
             (hash_password(password), int(row["id"])),
         )
         conn.execute("DELETE FROM sessions WHERE admin_id = ?", (int(row["id"]),))
+        return True
+
+
+def change_password(path: str, admin_id: int, current: str, new: str) -> bool:
+    """当前登录用户改密码：校验旧密码，成功后注销其全部会话。
+    返回 False 表示旧密码错误；新密码不合规时抛 ValueError。"""
+    with _db(path) as conn:
+        row = conn.execute(
+            "SELECT username, password_hash, is_active FROM admins WHERE id = ?",
+            (admin_id,),
+        ).fetchone()
+        if row is None or int(row["is_active"]) != 1:
+            return False
+        if not verify_password(current, row["password_hash"]):
+            return False
+        err = validate_password(row["username"], new)
+        if err:
+            raise ValueError(err)
+        conn.execute(
+            "UPDATE admins SET password_hash = ? WHERE id = ?",
+            (hash_password(new), admin_id),
+        )
+        conn.execute("DELETE FROM sessions WHERE admin_id = ?", (admin_id,))
         return True
 
 

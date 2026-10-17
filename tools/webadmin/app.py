@@ -9,8 +9,9 @@
 #   · 管理员账号存 SQLite（tools/webadmin/data/webadmin.db），密码 scrypt 哈希；
 #   · 会话存服务端，Cookie HttpOnly/Secure/SameSite=Strict；数据库只存令牌哈希；
 #   · 所有写请求要求 X-CSRF-Token；
-#   · 登录/注册限速，错误提示不区分用户名是否存在；
-#   · 首次管理员用一次性初始化令牌创建，之后注册关闭，由已登录管理员添加；
+#   · 登录限速，错误提示不区分用户名是否存在；
+#   · 不开放注册：首个管理员由服务器 root 用 manage.py create-admin 创建，
+#     后续账号由已登录管理员添加；
 #   · 中转管理令牌只保存在服务端，用于访问 127.0.0.1:18081，浏览器永远拿不到。
 #
 # 零第三方依赖：只用 Python 3 标准库 + OpenSSL（ssl/sqlite3/hashlib）。
@@ -59,7 +60,6 @@ class Config:
     controller = "http://127.0.0.1:18081"
     controller_ca = ""
     token = ""              # 中转管理令牌：只在服务端使用
-    bootstrap_token = ""    # 首次管理员初始化令牌
     bind = "127.0.0.1"
     port = 8080
     tls_cert = ""
@@ -236,7 +236,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _static(self, name: str, ctype: str) -> None:
         # 只允许固定文件，避免路径穿越
-        allowed = {"index.html", "login.html", "register.html"}
+        allowed = {"index.html", "login.html"}
         if name not in allowed:
             return self._error(404, "not found")
         path = os.path.join(HERE, name)
@@ -255,19 +255,15 @@ class Handler(BaseHTTPRequestHandler):
             if self._session() is None:
                 return self._redirect("/login")
             return self._static("index.html", "text/html; charset=utf-8")
-        if path in ("/login", "/register"):
+        if path == "/login":
             if self._session() is not None:
                 return self._redirect("/")
-            name = "login.html" if path == "/login" else "register.html"
-            return self._static(name, "text/html; charset=utf-8")
+            return self._static("login.html", "text/html; charset=utf-8")
         if path == "/favicon.ico":
             return self._send(204, b"", "text/plain")
         if path == "/api/auth/status":
             initialized = auth.count_admins(Config.db_path) > 0
-            return self._send_json(200, {
-                "initialized": initialized,
-                "registration_open": not initialized,
-            })
+            return self._send_json(200, {"initialized": initialized})
         if path == "/api/auth/me":
             sess = self._require_session()
             if sess is None:
@@ -292,12 +288,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
-        if path == "/api/auth/register":
-            return self._register()
         if path == "/api/auth/login":
             return self._login()
         if path == "/api/auth/logout":
             return self._logout()
+        if path == "/api/auth/password":
+            return self._change_password()
         if path == "/api/admin/users":
             sess = self._require_session()
             if sess is None:
@@ -316,51 +312,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found")
 
     # ---------------------------------------------------------------- 认证
-    def _register(self) -> None:
-        if not self._same_origin():
-            return self._error(403, "origin not allowed")
-        ip = self._client_ip()
-        wait = _RATE.retry_after(f"register:ip:{ip}", 5, 3600)
-        if wait:
-            return self._error(429, "too many attempts", headers={"Retry-After": str(wait)})
-        _RATE.hit(f"register:ip:{ip}", 3600)
-
-        try:
-            data = self._read_json()
-        except ValueError as e:
-            return self._error(400, str(e))
-        username = data.get("username", "")
-        password = data.get("password", "")
-        bootstrap = data.get("bootstrap_token", "")
-        if not isinstance(username, str) or not isinstance(password, str) \
-                or not isinstance(bootstrap, str):
-            return self._error(400, "invalid fields")
-
-        if auth.count_admins(Config.db_path) > 0:
-            return self._error(403, "registration closed",
-                               hint="首个管理员已创建；后续账号请由已登录管理员添加")
-        if not Config.bootstrap_token or not hmac.compare_digest(
-                bootstrap.encode("utf-8", "ignore"),
-                Config.bootstrap_token.encode("utf-8")):
-            auth.audit(Config.db_path, username, ip, "register_fail", "bad bootstrap")
-            return self._error(403, "invalid bootstrap token")
-
-        try:
-            admin_id = auth.create_first_admin(Config.db_path, username, password)
-        except PermissionError:
-            return self._error(403, "registration closed")
-        except ValueError as e:
-            return self._error(400, str(e))
-        except Exception as e:
-            log(f"[auth] create first admin failed: {e}")
-            return self._error(500, "create admin failed")
-
-        raw, _csrf = auth.create_session(
-            Config.db_path, admin_id, ip, self.headers.get("User-Agent", ""))
-        auth.audit(Config.db_path, username, ip, "register_ok")
-        return self._send_json(200, {"ok": True, "username": username},
-                               set_cookie=self._set_cookie(raw))
-
     def _login(self) -> None:
         if not self._same_origin():
             return self._error(403, "origin not allowed")
@@ -396,6 +347,38 @@ class Handler(BaseHTTPRequestHandler):
         auth.audit(Config.db_path, admin["username"], ip, "login_ok")
         return self._send_json(200, {"ok": True, "username": admin["username"]},
                                set_cookie=self._set_cookie(raw))
+
+    def _change_password(self) -> None:
+        sess = self._require_session()
+        if sess is None:
+            return
+        if not self._require_csrf(sess):
+            return
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        current = data.get("current_password", "")
+        new = data.get("new_password", "")
+        if not isinstance(current, str) or not isinstance(new, str):
+            return self._error(400, "invalid fields")
+        try:
+            ok = auth.change_password(
+                Config.db_path, sess["admin_id"], current, new)
+        except ValueError as e:
+            return self._error(400, str(e))
+        except Exception as e:
+            log(f"[auth] change password failed: {e}")
+            return self._error(500, "change password failed")
+        if not ok:
+            auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                       "password_change_fail")
+            return self._error(400, "current password incorrect")
+        # auth.change_password 已删除该用户全部会话；强制重新登录。
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "password_change")
+        return self._send_json(200, {"ok": True, "relogin": True},
+                               set_cookie=self._clear_cookie())
 
     def _logout(self) -> None:
         sess = self._require_session()
@@ -502,8 +485,6 @@ def main() -> int:
                     help="上游 HTTPS 的私有 CA 文件（公共 CA 留空）")
     ap.add_argument("--token", default=os.environ.get("ADMIN_TOKEN", ""),
                     help="中转管理令牌（只在服务端使用，不下发浏览器）")
-    ap.add_argument("--bootstrap-token", default=os.environ.get("WEBADMIN_BOOTSTRAP_TOKEN", ""),
-                    help="首次管理员初始化令牌；留空则复用 --token")
     ap.add_argument("--db", default=os.environ.get("WEBADMIN_DB", Config.db_path),
                     help="SQLite 数据库路径")
     ap.add_argument("--cookie-secure", default=os.environ.get("WEBADMIN_COOKIE_SECURE", ""),
@@ -517,7 +498,6 @@ def main() -> int:
     Config.controller = args.controller.rstrip("/")
     Config.controller_ca = args.controller_ca or ""
     Config.token = args.token or ""
-    Config.bootstrap_token = args.bootstrap_token or Config.token
     Config.bind = args.listen
     Config.port = args.port
     Config.db_path = args.db
@@ -565,7 +545,7 @@ def main() -> int:
     print(f"[+] 后台管理 Web 已启动: {scheme}://{Config.bind}:{Config.port}/", flush=True)
     print(f"    中转站: {Config.controller}", flush=True)
     print(f"    数据库: {Config.db_path}（管理员 {auth.count_admins(Config.db_path)} 个）", flush=True)
-    print(f"    管理员初始化: {'已完成（登录页）' if initialized else '未完成（访问 /register 创建首个管理员）'}", flush=True)
+    print(f"    管理员初始化: {'已完成（登录页）' if initialized else '未完成（服务器执行 manage.py create-admin）'}", flush=True)
     print(f"    中转令牌: {'已配置（仅服务端使用）' if Config.token else '未配置 —— 登录后 API 会 502'}", flush=True)
     print(f"    TLS: {'已启用（TLS 1.2+）' if Config.tls else '未启用'}", flush=True)
     print("    Ctrl+C 退出", flush=True)

@@ -11,7 +11,8 @@
 cd tools/webadmin
 ADMIN_TOKEN="$(cd ../../server && ./admin-relay.sh token)" python3 app.py
 # 打开 http://127.0.0.1:8080/
-# 首次访问 /register，用上面的令牌作为“初始化令牌”创建第一个管理员
+# 不开放注册：首个管理员在服务器执行
+# python3 manage.py create-admin <用户名>
 # 之后在 /login 用管理员账号登录
 ```
 
@@ -30,7 +31,7 @@ python3 app.py --port 8080 --controller http://127.0.0.1:19998 --token goodtoken
 
 ## 功能
 
-管理员注册/登录/登出 · 管理员账号管理 · 服务器列表 · 公钥与监听信息 ·
+管理员登录/登出/修改密码 · 管理员账号管理 · 服务器列表 · 公钥与监听信息 ·
 未消费令牌增删复制 · 申请令牌 · 一键导出 JSON
 
 ## 文档
@@ -45,7 +46,6 @@ python3 app.py --port 8080 --controller http://127.0.0.1:19998 --token goodtoken
 | `app.py` | HTTP/HTTPS 服务、认证路由 + 反向代理 |
 | `auth.py` | SQLite 管理员、scrypt 密码、会话、CSRF、限速、审计 |
 | `login.html` | 登录页 |
-| `register.html` | 首次管理员初始化页 |
 | `index.html` | 管理界面（原生 JS，无框架） |
 | `manage.py` | 账号恢复 CLI（list/create-admin/reset-password） |
 | `data/webadmin.db` | 管理员/会话/审计数据库（自动生成，勿提交） |

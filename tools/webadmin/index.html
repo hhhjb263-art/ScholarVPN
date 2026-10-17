@@ -115,10 +115,20 @@
   <div class="brand">ScholarVPN 后台管理 <small>vpn_controller</small></div>
   <div class="grow"></div>
   <span class="ctl" id="who">—</span>
+  <button id="btnAccount" title="修改密码">账号</button>
   <button id="btnAdmins" title="管理员账号">管理员</button>
   <button id="btnLogout">退出</button>
   <button id="btnRefresh" class="primary">刷新</button>
 </header>
+
+<div class="bar hidden" id="accountPanel">
+  <span>修改密码</span>
+  <input id="curPass" class="small" type="password" placeholder="当前密码" autocomplete="current-password">
+  <input id="newPass1" class="small" type="password" placeholder="新密码（至少10位）" autocomplete="new-password">
+  <input id="newPass2" class="small" type="password" placeholder="确认新密码" autocomplete="new-password">
+  <button id="btnChangePass" class="primary">修改</button>
+  <span id="acctMsg" class="hint"></span>
+</div>
 
 <div class="bar hidden" id="adminPanel">
   <span>新增管理员</span>
@@ -449,9 +459,37 @@ function exportJSON(id, info, toks) {
   toast("已导出");
 }
 
-/* ------------------------------------------------------------------ 管理员 */
+/* ------------------------------------------------------------------ 账号 / 管理员 */
+$("btnAccount").onclick = () => {
+  const p = $("accountPanel");
+  $("adminPanel").classList.add("hidden");
+  p.classList.toggle("hidden");
+  $("acctMsg").textContent = "";
+};
+
+$("btnChangePass").onclick = async () => {
+  const current = $("curPass").value;
+  const n1 = $("newPass1").value;
+  const n2 = $("newPass2").value;
+  const msg = $("acctMsg");
+  msg.textContent = "";
+  if (!current || !n1) { msg.textContent = "请输入当前密码和新密码"; return; }
+  if (n1.length < 10) { msg.textContent = "新密码至少 10 位"; return; }
+  if (n1 !== n2) { msg.textContent = "两次输入的新密码不一致"; return; }
+  try {
+    await api("/api/auth/password", {
+      method: "POST",
+      body: { current_password: current, new_password: n1 },
+    });
+    location.href = "/login?changed=1";
+  } catch (e) {
+    msg.textContent = e.message;
+  }
+};
+
 $("btnAdmins").onclick = () => {
   const p = $("adminPanel");
+  $("accountPanel").classList.add("hidden");
   p.classList.toggle("hidden");
   if (!p.classList.contains("hidden")) loadAdmins();
 };

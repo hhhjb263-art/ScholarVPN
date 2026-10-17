@@ -371,3 +371,87 @@ FodyWeavers.xsd
 !third_party/openssl/bin/
 !third_party/wintun-0.14.1/wintun/bin/
 !third_party/wintun-0.14.1/wintun/bin/amd64/
+
+# ============================================================
+# AI 编程助手：本地配置 / 会话状态 / 索引缓存（不入库）
+# 说明：以下均为各工具在本地生成的配置与状态目录，属机器/个人私有，
+#       不应提交。若团队希望共享某工具的"规则文件"（如 AGENTS.md），
+#       可单独用 ! 取消对应行的忽略。
+# ============================================================
+
+# WorkBuddy（本项目当前使用）
+.workbuddy-ai/
+
+# ZCode
+.zcode/
+
+# Cursor
+.cursor/
+.cursorrules
+.cursorignore
+
+# Claude Code
+.claude/
+.claude.json
+CLAUDE.md
+
+# Gemini CLI
+.gemini/
+GEMINI.md
+
+# OpenAI Codex CLI
+.codex/
+
+# GitHub Copilot
+.copilot/
+.github/copilot-instructions.md
+
+# Aider
+.aider*
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v*/
+
+# Continue
+.continue/
+
+# Codeium / Windsurf
+.codeium/
+.windsurf/
+.windsurfrules
+
+# Cline / Roo Code
+.cline/
+.roo/
+.roomodes
+
+# Trae
+.trae/
+
+# Kiro
+.kiro/
+
+# Qodo / Codium
+.qodo/
+
+# Tabnine
+.tabnine/
+
+# Sourcegraph Cody
+.sourcegraph/
+
+# SpecStory
+.specstory/
+
+# 通用：AI 目录 / MCP 配置
+.ai/
+.aiignore
+.agents/
+AGENTS.md
+.mcp.json
+# Python 缓存
+tools/webadmin/__pycache__/
+*.pyc
+
+# 后台管理管理员数据库（含密码哈希/会话）
+tools/webadmin/data/

@@ -67,6 +67,8 @@ Source: "x64\Release\tls\*"; DestDir: "{app}\tls"; Flags: ignoreversion recurses
 Source: "x64\Release\networkinformation\*"; DestDir: "{app}\networkinformation"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; 全局样式表
 Source: "x64\Release\style.qss"; DestDir: "{app}"; Flags: ignoreversion
+; 托盘图标（程序从 exe 同目录读取 icon.ico，缺了会退回系统默认图标）
+Source: "x64\Release\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

@@ -16,5 +16,18 @@ tun/test
 keys/*
 !keys/README.txt
 
+# TLS 证书/私钥（生产证书由 certbot 签发，不入库）
+tls/
+certs/
+*.pem
+
+# 域名/TLS 部署配置（含本机路径，证书由 setup-admin-domain.sh 管理）
+admin-domain.env
+
 # 运行时产物（watchdog 脚本 / PID / 停止标志）
 run/
+
+# 后台管理组件（admin-vpn.sh / admin-relay.sh）的运行时产物
+logs/
+agents.txt
+relay_admin_token.txt

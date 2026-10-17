@@ -83,6 +83,28 @@
          border:1px solid var(--line);border-radius:10px;padding:10px 14px;
          font-size:13px;opacity:0;transform:translateY(8px);transition:.18s;pointer-events:none}
   .toast.show{opacity:1;transform:translateY(0)}
+
+  /* ---- 手机 / 窄屏：左栏与内容改成上下堆叠 ---- */
+  @media (max-width: 760px){
+    header{flex-wrap:wrap;gap:8px;padding:10px 14px}
+    header .brand small{display:none}
+    .ctl{display:none}
+    .bar{flex-wrap:wrap;padding:10px 14px}
+    .bar input{flex:1 1 100%;min-width:0}
+    .bar .hint{flex:1 1 100%}
+    main{grid-template-columns:1fr}
+    aside{border-right:none;border-bottom:1px solid var(--line);padding:12px;
+          max-height:40vh;overflow:auto}
+    section{padding:14px}
+    .card{padding:12px;margin-bottom:12px}
+    .kv{grid-template-columns:84px 1fr;font-size:12px}
+    .card h3{flex-wrap:wrap;gap:6px}
+    table{font-size:12px}
+    th,td{padding:5px 4px}
+    td.tok{font-size:11px}
+    pre{font-size:10px;max-height:130px}
+    .toast{left:14px;right:14px;bottom:14px}
+  }
 </style>
 </head>
 <body>

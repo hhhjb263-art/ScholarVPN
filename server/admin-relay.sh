@@ -30,6 +30,8 @@
 #   AGENT_PORT=19090           agent 通道端口
 #   HTTP_BIND=127.0.0.1        HTTP 入口地址（默认仅环回，建议保持）
 #   HTTP_PORT=18081            HTTP 入口端口
+#   TLS_CERT=（空）            agent 通道 TLS 证书链（fullchain.pem）；与 TLS_KEY 成对
+#   TLS_KEY=（空）             agent 通道 TLS 私钥（privkey.pem，0600）
 #   ADMIN_TOKEN=（自动生成）   HTTP 入口 Bearer；留空则用/生成 $SCRIPT_DIR/admin_token.txt
 #   AGENTS_FILE=$SCRIPT_DIR/agents.txt   agent 公钥指纹白名单
 #   LOGS_DIR / RUN_DIR         日志 / PID 目录
@@ -40,6 +42,23 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+
+# 可选：读取 admin-domain.env（由 setup-admin-domain.sh 生成）。
+# 只填充“当前环境里还没设置”的变量，命令行前缀仍然优先。
+load_domain_env() {
+    local file="$SCRIPT_DIR/admin-domain.env" line key val
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        [ "$key" = "$line" ] && continue
+        if [ -z "${!key+x}" ]; then
+            export "$key=$val"
+        fi
+    done < "$file"
+}
+load_domain_env
 
 BUILD_DIR="$SCRIPT_DIR/build"
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"
@@ -52,6 +71,9 @@ AGENT_BIND="${AGENT_BIND:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-19090}"
 HTTP_BIND="${HTTP_BIND:-127.0.0.1}"
 HTTP_PORT="${HTTP_PORT:-18081}"
+TLS_CERT="${TLS_CERT:-}"
+TLS_KEY="${TLS_KEY:-}"
+TLS_ARGS=()
 
 CTL_LOG="$LOGS_DIR/vpn_controller.log"
 CTL_PID="$RUN_DIR/vpn_controller.pid"
@@ -140,6 +162,28 @@ ensure_relay_token() {
     printf '%s\n' "$RELAY_TOKEN" > "$TOKEN_FILE" || die "写令牌失败: $TOKEN_FILE"
     chmod 600 "$TOKEN_FILE" 2>/dev/null
     ok "已生成 $TOKEN_FILE"
+}
+
+# agent 通道 TLS：证书/私钥必须成对。生产环境用域名 + Let's Encrypt 证书，
+# 这里只校验文件可读并拼参数；证书的签发/续期交给 certbot，不在脚本里重造。
+prepare_tls() {
+    TLS_ARGS=()
+    if [ -z "$TLS_CERT" ] && [ -z "$TLS_KEY" ]; then
+        warn "agent 通道未启用 TLS（明文 TCP）。生产环境请设置 TLS_CERT/TLS_KEY"
+        return 0
+    fi
+    [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ] || die "TLS_CERT 与 TLS_KEY 必须同时设置"
+    [ -r "$TLS_CERT" ] || die "证书不可读: $TLS_CERT"
+    [ -r "$TLS_KEY" ] || die "私钥不可读: $TLS_KEY"
+    if have openssl; then
+        openssl x509 -in "$TLS_CERT" -noout -checkend 0 >/dev/null 2>&1 \
+            || die "证书已过期或无法解析: $TLS_CERT"
+        openssl x509 -in "$TLS_CERT" -noout -checkend 2592000 >/dev/null 2>&1 \
+            || warn "证书将在 30 天内过期: $TLS_CERT —— 记得续期"
+        openssl x509 -in "$TLS_CERT" -noout -subject -enddate 2>/dev/null | sed 's/^/    /'
+    fi
+    TLS_ARGS=(--tls-cert "$TLS_CERT" --tls-key "$TLS_KEY")
+    ok "agent 通道 TLS 已启用"
 }
 
 FP_NORM=""
@@ -296,6 +340,7 @@ do_start() {
     build_if_needed
     prepare_dirs
     ensure_relay_token
+    prepare_tls
 
     local n
     n="$(count_agents)"
@@ -324,6 +369,7 @@ do_start() {
                        --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
                        --admin-token "$RELAY_TOKEN" \
                        --agents "$AGENTS_FILE" \
+                       "${TLS_ARGS[@]}" \
             || die "启动 vpn_controller 失败（见上）"
         # 成功标志用「白名单」——失败信息里不含这三个字，不会被误判
         if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
@@ -355,6 +401,7 @@ do_fg() {
     build_if_needed
     prepare_dirs
     ensure_relay_token
+    prepare_tls
     trap fg_cleanup INT TERM
 
     start_one vpn_controller "$CTL_PID" "$CTL_LOG" \
@@ -362,6 +409,7 @@ do_fg() {
                    --http-bind "$HTTP_BIND"  --http-port "$HTTP_PORT" \
                    --admin-token "$RELAY_TOKEN" \
                    --agents "$AGENTS_FILE" \
+                   "${TLS_ARGS[@]}" \
         || die "启动 vpn_controller 失败（见上）"
     if ! wait_log_ok "$CTL_LOG" "白名单" "失败" 60; then
         tail -n 20 "$CTL_LOG" >&2; do_stop >/dev/null 2>&1; die "启动失败"
@@ -450,8 +498,14 @@ do_doctor() {
     [ -f "$TOKEN_FILE" ] && ok "令牌文件 $TOKEN_FILE" || warn "令牌文件缺失 $TOKEN_FILE（start 时会自动生成）"
 
     printf '\n%s=== 配置 ===%s\n' "$C_B" "$C_0"
-    printf 'agent 通道 : %s:%s\n' "$AGENT_BIND" "$AGENT_PORT"
+    printf 'agent 通道 : %s:%s  (%s)\n' "$AGENT_BIND" "$AGENT_PORT" \
+           "$([ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ] && echo 'TLS' || echo '明文 TCP')"
     printf 'HTTP 入口  : %s:%s\n' "$HTTP_BIND" "$HTTP_PORT"
+    if [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; then
+        printf 'TLS 证书   : %s\n' "${TLS_CERT:-<未设置>}"
+        printf 'TLS 私钥   : %s\n' "${TLS_KEY:-<未设置>}"
+        [ -r "$TLS_CERT" ] && openssl x509 -in "$TLS_CERT" -noout -subject -enddate 2>/dev/null | sed 's/^/  /'
+    fi
 
     if have ss; then
         printf '\n%s=== 端口占用 ===%s\n' "$C_B" "$C_0"

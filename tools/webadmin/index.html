@@ -33,6 +33,8 @@
        background:#1a1f2b;border-bottom:1px solid var(--line);font-size:13px}
   .bar input{flex:0 0 340px;background:var(--bg);border:1px solid var(--line);
              border-radius:8px;padding:6px 10px;color:var(--txt);font:13px var(--mono)}
+  .bar input.small{flex:0 0 170px}
+  .bar .grow{flex:1}
   .hidden{display:none!important}
 
   #alert{margin:14px 20px 0;padding:10px 14px;border-radius:10px;font-size:13px;
@@ -90,7 +92,7 @@
     header .brand small{display:none}
     .ctl{display:none}
     .bar{flex-wrap:wrap;padding:10px 14px}
-    .bar input{flex:1 1 100%;min-width:0}
+    .bar input,.bar input.small{flex:1 1 100%;min-width:0}
     .bar .hint{flex:1 1 100%}
     main{grid-template-columns:1fr}
     aside{border-right:none;border-bottom:1px solid var(--line);padding:12px;
@@ -112,16 +114,20 @@
 <header>
   <div class="brand">ScholarVPN 后台管理 <small>vpn_controller</small></div>
   <div class="grow"></div>
-  <span class="ctl" id="ctl">—</span>
-  <button id="btnToken" title="设置管理令牌">令牌</button>
+  <span class="ctl" id="who">—</span>
+  <button id="btnAdmins" title="管理员账号">管理员</button>
+  <button id="btnLogout">退出</button>
   <button id="btnRefresh" class="primary">刷新</button>
 </header>
 
-<div class="bar hidden" id="tokenBar">
-  <span>管理令牌</span>
-  <input id="tokenInput" type="password" placeholder="controller 的 ADMIN_TOKEN" autocomplete="off">
-  <button id="btnSaveToken" class="primary">保存</button>
-  <span class="hint">只存在本浏览器 sessionStorage，关闭标签页即失效</span>
+<div class="bar hidden" id="adminPanel">
+  <span>新增管理员</span>
+  <input id="newUser" class="small" placeholder="用户名" autocomplete="off">
+  <input id="newPass" class="small" type="password" placeholder="密码（至少10位）" autocomplete="new-password">
+  <button id="btnAddAdmin" class="primary">创建</button>
+  <span id="adminMsg" class="hint"></span>
+  <span class="grow"></span>
+  <span id="adminList" class="hint"></span>
 </div>
 
 <div id="alert" class="hidden"></div>
@@ -142,7 +148,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { servers: [], current: null, token: sessionStorage.getItem("admin_token") || "" };
+const state = { servers: [], current: null, csrf: "", username: "" };
 
 /* ------------------------------------------------------------------ 基础 */
 function toast(msg) {
@@ -177,8 +183,7 @@ async function copyText(text) {
 /* 状态码语义见 docs/客户端实现方案接口.md 2.6；401 有二义性，要分开提示 */
 function explain(status, body) {
   const err = (body && body.error) || "";
-  if (status === 401) return "401 未授权 —— 可能是【中转站令牌】错（页面右上「令牌」），\n" +
-    "也可能是【agent 启动时的 --token】与本机 admin_server 不一致（看 agent 日志）。";
+  if (status === 401) return "登录已过期或未登录，请重新登录。";
   if (status === 403) return "403 禁止访问。";
   if (status === 404) return "404 未找到 —— 路径不认识，或令牌已被消费（两侧都可能产生 404）。";
   if (status === 413) return "413 请求过大 —— controller 上限 8KB。";
@@ -190,20 +195,31 @@ function explain(status, body) {
 }
 
 async function api(path, opts = {}) {
+  const method = opts.method || "GET";
   const headers = Object.assign({ "Accept": "application/json" }, opts.headers || {});
-  if (state.token) headers["X-Admin-Token"] = state.token;
+  if (state.csrf && method !== "GET" && method !== "HEAD") {
+    headers["X-CSRF-Token"] = state.csrf;
+  }
   if (opts.body) headers["Content-Type"] = "application/json";
 
-  const res = await fetch(path, {
-    method: opts.method || "GET",
-    headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch (_) {
+    throw new Error("网络错误，请检查连接");
+  }
 
   let data = null;
   const text = await res.text();
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
 
+  if (res.status === 401) {
+    location.href = "/login";
+  }
   if (!res.ok) {
     const e = new Error(explain(res.status, data));
     e.status = res.status;
@@ -262,7 +278,6 @@ async function loadServers() {
     }
   } catch (e) {
     box.innerHTML = "";
-    if (e.status === 401) showTokenBar();
     alertBox("err", e.message);
   }
 }
@@ -434,32 +449,62 @@ function exportJSON(id, info, toks) {
   toast("已导出");
 }
 
-/* ------------------------------------------------------------------ 令牌输入 */
-function showTokenBar() {
-  $("tokenBar").classList.remove("hidden");
-  $("tokenInput").value = state.token;
-  $("tokenInput").focus();
-}
-
-$("btnToken").onclick = () => $("tokenBar").classList.toggle("hidden");
-$("btnSaveToken").onclick = () => {
-  state.token = $("tokenInput").value.trim();
-  sessionStorage.setItem("admin_token", state.token);
-  $("tokenBar").classList.add("hidden");
-  loadServers();
+/* ------------------------------------------------------------------ 管理员 */
+$("btnAdmins").onclick = () => {
+  const p = $("adminPanel");
+  p.classList.toggle("hidden");
+  if (!p.classList.contains("hidden")) loadAdmins();
 };
-$("tokenInput").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") $("btnSaveToken").click();
-});
-$("btnRefresh").onclick = () => loadServers();
+
+$("btnLogout").onclick = async () => {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch (_) { /* 已过期也跳转 */ }
+  location.href = "/login";
+};
+
+$("btnAddAdmin").onclick = async () => {
+  const username = $("newUser").value.trim();
+  const password = $("newPass").value;
+  $("adminMsg").textContent = "";
+  if (!username || !password) { $("adminMsg").textContent = "请输入用户名和密码"; return; }
+  try {
+    await api("/api/admin/users", { method: "POST", body: { username, password } });
+    $("newUser").value = "";
+    $("newPass").value = "";
+    $("adminMsg").textContent = "已创建 " + username;
+    await loadAdmins();
+  } catch (e) {
+    $("adminMsg").textContent = e.message;
+  }
+};
+
+async function loadAdmins() {
+  try {
+    const j = await api("/api/admin/users");
+    const names = (j.admins || []).map((a) =>
+      a.username + (a.username === j.current ? "（当前）" : ""));
+    $("adminList").textContent = names.join("、");
+  } catch (e) {
+    $("adminList").textContent = e.message;
+  }
+}
 
 /* ------------------------------------------------------------------ 启动 */
-$("ctl").textContent = location.origin;
-if (!state.token) {
-  /* 服务端可能已经配好令牌；先静默试一次，401 再弹输入框 */
+$("btnRefresh").onclick = () => loadServers();
+
+async function init() {
+  try {
+    const me = await api("/api/auth/me");
+    state.username = me.username || "";
+    state.csrf = me.csrf || "";
+    $("who").textContent = "管理员：" + state.username;
+  } catch (_) {
+    return; // api() 已处理 401 跳转
+  }
+  loadServers();
+  setInterval(() => { if (!document.hidden) loadServers(); }, 15000);
 }
-loadServers();
-setInterval(() => { if (!document.hidden) loadServers(); }, 15000);
+
+init();
 </script>
 </body>
 </html>

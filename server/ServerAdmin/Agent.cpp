@@ -63,8 +63,9 @@ bool from_hex(const std::string& s, std::vector<uint8_t>& out)
     return true;
 }
 
-// 非阻塞 connect + poll 等可写，成功返回已恢复阻塞的 fd
-int tcp_connect(const std::string& host, uint16_t port, int timeout_ms)
+// 本机 AdminServer 仍是环回明文 HTTP：保留一个简单的 TCP 连接器即可。
+// 管理通道（agent ↔ controller）的连接/域名解析/TLS 已改用 wire::Conn。
+int plain_tcp_connect(const std::string& host, uint16_t port, int timeout_ms)
 {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
@@ -102,7 +103,7 @@ bool send_all(int fd, const std::string& data)
     return true;
 }
 
-// 收一帧见 AdminWire.h 的 wire::recv_frame（循环读到凑齐或超时）
+// 收一帧见 AdminWire.h 的 wire::Conn::recv_frame（循环读到凑齐或超时）
 
 // 解析 HTTP 响应（Connection: close 语义：头 + 之后全是 body）
 bool parse_http(const std::string& raw, int& status, std::string& body)
@@ -123,7 +124,7 @@ bool http_call(const std::string& host, uint16_t port, const std::string& token,
                const std::string& method, const std::string& path,
                const std::string& req_body, int& status, std::string& resp_body)
 {
-    const int fd = tcp_connect(host, port, wire::kTimeoutMs);
+    const int fd = plain_tcp_connect(host, port, wire::kTimeoutMs);
     if (fd < 0) return false;
     std::string req;
     req += method + " " + path + " HTTP/1.1\r\n";
@@ -176,7 +177,11 @@ void usage(const char* prog)
         "  --key <path>              本机 Ed25519 身份私钥（默认 keys/server_sig.key）\n"
         "  --token <str>             访问本机 AdminServer 的 Bearer（默认取 ADMIN_TOKEN 环境变量）\n"
         "  --name <str>              展示名（可选）\n"
-        "环境变量: CONTROLLER_HOST/CONTROLLER_PORT/ADMIN_HOST/ADMIN_PORT/KEY_PATH/ADMIN_TOKEN/AGENT_NAME\n",
+        "  --tls                     启用 TLS（用系统 CA 校验 controller 证书）\n"
+        "  --tls-ca <file>           自定义信任根 PEM（自签/私有 CA；隐含 --tls）\n"
+        "  --tls-server-name <name>  证书校验名（默认用 controller 主机名）\n"
+        "环境变量: CONTROLLER_HOST/CONTROLLER_PORT/ADMIN_HOST/ADMIN_PORT/KEY_PATH/ADMIN_TOKEN/AGENT_NAME\n"
+        "          CONTROLLER_TLS=1/CONTROLLER_TLS_CA/CONTROLLER_TLS_NAME\n",
         prog);
 }
 
@@ -190,6 +195,10 @@ Agent::~Agent()
     if (priv_ != nullptr) {
         EVP_PKEY_free(priv_);
         priv_ = nullptr;
+    }
+    if (tls_ctx_ != nullptr) {
+        SSL_CTX_free(tls_ctx_);
+        tls_ctx_ = nullptr;
     }
 }
 
@@ -227,6 +236,19 @@ void Agent::run()
     pub_hex_ = to_hex(raw, raw_len);
     fprintf(stderr, "[agent] 本机身份指纹: %s\n", pub_hex_.c_str());
 
+    if (opt_.tls) {
+        std::string err;
+        tls_ctx_ = wire::make_client_ctx(opt_.tls_ca, err);
+        if (tls_ctx_ == nullptr) {
+            fprintf(stderr, "[agent] TLS 初始化失败: %s\n", err.c_str());
+            return;   // 证书/CA 配置错误：重连也不会好，直接退出让运维处理
+        }
+        const std::string name = opt_.tls_server_name.empty()
+                                     ? opt_.controller_host : opt_.tls_server_name;
+        fprintf(stderr, "[agent] TLS 已启用，校验名=%s，信任根=%s\n",
+                name.c_str(), opt_.tls_ca.empty() ? "系统 CA" : opt_.tls_ca.c_str());
+    }
+
     int backoff = kBackoffMinMs;
     while (running_.load()) {
         if (connect_and_serve()) break;   // 收到 stop()：正常退出
@@ -241,60 +263,65 @@ void Agent::run()
 
 bool Agent::connect_and_serve()
 {
-    const int fd = tcp_connect(opt_.controller_host, opt_.controller_port, wire::kTimeoutMs);
-    if (fd < 0) {
-        fprintf(stderr, "[agent] 连接 controller %s:%u 失败\n",
-                opt_.controller_host.c_str(), unsigned(opt_.controller_port));
+    wire::Conn conn;
+    std::string err;
+    if (!conn.connect_tcp(opt_.controller_host, opt_.controller_port,
+                          wire::kTimeoutMs, err)) {
+        fprintf(stderr, "[agent] 连接 controller %s:%u 失败: %s\n",
+                opt_.controller_host.c_str(), unsigned(opt_.controller_port),
+                err.c_str());
         return false;
+    }
+    if (opt_.tls) {
+        const std::string name = opt_.tls_server_name.empty()
+                                     ? opt_.controller_host : opt_.tls_server_name;
+        if (!conn.enable_tls_client(tls_ctx_, name, wire::kTimeoutMs, err)) {
+            fprintf(stderr, "[agent] 与 controller 的 TLS 握手失败: %s\n", err.c_str());
+            return false;
+        }
     }
 
     wire::Framer fr;
     std::string frame, type;
 
     // 1) 等 controller 下发的挑战
-    if (wire::recv_frame(fd, fr, frame, wire::kTimeoutMs) != 1 ||
+    if (conn.recv_frame(fr, frame, wire::kTimeoutMs) != 1 ||
         !wire::get_string(frame, "type", type) || type != "challenge") {
         fprintf(stderr, "[agent] 未收到 challenge\n");
-        ::close(fd);
         return false;
     }
     std::string nonce;
-    if (!wire::get_string(frame, "nonce", nonce)) { ::close(fd); return false; }
+    if (!wire::get_string(frame, "nonce", nonce)) return false;
 
     // 2) 签名 + hello（上报公钥指纹，controller 据此比对白名单）
     const std::string sig = sign_challenge(nonce);
     if (sig.empty()) {
         fprintf(stderr, "[agent] 挑战签名失败\n");
-        ::close(fd);
         return false;
     }
-    if (!wire::send_frame(fd, wire::Json().str("type", "hello")
+    if (!conn.send_frame(wire::Json().str("type", "hello")
                                   .str("pubkey_hex", pub_hex_)
                                   .str("sig", sig)
                                   .str("name", opt_.name)
                                   .done())) {
         fprintf(stderr, "[agent] 发送 hello 失败\n");
-        ::close(fd);
         return false;
     }
 
     // 3) 等准入结果
-    const int wr = wire::recv_frame(fd, fr, frame, wire::kTimeoutMs);
+    const int wr = conn.recv_frame(fr, frame, wire::kTimeoutMs);
     if (wr != 1) {
         fprintf(stderr, "[agent] 等待准入结果%s\n", wr == 0 ? "超时" : "时连接断开");
-        ::close(fd);
         return false;
     }
     if (!wire::get_string(frame, "type", type)) {
         fprintf(stderr, "[agent] 准入结果帧格式不对\n");
-        ::close(fd);
         return false;
     }
     if (type != "welcome") {
         std::string reason;
         wire::get_string(frame, "reason", reason);
         fprintf(stderr, "[agent] 准入被拒: %s\n", reason.c_str());
-        ::close(fd);
         return false;   // 白名单可能还没登记：退避后重试
     }
     fprintf(stderr, "[agent] 已接入 controller\n");
@@ -302,8 +329,8 @@ bool Agent::connect_and_serve()
     // 4) 心跳 + 命令循环
     auto last_hb = std::chrono::steady_clock::now();
     while (running_.load()) {
-        const int r = wire::recv_frame(fd, fr, frame, kPollSliceMs);
-        if (r < 0) { ::close(fd); return false; }
+        const int r = conn.recv_frame(fr, frame, kPollSliceMs);
+        if (r < 0) return false;
         if (r == 1) {
             std::string t;
             wire::get_string(frame, "type", t);
@@ -323,12 +350,11 @@ bool Agent::connect_and_serve()
                     status = 502;
                     resp = "{\"error\":\"local admin server unreachable\"}";
                 }
-                if (!wire::send_frame(fd, wire::Json().str("type", "reply")
+                if (!conn.send_frame(wire::Json().str("type", "reply")
                                               .num("id", id)
                                               .num("status", status)
                                               .str("body", resp)
                                               .done())) {
-                    ::close(fd);
                     return false;
                 }
             }
@@ -336,14 +362,12 @@ bool Agent::connect_and_serve()
         }
         const auto now = std::chrono::steady_clock::now();
         if (now - last_hb >= std::chrono::seconds(kHeartbeatSec)) {
-            if (!wire::send_frame(fd, wire::Json().str("type", "heartbeat").done())) {
-                ::close(fd);
+            if (!conn.send_frame(wire::Json().str("type", "heartbeat").done())) {
                 return false;
             }
             last_hb = now;
         }
     }
-    ::close(fd);
     return true;   // stop() 打断
 }
 
@@ -357,6 +381,13 @@ int main(int argc, char* argv[])
     if (const char* e = std::getenv("KEY_PATH"))        opt.key_path = e;
     if (const char* e = std::getenv("ADMIN_TOKEN"))     opt.admin_token = e;
     if (const char* e = std::getenv("AGENT_NAME"))      opt.name = e;
+    if (const char* e = std::getenv("CONTROLLER_TLS")) {
+        const std::string v = e;
+        opt.tls = (v == "1" || v == "true" || v == "yes" || v == "on");
+    }
+    if (const char* e = std::getenv("CONTROLLER_TLS_CA"))   opt.tls_ca = e;
+    if (const char* e = std::getenv("CONTROLLER_TLS_NAME")) opt.tls_server_name = e;
+    if (!opt.tls_ca.empty() || !opt.tls_server_name.empty()) opt.tls = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -382,6 +413,16 @@ int main(int argc, char* argv[])
             const char* v = next("令牌"); if (v == nullptr) return 1; opt.admin_token = v;
         } else if (a == "--name") {
             const char* v = next("名称"); if (v == nullptr) return 1; opt.name = v;
+        } else if (a == "--tls") {
+            opt.tls = true;
+        } else if (a == "--tls-ca") {
+            const char* v = next("PEM"); if (v == nullptr) return 1;
+            opt.tls_ca = v;
+            opt.tls = true;
+        } else if (a == "--tls-server-name") {
+            const char* v = next("name"); if (v == nullptr) return 1;
+            opt.tls_server_name = v;
+            opt.tls = true;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -392,9 +433,10 @@ int main(int argc, char* argv[])
         }
     }
 
-    fprintf(stderr, "[agent] controller=%s:%u admin=%s:%u key=%s\n",
+    fprintf(stderr, "[agent] controller=%s:%u admin=%s:%u key=%s tls=%s\n",
             opt.controller_host.c_str(), unsigned(opt.controller_port),
-            opt.admin_host.c_str(), unsigned(opt.admin_port), opt.key_path.c_str());
+            opt.admin_host.c_str(), unsigned(opt.admin_port), opt.key_path.c_str(),
+            opt.tls ? "on" : "off");
 
     Agent agent(std::move(opt));
     g_agent = &agent;

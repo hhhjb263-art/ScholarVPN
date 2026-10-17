@@ -99,7 +99,7 @@ bool send_all(int fd, const std::string& data)
     return true;
 }
 
-// 收一帧见 AdminWire.h 的 wire::recv_frame（循环读到凑齐或超时）
+// 收一帧见 AdminWire.h 的 wire::Conn::recv_frame（循环读到凑齐或超时）
 
 const char* reason_phrase(int status)
 {
@@ -164,6 +164,8 @@ void usage(const char* prog)
         "  --http-port <n>       HTTP 入口端口（默认 18081）\n"
         "  --admin-token <str>   HTTP 入口 Bearer（默认取 ADMIN_TOKEN 环境变量；空=不鉴权）\n"
         "  --agents <file>       agent 公钥指纹白名单文件（默认 agents.txt，每行一个 hex）\n"
+        "  --tls-cert <file>     agent 通道 TLS 证书链，如 fullchain.pem（与 --tls-key 成对）\n"
+        "  --tls-key <file>      agent 通道 TLS 私钥，如 privkey.pem（0600）\n"
         "  --add-agent <hex>     把某指纹追加进白名单后退出\n",
         prog);
 }
@@ -178,6 +180,7 @@ Controller::~Controller()
     if (agent_thread_.joinable()) agent_thread_.join();
     if (agent_fd_ >= 0) { ::close(agent_fd_); agent_fd_ = -1; }
     if (http_fd_ >= 0) { ::close(http_fd_); http_fd_ = -1; }
+    if (tls_ctx_ != nullptr) { SSL_CTX_free(tls_ctx_); tls_ctx_ = nullptr; }
 }
 
 bool Controller::start()
@@ -188,6 +191,24 @@ bool Controller::start()
     while (std::getline(fin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (!line.empty()) whitelist_.push_back(line);
+    }
+
+    // TLS 是 agent 通道的传输层保护；证书/私钥必须成对出现。
+    if (!opt_.tls_cert.empty() || !opt_.tls_key.empty()) {
+        if (opt_.tls_cert.empty() || opt_.tls_key.empty()) {
+            fprintf(stderr, "[controller] TLS_CERT 与 TLS_KEY 必须同时设置\n");
+            return false;
+        }
+        std::string err;
+        tls_ctx_ = wire::make_server_ctx(opt_.tls_cert, opt_.tls_key, err);
+        if (tls_ctx_ == nullptr) {
+            fprintf(stderr, "[controller] TLS 初始化失败: %s\n", err.c_str());
+            return false;
+        }
+    } else if (opt_.agent_bind != "127.0.0.1" && opt_.agent_bind != "::1") {
+        fprintf(stderr,
+                "[controller] 警告: agent 通道是明文 TCP。生产环境请配置 "
+                "--tls-cert/--tls-key（或 TLS_CERT/TLS_KEY）\n");
     }
 
     agent_fd_ = listen_tcp(opt_.agent_bind, opt_.agent_port, 16);
@@ -205,8 +226,9 @@ bool Controller::start()
 
     running_.store(true);
     agent_thread_ = std::thread([this] { agent_loop(); });
-    fprintf(stderr, "[controller] agent 通道 %s:%u，HTTP 入口 %s:%u，白名单 %zu 条\n",
+    fprintf(stderr, "[controller] agent 通道 %s:%u（%s），HTTP 入口 %s:%u，白名单 %zu 条\n",
             opt_.agent_bind.c_str(), unsigned(opt_.agent_port),
+            tls_ctx_ != nullptr ? "TLS" : "明文 TCP",
             opt_.http_bind.c_str(), unsigned(opt_.http_port), whitelist_.size());
     return true;
 }
@@ -250,21 +272,30 @@ void Controller::agent_loop()
         ::inet_ntop(AF_INET, &clt.sin_addr, ipbuf, sizeof(ipbuf));
         const std::string ip = ipbuf;
 
-        // ---- 握手（阻塞，管理连接很少，短暂占用本线程可接受）----
+        wire::Conn conn;
+        conn.adopt_fd(cfd);
+        if (tls_ctx_ != nullptr) {
+            std::string terr;
+            if (!conn.enable_tls_server(tls_ctx_, wire::kTimeoutMs, terr)) {
+                fprintf(stderr, "[controller] agent %s TLS 握手失败: %s\n",
+                        ip.c_str(), terr.c_str());
+                continue;   // conn 析构时关闭 fd
+            }
+        }
+
+        // ---- 握手（管理连接很少，短暂占用本线程可接受）----
         const std::vector<uint8_t> nonce = generate_nonce(16);
         const std::string nonce_hex = to_hex(nonce.data(), nonce.size());
-        if (!wire::send_frame(cfd, wire::Json().str("type", "challenge")
+        if (!conn.send_frame(wire::Json().str("type", "challenge")
                                         .str("nonce", nonce_hex).done())) {
-            ::close(cfd);
             continue;
         }
         wire::Framer fr;
         std::string frame, type, pub_hex, sig_hex, name;
-        if (wire::recv_frame(cfd, fr, frame, wire::kTimeoutMs) != 1 ||
+        if (conn.recv_frame(fr, frame, wire::kTimeoutMs) != 1 ||
             !wire::get_string(frame, "type", type) || type != "hello" ||
             !wire::get_string(frame, "pubkey_hex", pub_hex) ||
             !wire::get_string(frame, "sig", sig_hex)) {
-            ::close(cfd);
             continue;
         }
         wire::get_string(frame, "name", name);
@@ -283,31 +314,29 @@ void Controller::agent_loop()
             }
         }
         if (!ok) {
-            wire::send_frame(cfd, wire::Json().str("type", "reject")
+            conn.send_frame(wire::Json().str("type", "reject")
                                      .str("reason", "signature verify failed").done());
-            ::close(cfd);
             fprintf(stderr, "[controller] agent %s 签名校验失败，拒绝\n", ip.c_str());
             continue;
         }
         if (!in_whitelist(pub_hex)) {
-            wire::send_frame(cfd, wire::Json().str("type", "reject")
+            conn.send_frame(wire::Json().str("type", "reject")
                                      .str("reason", "pubkey not in whitelist").done());
-            ::close(cfd);
             fprintf(stderr, "[controller] agent %s 指纹未登记，拒绝: %s\n", ip.c_str(), pub_hex.c_str());
             continue;
         }
 
         auto ag = std::make_shared<Agent>();
-        ag->fd = cfd;
         ag->pubkey_hex = pub_hex;
         ag->id = name.empty() ? pub_hex.substr(0, 8) : name;
         ag->ip = ip;
         ag->connected_at = now_ms();
         ag->last_seen = ag->connected_at;
-        if (!wire::send_frame(cfd, wire::Json().str("type", "welcome").str("id", ag->id).done())) {
-            ::close(cfd);
+        if (!conn.send_frame(wire::Json().str("type", "welcome").str("id", ag->id).done())) {
             continue;
         }
+        ag->conn = std::move(conn);
+        ag->fr = std::move(fr);
         {
             std::lock_guard<std::mutex> lk(mtx_);
             agents_[ag->id] = ag;   // 同 id 重连：覆盖旧连接（旧的会在下面因断开被摘除）
@@ -317,7 +346,7 @@ void Controller::agent_loop()
 
         // ---- 长连接：收心跳 / 命令回执，直到断开或心跳超时 ----
         while (running_.load()) {
-            const int r = wire::recv_frame(cfd, ag->fr, frame, kPollSliceMs);
+            const int r = ag->conn.recv_frame(ag->fr, frame, kPollSliceMs);
             if (r < 0) break;
             if (r == 0) {
                 if (now_ms() - ag->last_seen > kHeartbeatGap) {
@@ -350,7 +379,6 @@ void Controller::agent_loop()
             auto it = agents_.find(ag->id);
             if (it != agents_.end() && it->second == ag) agents_.erase(it);
         }
-        ::close(cfd);
         fprintf(stderr, "[controller] agent 断开: id=%s ip=%s\n", ag->id.c_str(), ip.c_str());
     }
 }
@@ -375,7 +403,7 @@ bool Controller::forward(const std::string& server_id, const std::string& method
                                      .str("body", body).done();
     {
         std::lock_guard<std::mutex> lk(ag->wmtx);   // 命令帧不能交错
-        if (!wire::send_frame(ag->fd, cmd)) { err = "agent send failed"; return false; }
+        if (!ag->conn.send_frame(cmd)) { err = "agent send failed"; return false; }
     }
 
     std::unique_lock<std::mutex> lk(ag->pmtx);
@@ -563,6 +591,8 @@ int main(int argc, char* argv[])
     if (const char* e = std::getenv("HTTP_PORT"))    opt.http_port = uint16_t(std::atoi(e));
     if (const char* e = std::getenv("ADMIN_TOKEN"))  opt.admin_token = e;
     if (const char* e = std::getenv("AGENTS_FILE"))  opt.agents_file = e;
+    if (const char* e = std::getenv("TLS_CERT"))     opt.tls_cert = e;
+    if (const char* e = std::getenv("TLS_KEY"))      opt.tls_key = e;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -576,6 +606,8 @@ int main(int argc, char* argv[])
         else if (a == "--http-port") { const char* v = next("n"); if (!v) return 1; opt.http_port = uint16_t(std::atoi(v)); }
         else if (a == "--admin-token") { const char* v = next("str"); if (!v) return 1; opt.admin_token = v; }
         else if (a == "--agents") { const char* v = next("file"); if (!v) return 1; opt.agents_file = v; }
+        else if (a == "--tls-cert") { const char* v = next("file"); if (!v) return 1; opt.tls_cert = v; }
+        else if (a == "--tls-key") { const char* v = next("file"); if (!v) return 1; opt.tls_key = v; }
         else if (a == "--add-agent") {
             const char* v = next("hex");
             if (v == nullptr) return 1;

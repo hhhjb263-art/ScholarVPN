@@ -31,8 +31,11 @@
 #   ADMIN_BIND=127.0.0.1       admin_server 监听地址（强烈建议保持环回）
 #   ADMIN_PORT=18080           admin_server 监听端口
 #   ADMIN_NAME=vpn-1           上报给中转的展示名（中转那边拿它当 server id）
-#   RELAY_HOST=127.0.0.1       中转服务器地址
+#   RELAY_HOST=127.0.0.1       中转服务器地址（生产环境填域名，如 admin.example.com）
 #   RELAY_PORT=19090           中转的 agent 通道端口
+#   RELAY_TLS=0                1=启用 TLS（用系统 CA 校验中转证书）
+#   RELAY_TLS_CA=（空）        自定义信任根 PEM（自签/私有 CA；设置后隐含启用 TLS）
+#   RELAY_TLS_NAME=（空）      证书校验名；留空=RELAY_HOST（用 IP 连接时也建议显式设置域名）
 #   KEYS_DIR=<脚本目录>/keys   密钥与令牌目录
 #   LOGS_DIR / RUN_DIR         日志 / PID 目录
 #   ADMIN_TOKEN=（空）         管理令牌；留空则用 KEYS_DIR/admin_token.txt（没有就自动生成）
@@ -44,6 +47,23 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+# 可选：读取 admin-domain.env（由 setup-admin-domain.sh 生成）。
+# 只填充“当前环境里还没设置”的变量，命令行前缀仍然优先。
+load_domain_env() {
+    local file="$SCRIPT_DIR/admin-domain.env" line key val
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        [ "$key" = "$line" ] && continue
+        if [ -z "${!key+x}" ]; then
+            export "$key=$val"
+        fi
+    done < "$file"
+}
+load_domain_env
+
 BUILD_DIR="$SCRIPT_DIR/build"
 KEYS_DIR="${KEYS_DIR:-$SCRIPT_DIR/keys}"
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"
@@ -54,6 +74,10 @@ ADMIN_PORT="${ADMIN_PORT:-18080}"
 ADMIN_NAME="${ADMIN_NAME:-vpn-1}"
 RELAY_HOST="${RELAY_HOST:-127.0.0.1}"
 RELAY_PORT="${RELAY_PORT:-19090}"
+RELAY_TLS="${RELAY_TLS:-0}"
+RELAY_TLS_CA="${RELAY_TLS_CA:-}"
+RELAY_TLS_NAME="${RELAY_TLS_NAME:-}"
+AGENT_TLS_ARGS=()
 
 ADMIN_BIN="$BUILD_DIR/admin_server"
 AGENT_BIN="$BUILD_DIR/admin_agent"
@@ -180,6 +204,23 @@ read_token() {
     if [ -n "${ADMIN_TOKEN:-}" ]; then printf '%s' "$ADMIN_TOKEN"; return 0; fi
     [ -f "$TOKEN_FILE" ] || return 1
     head -n1 "$TOKEN_FILE" 2>/dev/null | tr -d '\r\n'
+}
+
+# agent → controller 的管理通道 TLS。RELAY_TLS_CA 非空时只信任该 CA；
+# RELAY_TLS=1 时用系统 CA（Let's Encrypt 等公共 CA）。
+prepare_agent_tls() {
+    AGENT_TLS_ARGS=()
+    if [ -n "$RELAY_TLS_CA" ]; then
+        [ -r "$RELAY_TLS_CA" ] || die "RELAY_TLS_CA 不可读: $RELAY_TLS_CA"
+        AGENT_TLS_ARGS=(--tls-ca "$RELAY_TLS_CA"
+                        --tls-server-name "${RELAY_TLS_NAME:-$RELAY_HOST}")
+        ok "agent 管理通道 TLS 已启用（自定义 CA）"
+    elif [ "$RELAY_TLS" = "1" ]; then
+        AGENT_TLS_ARGS=(--tls --tls-server-name "${RELAY_TLS_NAME:-$RELAY_HOST}")
+        ok "agent 管理通道 TLS 已启用（系统 CA）"
+    else
+        warn "agent 管理通道未启用 TLS（明文 TCP）。生产环境请设置 RELAY_TLS=1 或 RELAY_TLS_CA"
+    fi
 }
 
 # ---------------------------------------------------------------- 进程
@@ -315,6 +356,7 @@ do_start() {
     build_if_needed
     prepare_dirs
     ensure_keys
+    prepare_agent_tls
 
     local fp tok
     fp="$(fingerprint)" || die "无法获取身份指纹"
@@ -353,6 +395,7 @@ do_start() {
         "$AGENT_BIN" --controller "$RELAY_HOST:$RELAY_PORT" \
                      --admin "$ADMIN_BIND:$ADMIN_PORT" \
                      --key "$SIG_KEY" --token "$tok" --name "$ADMIN_NAME" \
+                     "${AGENT_TLS_ARGS[@]}" \
         || die "启动 admin_agent 失败（见上）"
     if wait_log "$AG_LOG" "已接入 controller" 100; then
         ok "admin_agent 已接入中转"
@@ -389,6 +432,7 @@ do_fg() {
     build_if_needed
     prepare_dirs
     ensure_keys
+    prepare_agent_tls
 
     local fp tok
     fp="$(fingerprint)" || die "无法获取身份指纹"
@@ -409,6 +453,7 @@ do_fg() {
         "$AGENT_BIN" --controller "$RELAY_HOST:$RELAY_PORT" \
                      --admin "$ADMIN_BIND:$ADMIN_PORT" \
                      --key "$SIG_KEY" --token "$tok" --name "$ADMIN_NAME" \
+                     "${AGENT_TLS_ARGS[@]}" \
         || die "启动 admin_agent 失败（见上）"
 
     printf '\n'
@@ -513,6 +558,10 @@ do_doctor() {
     printf '\n%s=== 配置 ===%s\n' "$C_B" "$C_0"
     printf 'admin_server 监听 : %s:%s\n' "$ADMIN_BIND" "$ADMIN_PORT"
     printf '上报中转          : %s:%s  (name=%s)\n' "$RELAY_HOST" "$RELAY_PORT" "$ADMIN_NAME"
+    printf '管理通道 TLS      : %s\n' \
+           "$([ -n "$RELAY_TLS_CA" ] || [ "$RELAY_TLS" = "1" ] && echo '启用' || echo '未启用（明文 TCP）')"
+    [ -n "$RELAY_TLS_CA" ] && printf 'TLS 信任根        : %s\n' "$RELAY_TLS_CA"
+    printf 'TLS 校验名        : %s\n' "${RELAY_TLS_NAME:-$RELAY_HOST}"
 
     if [ -f "$SIG_PUB" ]; then
         printf '本机身份指纹      : %s\n' "$(fingerprint)"

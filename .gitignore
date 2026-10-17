@@ -452,3 +452,6 @@ AGENTS.md
 # Python 缓存
 tools/webadmin/__pycache__/
 *.pyc
+
+# 后台管理管理员数据库（含密码哈希/会话）
+tools/webadmin/data/

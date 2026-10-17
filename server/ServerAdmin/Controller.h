@@ -31,6 +31,9 @@ public:
         uint16_t    http_port = 18081;
         std::string admin_token;              // HTTP 入口的 Bearer（空 = 不鉴权，仅限本机调试）
         std::string agents_file = "agents.txt"; // 允许接入的 agent 公钥指纹（每行一个 hex）
+        // 非空 = agent 通道启用 TLS（两者必须同时给）。生产环境用域名 + 正式证书。
+        std::string tls_cert;                 // fullchain.pem
+        std::string tls_key;                  // privkey.pem（0600）
     };
 
     explicit Controller(Options opt);
@@ -46,7 +49,7 @@ public:
 private:
     // 一个已接入的 agent
     struct Agent {
-        int fd = -1;
+        wire::Conn conn;           // TCP 或 TLS 连接（含 fd 所有权）
         std::string id;            // 展示名（agent 自报；空则用指纹前 8 位）
         std::string pubkey_hex;
         std::string ip;
@@ -89,6 +92,7 @@ private:
     std::atomic<bool> running_{ false };
     int agent_fd_ = -1;
     int http_fd_ = -1;
+    SSL_CTX* tls_ctx_ = nullptr;   // agent 通道 TLS（opt_.tls_* 非空时创建）
     std::thread agent_thread_;
     std::thread http_thread_;
 

@@ -58,18 +58,19 @@ target_link_libraries(vpn_server PRIVATE vpn_modules)
 # 3) 中转（控制面）：admin_agent（VPN 服务器侧）+ vpn_controller（中转服务器）
 #    只实现「VPN 服务器 ↔ 中转服务器」之间的业务接口（agent 通道）；
 #    管理端客户端（Web/Qt）不在本次范围内。
-#    两者共用 ServerAdmin/AdminWire.h 的线协议（明文 TCP + 长度前缀 JSON 帧）。
+#    两者共用 ServerAdmin/AdminWire.h 的线协议（长度前缀 JSON 帧；
+#    传输层支持明文 TCP 兼容模式与 OpenSSL TLS 生产模式）。
 # ============================================================
 add_executable(admin_agent
     ServerAdmin/Agent.cpp
 )
-target_link_libraries(admin_agent PRIVATE vpn_modules)
+target_link_libraries(admin_agent PRIVATE vpn_modules OpenSSL::SSL)
 target_compile_options(admin_agent PRIVATE -Wall -Wextra)
 
 add_executable(vpn_controller
     ServerAdmin/Controller.cpp
 )
-target_link_libraries(vpn_controller PRIVATE vpn_modules)
+target_link_libraries(vpn_controller PRIVATE vpn_modules OpenSSL::SSL)
 target_compile_options(vpn_controller PRIVATE -Wall -Wextra)
 
 # ============================================================

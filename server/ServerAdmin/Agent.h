@@ -14,6 +14,7 @@
 #include <string>
 
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
 
 class Agent {
 public:
@@ -25,6 +26,10 @@ public:
         std::string key_path = "keys/server_sig.key";// 本机 Ed25519 身份私钥（准入指纹来源）
         std::string admin_token;                     // 访问本机 AdminServer 的 Bearer
         std::string name;                            // 展示名（可空，controller 回退用指纹前 8 位）
+        // ---- 管理通道 TLS（生产推荐；controller_host 可以是域名）----
+        bool        tls = false;                     // 启用 TLS（系统 CA 或 tls_ca 指定的 CA）
+        std::string tls_ca;                          // 自定义信任根 PEM；自签/私有 CA 用
+        std::string tls_server_name;                 // 证书中的名字；空 = controller_host
     };
 
     explicit Agent(Options opt);
@@ -46,5 +51,6 @@ private:
     Options opt_;
     std::atomic<bool> running_{ false };
     EVP_PKEY* priv_ = nullptr;      // 本机身份私钥（run 里载入，析构释放）
+    SSL_CTX* tls_ctx_ = nullptr;    // 管理通道 TLS 客户端上下文（run 里创建）
     std::string pub_hex_;           // 本机身份公钥 hex（hello 上报，controller 据此比对白名单）
 };

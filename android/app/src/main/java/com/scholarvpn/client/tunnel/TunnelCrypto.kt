@@ -25,12 +25,21 @@ object TunnelCrypto {
     private val random = SecureRandom()
 
     /** 加密时承载"内层 type"字节的线程本地暂存（避免热路径每包分配） */
-    private val typeScratch = ThreadLocal.withInitial { ByteArray(1) }
+    private val typeScratch: ThreadLocal<ByteArray> = ThreadLocal.withInitial { ByteArray(1) }
+
+    /**
+     * GCM nonce 的线程本地暂存（避免每包 new 12 字节）。
+     * GCMParameterSpec 构造时会 clone 传入的 iv，所以 init 之后本数组即可安全复用。
+     */
+    private val nonceScratch: ThreadLocal<ByteArray> =
+        ThreadLocal.withInitial { ByteArray(Protocol.GCM_NONCE_LEN) }
 
     // 每包热路径的密码对象线程本地复用：Cipher.getInstance/Mac.getInstance
     // 涉及 Provider 查找，逐包调用在弱核手机上开销显著（Android 侧主要分配点）
-    private val cipherCache = ThreadLocal.withInitial { Cipher.getInstance("AES/GCM/NoPadding") }
-    private val macCache = ThreadLocal.withInitial { Mac.getInstance("HmacSHA256") }
+    private val cipherCache: ThreadLocal<Cipher> =
+        ThreadLocal.withInitial { Cipher.getInstance("AES/GCM/NoPadding") }
+    private val macCache: ThreadLocal<Mac> =
+        ThreadLocal.withInitial { Mac.getInstance("HmacSHA256") }
 
     // ---------- 随机数 ----------
 
@@ -52,14 +61,16 @@ object TunnelCrypto {
         output: ByteArray, outOff: Int,
     ): Int {
         require(key.size == 32) { "AES-256 密钥必须 32 字节" }
-        val nonce = ByteArray(Protocol.GCM_NONCE_LEN)
+        // !! 是安全的：withInitial 的 supplier 永不返回 null，
+        // 但 Kotlin 把 Java ThreadLocal.get() 视为 platform type，必须显式断言
+        val nonce = nonceScratch.get()!!
         random.nextBytes(nonce)
         System.arraycopy(nonce, 0, output, outOff, Protocol.GCM_NONCE_LEN)
         // Cipher 线程本地复用：每包重新 init（换 nonce/密钥），避免逐包 getInstance
-        val cipher = cipherCache.get()
+        val cipher = cipherCache.get()!!
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(Protocol.GCM_TAG_LEN * 8, nonce))
         cipher.updateAAD(aadBuf, aadOff, Protocol.HEADER_SIZE)
-        val scratch = typeScratch.get()
+        val scratch = typeScratch.get()!!
         scratch[0] = type
         cipher.update(scratch)
         val written = if (data != null && dataLen > 0) {
@@ -74,23 +85,53 @@ object TunnelCrypto {
      * 解密封装的密文段 sealed[srcOff, srcOff+srcLen)（= nonce(12)||ct||tag(16)）。
      * @param aadBuf/aadOff AAD = 帧头 12 字节
      * @return inner 明文（首字节为内层 type，其后为载荷）；tag 校验失败返回 null（静默丢弃语义）
+     *
+     * 便利包装：内部转调 [gcmOpenInto]，会分配一次输出数组。
+     * **收包热路径请直接调 [gcmOpenInto]**，不要用这个。
      */
     fun gcmOpen(
         key: ByteArray, sealed: ByteArray, srcOff: Int, srcLen: Int,
         aadBuf: ByteArray, aadOff: Int,
     ): ByteArray? {
-        require(key.size == 32)
-        if (srcLen < Protocol.GCM_NONCE_LEN + Protocol.GCM_TAG_LEN) return null
-        val nonce = sealed.copyOfRange(srcOff, srcOff + Protocol.GCM_NONCE_LEN)
+        val plainLen = srcLen - Protocol.GCM_NONCE_LEN - Protocol.GCM_TAG_LEN
+        if (plainLen < 0) return null
+        val out = ByteArray(plainLen)
+        val n = gcmOpenInto(key, sealed, srcOff, srcLen, aadBuf, aadOff, out)
+        return if (n < 0) null else out
+    }
+
+    /**
+     * 零分配解密：把明文写进调用方提供的 [out]，返回明文长度（失败返回 -1）。
+     *
+     * 为什么要有这个版本：原 [gcmOpen] 每解一个下行包就 `new ByteArray(1400)`，
+     * 紧接着 TunnelClient.handleInner 又 copyOfRange 一次——每个数据包产生
+     * 约 2.8KB 垃圾。按 10Mbps 下行（约 900 包/秒）算是 2.5MB/s 的分配率，
+     * 弱核手机上 GC 会被迫高频运行，表现为后台持续发热。
+     *
+     * 约束：[out] 由调用方保证独占（TunnelClient 里是单 recv 线程使用的实例字段），
+     * 且长度 ≥ srcLen - 28。返回后 [out] 的内容在下一次调用前有效。
+     */
+    fun gcmOpenInto(
+        key: ByteArray, sealed: ByteArray, srcOff: Int, srcLen: Int,
+        aadBuf: ByteArray, aadOff: Int,
+        out: ByteArray,
+    ): Int {
+        require(key.size == 32) { "AES-256 密钥必须 32 字节" }
+        val plainLen = srcLen - Protocol.GCM_NONCE_LEN - Protocol.GCM_TAG_LEN
+        if (plainLen < 0 || out.size < plainLen) return -1
+        // nonce 拷到线程本地暂存，避免每包分配
+        val nonce = nonceScratch.get()!!
+        System.arraycopy(sealed, srcOff, nonce, 0, Protocol.GCM_NONCE_LEN)
         return try {
-            val cipher = cipherCache.get()
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(Protocol.GCM_TAG_LEN * 8, nonce))
+            val cipher = cipherCache.get()!!
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"),
+                GCMParameterSpec(Protocol.GCM_TAG_LEN * 8, nonce))
             cipher.updateAAD(aadBuf, aadOff, Protocol.HEADER_SIZE)
-            val out = ByteArray(srcLen - Protocol.GCM_NONCE_LEN - Protocol.GCM_TAG_LEN)
-            cipher.doFinal(sealed, srcOff + Protocol.GCM_NONCE_LEN, srcLen - Protocol.GCM_NONCE_LEN, out, 0)
-            out
+            // 输入 = ct||tag（长度 srcLen-12），输出长度自动扣掉 tag
+            cipher.doFinal(sealed, srcOff + Protocol.GCM_NONCE_LEN,
+                srcLen - Protocol.GCM_NONCE_LEN, out, 0)
         } catch (_: Exception) {
-            null   // 认证失败：与 C++ 端一致，静默丢弃
+            -1   // 认证失败：与 C++ 端一致，静默丢弃
         }
     }
 
@@ -126,7 +167,7 @@ object TunnelCrypto {
     }
 
     private fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
-        val mac = macCache.get()
+        val mac = macCache.get()!!
         mac.init(SecretKeySpec(if (key.isEmpty()) ByteArray(32) else key, "HmacSHA256"))
         return mac.doFinal(data)
     }

@@ -20,6 +20,7 @@ import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketException
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -69,11 +70,25 @@ class TunnelClient(
         private const val AUTH_TIMEOUT_MS = 8_000L
         private const val AUTH_RETRY_MS = 500L         // 重传间隔（对齐 kAuthRetryInterval）
         private const val AUTH_MAX_RETRIES = 16        // 与 8s 预算一致（16 × 500ms）
-        private const val HEARTBEAT_INTERVAL_MS = 1_000L
-        // 15s（原 5s）：移动网 RTT 2~4s + 丢包时，5s 内没收到任何一个可解密报文
-        // 很常见，会把正在工作的连接误判为失联而断开重连（表现为"连上过一会儿就断"）。
-        // 服务端心跳 10s 一次、失联判定 30s，客户端取 15s：够宽松，又早于服务端判死。
-        private const val HEARTBEAT_TIMEOUT_MS = 15_000L
+        // 10s，对齐服务端 kHeartbeatInterval（server/UDP/UDP.cpp:60）。
+        //
+        // 为什么从 1s 改成 10s（2026-10-18，真机发热问题）：
+        // 移动网络的射频有「尾时器」——发完任何一个包后，射频功放要维持高功耗约
+        // 5~10 秒才会回落到空闲态。1 秒一次心跳意味着尾时器**每秒被重置一次**，
+        // 射频永远进不了低功耗，手机背面持续发烫、待机掉电极快。
+        //
+        // 这不是 CPU 忙等（数据面是阻塞 read/receive，本身已是事件驱动），
+        // 所以加回调/改 epoll 都没用——唯一的解就是把发包间隔拉到大于尾时器。
+        //
+        // 10s 的依据：
+        //  - 服务端心跳也是 10s、30s 判失联，客户端 10s 完全够保活；
+        //  - 运营商 NAT 表项超时普遍 30~120s，10s 远在安全线内；
+        //  - 10s > 尾时器上限（约 10s），射频能真正回落空闲态。
+        private const val HEARTBEAT_INTERVAL_MS = 10_000L
+        // 25s（原 15s）：心跳间隔拉到 10s 后，正常情况每 10s 必收到服务端心跳，
+        // 25s 等于容忍连续丢 2 个心跳包，仍早于服务端的 30s 判死线。
+        // 不能沿用 15s——那样一次丢包就误判失联，重连比心跳还费电。
+        private const val HEARTBEAT_TIMEOUT_MS = 25_000L
         private const val TCP_CONNECT_TIMEOUT_MS = 4_000
     }
 
@@ -91,8 +106,46 @@ class TunnelClient(
     /** 链路死亡回调（心跳超时/对端断开/连接错误）；重连由上层负责（TODO M4 退避状态机） */
     @Volatile var onDead: (() -> Unit)? = null
 
-    /** 服务端→客户端的上行 IP 包（VpnService 桥接线程消费，写 tun fd） */
-    val incomingPackets = Channel<ByteArray>(4096)
+    /**
+     * 服务端→客户端的上行 IP 包（VpnService 桥接线程消费，写 tun fd）。
+     *
+     * 容量 512（原 4096）：每个元素是一个 IP 包（最大 1400B），
+     * 4096 满载就是 ~5.6MB 的堆占用——低端机上会持续触发 GC，表现为后台发烫。
+     * 512 个包 ≈ 700KB，按 20Mbps 下行算约 0.28s 的缓冲，足够吸收调度抖动；
+     * 真堵住了由 TCP 重传兜底（trySend 丢弃策略不变）。
+     *
+     * 元素类型是 [RxPacket] 而非裸 ByteArray：消费方写完后要把缓冲还回池子，
+     * 稳态下每包零分配（原来每包 copyOfRange 一次 1400B）。
+     * **消费方必须调用 [recycleRxPacket]**，否则退化为每次新分配（不会出错，只是白优化）。
+     */
+    val incomingPackets = Channel<RxPacket>(512)
+
+    /**
+     * 下行包缓冲池。生产者是 recv 线程，回收者是写 tun 的协程，
+     * 跨线程访问故用并发队列。
+     *
+     * 池上限 128：约 180KB 常驻，够覆盖"通道满 + 消费慢"的瞬时峰值，
+     * 再多就是白占内存。
+     */
+    private val rxPool = ConcurrentLinkedQueue<RxPacket>()
+
+    /** 取一个至少 [len] 字节的包缓冲（优先复用池中够大的） */
+    private fun obtainRxPacket(len: Int): RxPacket {
+        while (true) {
+            val p = rxPool.poll() ?: break
+            if (p.buf.size >= len) {
+                p.len = len
+                return p
+            }
+            // 太小：丢弃继续找（池里其余元素可能更大）
+        }
+        return RxPacket(ByteArray(maxOf(len, Protocol.MAX_DATA_PAYLOAD)), len)
+    }
+
+    /** 消费方写完 tun 后归还缓冲 */
+    fun recycleRxPacket(p: RxPacket) {
+        if (rxPool.size < 128) rxPool.offer(p)
+    }
 
     // ---- 会话上下文 ----
     private lateinit var nonceC: ByteArray
@@ -112,6 +165,31 @@ class TunnelClient(
 
     /** 反重放滑窗（仅密文帧；序号在 AAD 内不可篡改，重放帧静默丢弃） */
     private val replayWindow = ReplayWindow()
+
+    /**
+     * 下行解密复用缓冲（热路径，避免每包 new ByteArray）。
+     *
+     * 只有 recv 单线程访问（recvLoopUdp / recvLoopTcp 不会同时跑），因此无需同步。
+     * 大小取 MAX_PAYLOAD_LEN：明文 = 密文段 - nonce(12) - tag(16)，必小于该值。
+     */
+    private val rxScratch = ByteArray(Protocol.MAX_PAYLOAD_LEN)
+
+    /**
+     * 上行组帧复用缓冲（ThreadLocal，热路径避免每包 new ByteArray）。
+     *
+     * 为什么能复用：[rawSend] 是**同步**发送——UDP 的 `send` 把数据拷进内核即返回，
+     * TCP 的 `write` 也是拷进发送缓冲即返回。返回之后这块内存就没人再读了。
+     *
+     * 为什么用 ThreadLocal 而不是实例字段：上行发送有多个调用方
+     * （tun 桥接线程、recv 线程回 heart_response、心跳协程），
+     * 共享一块缓冲会互相覆盖；每线程一块最省心，代价只有 1.4KB × 线程数。
+     *
+     * 大小 = 帧头(12) + 内层type(1) + 最大载荷(1400) + nonce(12) + tag(16) = 1441
+     */
+    private val txScratch: ThreadLocal<ByteArray> = ThreadLocal.withInitial {
+        ByteArray(Protocol.HEADER_SIZE + 1 + Protocol.MAX_DATA_PAYLOAD +
+            Protocol.GCM_NONCE_LEN + Protocol.GCM_TAG_LEN)
+    }
 
     private val remoteAddress: InetSocketAddress get() = InetSocketAddress(serverIp, serverPort)
     private val wireVersion: Byte get() = if (useTcp) Protocol.VERSION_TCP else Protocol.VERSION_UDP
@@ -260,11 +338,13 @@ class TunnelClient(
             // 反重放分两步：解密前只做"不修改状态"的过旧预检（未认证报文
             // 不能污染窗口），GCM 验证成功后才提交窗口与存活时间
             if (replayWindow.isStale(seq)) return
-            val inner = TunnelCrypto.gcmOpen(keyRx, buf, Protocol.HEADER_SIZE, len - Protocol.HEADER_SIZE, buf, 0)
-                ?: return   // 解密失败静默丢弃（不推进窗口、不刷新存活）
+            // 零分配解密：明文直接落到 rxScratch，避免每包一次 ByteArray 分配
+            val plainLen = TunnelCrypto.gcmOpenInto(
+                keyRx, buf, Protocol.HEADER_SIZE, len - Protocol.HEADER_SIZE, buf, 0, rxScratch)
+            if (plainLen < 0) return   // 解密失败静默丢弃（不推进窗口、不刷新存活）
             if (!replayWindow.accept(seq)) return   // 重放帧：静默丢弃
             lastRxMs.set(System.currentTimeMillis())   // 仅已认证报文刷新存活
-            handleInner(inner[0], inner, 1, inner.size - 1)
+            handleInner(rxScratch[0], rxScratch, 1, plainLen - 1)
         } else if (header.type == Protocol.TYPE_AUTH_SERVER_HELLO) {
             handleServerHello(buf.copyOfRange(Protocol.HEADER_SIZE, len))
         }
@@ -295,8 +375,12 @@ class TunnelClient(
         when (type) {
             Protocol.TYPE_DATA -> {
                 if (len > 0) {
-                    val packet = src.copyOfRange(off, off + len)
-                    incomingPackets.trySend(packet)   // 桥接消费不动则丢弃（隧道内 TCP 重传兜底）
+                    // 从池里取缓冲直接拷贝，避免每包 copyOfRange 一次分配
+                    val p = obtainRxPacket(len)
+                    System.arraycopy(src, off, p.buf, 0, len)
+                    // 桥接消费不动则丢弃（隧道内 TCP 重传兜底）；
+                    // 发送失败必须立刻回收，否则"已出池但无人消费"的缓冲会永久流失
+                    if (!incomingPackets.trySend(p).isSuccess) recycleRxPacket(p)
                 }
             }
             Protocol.TYPE_HEART -> runCatching { sendEncrypted(Protocol.TYPE_HEART_RESPONSE, ByteArray(0)) }
@@ -332,7 +416,9 @@ class TunnelClient(
 
     /**
      * 密文帧（分段版，热路径）：AAD = 含密文长度的帧头，payload = nonce||ct||tag。
-     * 整帧单次分配；payload 直接从 [data] 段加密，零拷贝（规格 §4）
+     *
+     * 组帧写进线程本地复用缓冲 [txScratch]，不再每包 `new ByteArray(1429)`。
+     * 安全性依赖 [rawSend] 同步完成发送（见 txScratch 注释）。
      */
     private fun sendEncryptedSeg(type: Byte, data: ByteArray, off: Int, len: Int) {
         if (!keysReady.get()) throw IOException("密钥未就绪")
@@ -344,10 +430,14 @@ class TunnelClient(
             return
         }
         val sealedLen = 1 + len + Protocol.GCM_NONCE_LEN + Protocol.GCM_TAG_LEN
-        val frame = ByteArray(Protocol.HEADER_SIZE + sealedLen)
+        val total = Protocol.HEADER_SIZE + sealedLen
+        val scratch = txScratch.get()!!
+        // 数据面帧（≤1441B）走复用缓冲；控制面长报文（如含注册令牌的身份报文）
+        // 可能超出容量，回退到动态分配——这类报文只在握手时发几次，不影响热路径
+        val frame = if (total <= scratch.size) scratch else ByteArray(total)
         Protocol.encodeHeaderInto(frame, 0, wireVersion, type, sealedLen, seqNum.toInt())
         TunnelCrypto.gcmSealInto(keyTx, type, data, off, len, frame, 0, frame, Protocol.HEADER_SIZE)
-        rawSend(frame)
+        rawSend(frame, total)
     }
 
     /** 上行数据面：VpnService 桥接线程调用（tun fd 读到的 IP 包，不复制直接加密发送） */
@@ -366,16 +456,21 @@ class TunnelClient(
     /** 隧道是否可用（桥接线程以此判活退出，避免对已死隧道空转） */
     val isAlive: Boolean get() = running.get() && keysReady.get()
 
-    private fun rawSend(frame: ByteArray) {
+    /**
+     * 同步发送一帧。[len] 必须显式给出——复用缓冲比实际帧长，
+     * 用 `frame.size` 会把尾部残留的旧数据一起发出去（对端 AAD 校验直接失败）。
+     */
+    private fun rawSend(frame: ByteArray, len: Int = frame.size) {
         if (useTcp) {
             val out = socketTcp?.getOutputStream() ?: throw IOException("TCP 未连接")
-            synchronized(out) {   // 整帧原子写（防多线程交错破坏分帧，对齐 C++ m_send_mutex）
-                out.write(frame)
-                out.flush()
+            // 整帧原子写（防多线程交错破坏分帧，对齐 C++ m_send_mutex）
+            synchronized(out) {
+                out.write(frame, 0, len)
+                // 不调 flush()：SocketOutputStream 无用户态缓冲，write 即进内核发送队列
             }
         } else {
             val s = socketUdp ?: throw IOException("UDP 未连接")
-            s.send(DatagramPacket(frame, frame.size, remoteAddress))
+            s.send(DatagramPacket(frame, 0, len, remoteAddress))
         }
     }
 
@@ -384,7 +479,9 @@ class TunnelClient(
     // ------------------------------------------------------------------
     fun startHeartbeat() {
         scope.launch {
-            // 按到期时间精确休眠（每 1s 唤醒一次，替代 100ms 轮询——省电减热）
+            // 单协程同时负责「按点发心跳」与「判失联」，按两个到期时刻中更早的那个唤醒。
+            // 心跳间隔 10s 而超时 25s，若只睡到心跳点，失联发现会被拖后最多 10s
+            // （表现为切网后 35s 才重连）；这里分别算两个 deadline 取最早。
             var nextHeart = System.currentTimeMillis() + HEARTBEAT_INTERVAL_MS
             while (running.get() && scope.isActive) {
                 val now = System.currentTimeMillis()
@@ -396,9 +493,11 @@ class TunnelClient(
                 if (now >= nextHeart) {
                     runCatching { sendEncrypted(Protocol.TYPE_HEART, ByteArray(0)) }
                     nextHeart = now + HEARTBEAT_INTERVAL_MS
-                    continue
                 }
-                delay(nextHeart - now)
+                // 下次唤醒：心跳到期 或 失联判定到期，取更早者
+                val deadlineRx = if (last != 0L) last + HEARTBEAT_TIMEOUT_MS + 1 else Long.MAX_VALUE
+                val wakeAt = minOf(nextHeart, deadlineRx)
+                delay((wakeAt - System.currentTimeMillis()).coerceAtLeast(1L))
             }
         }
     }
@@ -434,6 +533,31 @@ class TunnelClient(
         }
     }
 
+    /**
+     * 外部事件：物理网络已断开（由 VpnService 的 ConnectivityManager 回调驱动）。
+     *
+     * 为什么要这个：只靠心跳超时判失联，网络一断要干等 25s 才发现，
+     * 期间 tun 上的包全部塞进黑洞（应用侧表现为"卡住不动"，然后超时重传），
+     * 既拖慢体验又白耗射频。收到系统事件后立即判死，上层 1s 后就开始重连。
+     *
+     * 只在 [running] 时生效，避免已 stop 的会话再回调一次。
+     */
+    fun onPhysicalNetworkLost() {
+        if (!running.get()) return
+        notifyDead("物理网络已断开（系统事件）")
+    }
+
+    /**
+     * 外部事件：物理网络恢复可用。
+     *
+     * 若此时隧道已死（[deadNotified]），说明上一次判死发生在无网络期间——
+     * 上层会话循环会自己退避重连，这里无需额外动作；保留该入口是为了
+     * 将来做"网络恢复立即唤醒退避等待"（目前退避最长 30s，可接受）。
+     */
+    fun onPhysicalNetworkAvailable() {
+        // 占位：退避唤醒见 ScholarVpnService 的 retrySignal（暂未接入）
+    }
+
     fun stop() {
         if (!running.getAndSet(false)) return
         // 显式断开（密文内层，尽力而为）
@@ -449,3 +573,20 @@ class TunnelClient(
         keysReady.set(false)
     }
 }
+
+/**
+ * 下行 IP 包的池化载体。
+ *
+ * 为什么不直接传 ByteArray：池化复用必须知道"有效长度"。
+ * 裸数组无法携带长度，消费方 `output.write(buf)` 会把整块缓冲（含上一次的残留）
+ * 都写进 tun，等于往网卡里灌垃圾包。
+ *
+ * [len] 是可变字段——池化复用时改长度而不是换对象，稳态下零分配。
+ * 只在 Channel 单向流转：生产者填完立刻交出去，消费方读完才回收，不存在共享竞态。
+ */
+class RxPacket(
+    /** 缓冲本体，容量固定不小于首次申请长度 */
+    val buf: ByteArray,
+    /** 本包有效字节数（buf[0, len) 有效） */
+    var len: Int,
+)

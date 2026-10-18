@@ -327,8 +327,14 @@ private fun StatusHero(
     message: String,
     busyServer: ServerEntry?,
 ) {
+    // 只有「正在握手 / 正在重连」这种过渡态才做呼吸动画——这两个状态短暂，
+    // 动画能给出"还在努力"的反馈，且用户通常只在几秒内看着它。
+    //
+    // CONNECTED 不再动画（2026-10-18）：已连接是长期稳定态，呼吸灯不传递任何
+    // 新信息，却让 Compose 以 60fps 持续重绘，是前台耗电/发热的次要来源。
+    // 静态绿点一样能表达"已连接"，还省掉整条渲染管线。
     val pulsing = phase == VpnStatus.Phase.CONNECTING ||
-        phase == VpnStatus.Phase.CONNECTED || phase == VpnStatus.Phase.RECONNECTING
+        phase == VpnStatus.Phase.RECONNECTING
 
     Box(
         modifier = Modifier

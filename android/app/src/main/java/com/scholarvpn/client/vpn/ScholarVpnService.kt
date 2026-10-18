@@ -5,6 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.provider.Settings
@@ -20,9 +24,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Android VPN 服务：平台的"虚拟网卡"。
@@ -55,6 +61,88 @@ class ScholarVpnService : VpnService() {
     private var tunnel: TunnelClient? = null
     private val running = AtomicBoolean(false)
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // ---- 物理网络监听（事件驱动，替代纯心跳超时探测） ----
+
+    private val cm by lazy { getSystemService(ConnectivityManager::class.java) }
+
+    /** 当前可见的物理网络集合（不含 VPN 自己） */
+    private val physicalNetworks = mutableSetOf<Network>()
+
+    /** 防抖：网络抖动（如 WiFi 短暂扫描）可能连续回调，2s 内不重复判死 */
+    private val lastNetEventMs = AtomicLong(0L)
+    private var netWatchRegistered = false
+
+    /**
+     * 重连退避的「提前唤醒」信号。
+     *
+     * 退避等待期间若物理网络恢复，没必要把剩下的 30s 等完——网络一回来就重试。
+     * CONFLATED：多次网络事件只保留一个信号；每次进退避前清空残留，
+     * 避免"上一次的旧信号"让下一次退避瞬间穿透（那样等于没有退避）。
+     */
+    private val retrySignal = Channel<Unit>(Channel.CONFLATED)
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val first = synchronized(physicalNetworks) {
+                val wasEmpty = physicalNetworks.isEmpty()
+                physicalNetworks.add(network)
+                wasEmpty
+            }
+            Log.i(TAG, "物理网络可用: $network（当前 ${physicalNetworks.size} 个）")
+            if (first) tunnel?.onPhysicalNetworkAvailable()
+            // 网络一恢复就打断退避等待：重连成功的那一刻往往就是网络刚回来的那一刻，
+            // 让用户少等最多 30s
+            retrySignal.trySend(Unit)
+        }
+
+        override fun onLost(network: Network) {
+            val remaining = synchronized(physicalNetworks) {
+                physicalNetworks.remove(network)
+                physicalNetworks.size
+            }
+            Log.i(TAG, "物理网络丢失: $network（剩余 $remaining 个）")
+
+            // 关键判断：只要**任何**物理网络丢失就判死重连。
+            // 理由：Java Socket 在创建时绑定到当时默认网络的源地址，WiFi 断掉后
+            // 即使 4G 还在，旧 socket 的源 IP 也已失效——不重建连接就永远收不到包。
+            // 重连成本（约 3~4s 三阶段握手）远低于干等 25s 心跳超时。
+            //
+            // 2s 防抖：WiFi 扫描/信号抖动可能连续回调，避免打出重连风暴
+            val now = System.currentTimeMillis()
+            val prev = lastNetEventMs.get()
+            if (now - prev >= 2_000L && lastNetEventMs.compareAndSet(prev, now)) {
+                tunnel?.onPhysicalNetworkLost()
+            }
+        }
+    }
+
+    /**
+     * 注册物理网络监听。只监听 WIFI / CELLULAR / ETHERNET，
+     * 不含 TRANSPORT_VPN——否则会收到自己建立的 tun 网络，形成"自己切换自己"的循环。
+     */
+    private fun registerNetworkWatch() {
+        if (netWatchRegistered) return
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+            .build()
+        netWatchRegistered = runCatching {
+            cm.registerNetworkCallback(request, networkCallback)
+            true
+        }.getOrElse {
+            Log.w(TAG, "注册网络监听失败（降级为纯心跳探测）: ${it.message}")
+            false
+        }
+    }
+
+    private fun unregisterNetworkWatch() {
+        if (!netWatchRegistered) return
+        netWatchRegistered = false
+        runCatching { cm.unregisterNetworkCallback(networkCallback) }
+        synchronized(physicalNetworks) { physicalNetworks.clear() }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // 每条启动来源都记一行日志：下次"它又自己连上了"可以直接从 logcat 看出是谁拉起的
@@ -109,8 +197,20 @@ class ScholarVpnService : VpnService() {
     private fun startVpn(statusText: String = "连接中…") {
         startForeground()   // Android 12+ 要求启动后尽快进入前台状态
         if (!running.compareAndSet(false, true)) return
+        registerNetworkWatch()   // 先挂网络事件，首次握手期间切网也能及时感知
         updateStatus(VpnStatus.Phase.CONNECTING, statusText)
         runSessionLoop()
+    }
+
+    /**
+     * 退避等待：到期返回，或被网络事件提前唤醒（返回 true）。
+     *
+     * 进来先清空残留信号——否则"上一次网络变化"留下的旧信号会让本次等待
+     * 瞬间穿透，等于退避形同虚设（可能立刻打满服务端限速）。
+     */
+    private suspend fun backoffWait(ms: Long): Boolean {
+        while (retrySignal.tryReceive().isSuccess) { /* 丢弃过期信号 */ }
+        return withTimeoutOrNull(ms) { retrySignal.receive() } != null
     }
 
     /**
@@ -152,7 +252,7 @@ class ScholarVpnService : VpnService() {
                     dead.await()   // 等链路死亡（心跳超时/网络切换/对端断开）
                     closeTun()
                     updateStatus(VpnStatus.Phase.RECONNECTING, "链路断开，重连中…")
-                    delay(1_000)
+                    backoffWait(1_000)
                 } catch (e: TunnelClient.AuthDeniedException) {
                     if (e.reasonCode == 1) {
                         // 令牌无效或已使用：自动清空并以登录模式重试（对齐 C++ 端行为）
@@ -175,7 +275,8 @@ class ScholarVpnService : VpnService() {
                     Log.w(TAG, "连接失败(第${attempt}次): ${e.message}，${backoff / 1000}s 后重连")
                     updateStatus(VpnStatus.Phase.RECONNECTING,
                         "重连中（第${attempt}次，${backoff / 1000}s 后重试）")
-                    delay(backoff)
+                    // 网络恢复会提前唤醒，不必把整个退避等完
+                    if (backoffWait(backoff)) Log.i(TAG, "网络事件提前唤醒退避，立即重试")
                 } finally {
                     client.stop()
                 }
@@ -245,8 +346,14 @@ class ScholarVpnService : VpnService() {
             try {
                 while (running.get()) {
                     val packet = client.incomingPackets.receive()
-                    output.write(packet)
-                    output.flush()
+                    try {
+                        // 显式给长度：缓冲是池化复用的，比实际包大，
+                        // 用 write(buf) 会把尾部残留灌进 tun
+                        output.write(packet.buf, 0, packet.len)
+                    } finally {
+                        // 无论写成功与否都归还，否则池会漏干、退化成每包新分配
+                        client.recycleRxPacket(packet)
+                    }
                 }
             } catch (_: Exception) {
                 // 通道关闭 / fd 关闭：随会话退出
@@ -263,6 +370,7 @@ class ScholarVpnService : VpnService() {
 
     private fun stopVpn() {
         if (!running.getAndSet(false)) return
+        unregisterNetworkWatch()   // 先撤监听，避免停机过程中回调又拉起重连
         tunnel?.stop()
         tunnel = null
         closeTun()

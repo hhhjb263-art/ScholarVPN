@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <optional>
 #include <poll.h>
 #include <stdexcept>
@@ -245,11 +246,45 @@ void UDP::release_session(const std::string& key)
 }
 
 // 虚拟 IP
-uint32_t UDP::allocate_virtual_ip()
+// 分配策略：**租约记忆优先** —— 同一 ClientID 优先拿回上次分配的地址。
+//
+// 为什么（2026-10-19 生产事故）：地址改为随机分配后，服务端重启会把客户端
+// 重连拿到的新地址通告给客户端，但 Android 客户端重连路径不会用新地址重建
+// TUN——客户端网卡还挂着旧 IP，发出的每个包都被源地址防伪校验丢弃
+// （"包内源地址=10.8.0.2，本会话虚拟 IP=10.8.0.7"），上行全丢，表现为网速
+// 骤降到几十 K、连接假死。线性分配时代这个问题被"重启后第一个客户端总是
+// 拿回 .2"的巧合掩盖了。
+//
+// 租约记忆 + 持久化让"服务端重启/客户端重连"都稳定拿回同一地址；
+// 若记忆地址已被其他客户端占用，回退随机分配并更新记忆。
+uint32_t UDP::allocate_virtual_ip(const std::string& client_id)
 {
+    if (!client_id.empty() && m_ip_pool)
+    {
+        uint32_t preferred = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_vip_mutex);
+            auto it = m_last_vip.find(client_id);
+            if (it != m_last_vip.end())
+                preferred = it->second;
+        }
+        if (preferred != 0 && m_ip_pool->try_acquire(preferred))
+            return htonl(preferred);   // 归还上次地址，客户端 TUN 无需改地址
+    }
     if (!m_ip_pool)
         return 0;
-    return m_ip_pool->allocate();
+    const uint32_t ip_net = m_ip_pool->allocate();   // 随机分配（网络序）
+    if (ip_net == 0)
+        return 0;
+    if (!client_id.empty())
+    {
+        std::lock_guard<std::mutex> lock(m_vip_mutex);
+        if (m_last_vip.size() > 10000)
+            m_last_vip.clear();   // 极端防御：注册用户有限，正常到不了
+        m_last_vip[client_id] = ntohl(ip_net);
+        save_vip_leases();
+    }
+    return ip_net;
 }
 
 void UDP::release_virtual_ip(uint32_t ip)
@@ -259,9 +294,47 @@ void UDP::release_virtual_ip(uint32_t ip)
     {
         std::lock_guard<std::mutex> lock(m_vip_mutex);
         m_vip_to_key.erase(ip);
+        // 注意：m_last_vip（租约记忆）刻意【不删】——客户端重连要拿回同一地址
     }
     if (m_ip_pool)
         m_ip_pool->release(ip);
+}
+
+// 租约持久化：每行 "client_id vip_host_int"，纯文本便于人工检查/修改
+void UDP::load_vip_leases()
+{
+    const std::string path = m_keys_dir + "/vip_leases.txt";
+    std::ifstream in(path);
+    if (!in)
+        return;
+    std::string cid;
+    uint32_t ip = 0;
+    while (in >> cid >> ip)
+    {
+        if (!cid.empty() && ip != 0)
+            m_last_vip[cid] = ip;
+    }
+    if (!m_last_vip.empty())
+        fprintf(stderr, "[UDP] 已加载虚拟 IP 租约 %zu 条（%s）\n",
+                m_last_vip.size(), path.c_str());
+}
+
+void UDP::save_vip_leases()
+{
+    // 调用方已持 m_vip_mutex；写临时文件再 rename，避免写一半被读到残缺
+    const std::string path = m_keys_dir + "/vip_leases.txt";
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out)
+        {
+            fprintf(stderr, "[UDP] 租约文件写入失败: %s\n", tmp.c_str());
+            return;
+        }
+        for (const auto& kv : m_last_vip)
+            out << kv.first << " " << kv.second << "\n";
+    }
+    std::rename(tmp.c_str(), path.c_str());
 }
 
 // 握手重算限速（令牌桶，按来源 IP 网络序）。
@@ -336,6 +409,7 @@ bool UDP::start(const std::string& local_ip, uint16_t local_port,
             gw_net = a.s_addr;
     }
     m_ip_pool = std::make_shared<VirtualIpPool>(gw_net, m_tun_prefix);
+    load_vip_leases();   // 恢复 ClientID → 虚拟 IP 的租约记忆
 
     if (udp_enabled) {
         m_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1395,7 +1469,7 @@ void UDP::handle_identity(Session& s, const std::vector<uint8_t>& inner)
 
     // 分配虚拟 IP（多用户唯一地址；认证通过后才分配）
     if (!s.ip_assigned) {
-        s.virtual_ip = allocate_virtual_ip();
+        s.virtual_ip = allocate_virtual_ip(client_id);
         if (s.virtual_ip == 0) {
             fprintf(stderr, "[UDP][AUTH] 虚拟 IP 池已满，拒绝 %s\n", client_id.c_str());
             deny(0);

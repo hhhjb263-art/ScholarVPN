@@ -85,8 +85,10 @@ private:
     void wake_send_waiters();
     void wake_recv_waiters();
 
-    uint32_t allocate_virtual_ip();
+    uint32_t allocate_virtual_ip(const std::string& client_id);
     void release_virtual_ip(uint32_t ip);
+    void load_vip_leases();
+    void save_vip_leases();
 
     // 握手重算限速（令牌桶，按来源 IP）：只有"需要重算握手"的 auth_hello
     // （携带新 nonce → 要生成临时 X25519 密钥对 + Ed25519 签名）才消耗令牌；
@@ -137,6 +139,11 @@ private:
     mutable std::mutex m_vip_mutex;
     std::unordered_map<uint32_t, std::string> m_vip_to_key;
     std::shared_ptr<VirtualIpPool> m_ip_pool;
+    // 租约记忆：ClientID → 上次分配的虚拟 IP（主机序）。
+    // 服务端重启/客户端重连时优先归还同一地址，客户端 TUN 就不用改地址
+    // （改地址瞬间发出的包源地址还是旧 IP，会被源地址防伪校验丢掉）。
+    // 持久化在 m_keys_dir/vip_leases.txt，服务端重启也不丢。
+    std::unordered_map<std::string, uint32_t> m_last_vip;
 
     // 握手重算限速表（来源 IP 网络序 → 令牌桶）；见 allow_handshake_recompute。
     // logged 只为"每条 IP 最多打 3 条日志"限流用，避免被刷屏

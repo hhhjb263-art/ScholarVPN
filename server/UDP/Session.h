@@ -304,6 +304,19 @@ public:
         used.erase(ntohl(ip_net));
     }
 
+    // 指定地址获取（租约归还用）：该地址空闲则占用并返回 true。
+    // 网关地址 / 越界地址一律拒绝。用于"同一 ClientID 优先拿回上次地址"。
+    bool try_acquire(uint32_t ip_host)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (ip_host == 0 || ip_host == gw || ip_host < first || ip_host > last)
+            return false;
+        if (used.find(ip_host) != used.end())
+            return false;
+        used.insert(ip_host);
+        return true;
+    }
+
     size_t used_count() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);

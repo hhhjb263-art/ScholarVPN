@@ -67,15 +67,112 @@ class Config:
     tls = False
     cookie_secure = False
     db_path = os.path.join(HERE, "data", "webadmin.db")
+    # VPN 服务器对外可达地址（域名或公网 IP），仅用于页面展示，供复制到客户端配置。
+    # 留空则启动后首次访问 /api/meta 时自动探测出口 IP。
+    vpn_public_ip = ""
+    vpn_public_port = 51820
+
+
+# ---- VPN 对外地址 ----
+# 为什么要单独配：后台与 VPN 同机时，agent 上报给 controller 的源地址是 127.0.0.1，
+# 对客户端毫无用处。页面要展示的是**从外网能连上的地址**，只能显式配置或探测出口 IP。
+_PUBLIC_IP_CACHE: dict = {"value": "", "ts": 0.0}
+_PUBLIC_IP_TTL = 600.0
+
+
+def _looks_like_ip(text: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _detect_public_ip() -> str:
+    """向多个公共回显服务询问出口 IP，任一成功即返回；全失败返回空串（静默）。"""
+    for url in ("https://api.ipify.org",
+                "https://icanhazip.com",
+                "https://ifconfig.me/ip"):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "ScholarVPN-WebAdmin/2.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                text = resp.read(64).decode("ascii", "ignore").strip()
+            if _looks_like_ip(text):
+                return text
+        except Exception:
+            continue          # 网络不通/被墙/返回非 IP：换下一个源
+    return ""
+
+
+def public_ip() -> str:
+    """显式配置 > 缓存 > 探测。探测结果缓存 10 分钟，避免每次刷新页面都打外网。"""
+    if Config.vpn_public_ip:
+        return Config.vpn_public_ip
+    now = time.time()
+    if _PUBLIC_IP_CACHE["value"] and now - float(_PUBLIC_IP_CACHE["ts"]) < _PUBLIC_IP_TTL:
+        return str(_PUBLIC_IP_CACHE["value"])
+    ip = _detect_public_ip()
+    _PUBLIC_IP_CACHE["value"] = ip
+    _PUBLIC_IP_CACHE["ts"] = now
+    return ip
 
 
 def _json_bytes(obj) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 
+class TimeoutThreadingHTTPServer(ThreadingHTTPServer):
+    """TLS 握手放到工作线程里做，主线程只负责 accept。
+
+    为什么需要（2026-10-19 生产事故）：按常规写法
+    `srv.socket = ctx.wrap_socket(srv.socket, server_side=True)`，
+    `serve_forever()` 调 `accept()` 时会在 SSLSocket 内部同步完成 TLS 握手，
+    而**握手不吃监听 socket 上的 settimeout**（实测设 10s 无效）。
+    只要有一个客户端建立 TCP 连接却不发 ClientHello（端口扫描、浏览器预连接、
+    中途断开的 curl），主线程就永久阻塞，后续连接全堆在 backlog 里
+    （`ss` 看到 Recv-Q 持续增长），整站表现为"响应时间太长"，直到重启进程。
+
+    只把握手挪到 get_request 里也治标不治本——accept 仍是串行的，
+    一个半开连接会让后面的连接干等满一个 handshake_timeout。
+
+    最终做法：accept 保持纯 TCP（毫秒级），握手放进 ThreadingMixIn 的工作线程，
+    半开连接最多占住一个线程，其他人完全不受影响。
+    """
+
+    handshake_timeout = 10.0
+    request_timeout = 30.0
+    ssl_context = None      # 非 None 时由工作线程完成握手
+
+    def get_request(self):
+        sock, addr = super().get_request()   # 纯 TCP accept，立即返回
+        sock.settimeout(self.request_timeout)
+        return sock, addr
+
+    def process_request_thread(self, request, client_address):
+        ctx = self.ssl_context
+        if ctx is not None:
+            request.settimeout(self.handshake_timeout)
+            try:
+                request = ctx.wrap_socket(request, server_side=True)
+            except Exception:
+                # 握手失败/超时：关掉这条连接，其他线程照常工作
+                try:
+                    request.close()
+                except OSError:
+                    pass
+                return
+            request.settimeout(self.request_timeout)
+        super().process_request_thread(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ScholarVPN-WebAdmin/2.0"
     protocol_version = "HTTP/1.1"
+    # keep-alive 空闲超时：连接闲置超过这个时间就回收，
+    # 否则每个浏览器连接会一直占着一个工作线程（ThreadingHTTPServer 每连接一线程）。
+    timeout = 30
 
     # ---------------------------------------------------------------- 输出
     def _security_headers(self) -> None:
@@ -101,7 +198,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
         self._security_headers()
         if location:
             self.send_header("Location", location)
@@ -109,8 +205,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", set_cookie)
         for k, v in (headers or {}).items():
             self.send_header(k, v)
+        # 只有错误响应才关闭连接：错误路径可能没读完请求体，继续复用会让
+        # 下一个请求从错误的偏移开始解析。正常响应保持 HTTP/1.1 keep-alive，
+        # 让浏览器复用同一条 TLS 连接——跨境链路上省掉的是每次 1~4 秒的握手。
+        if status >= 400:
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
-        self.close_connection = True
         if self.command != "HEAD" and body:
             self.wfile.write(body)
 
@@ -279,6 +380,19 @@ class Handler(BaseHTTPRequestHandler):
             if sess is None:
                 return
             return self._list_admins(sess)
+        if path == "/api/meta":
+            # 页面展示用：VPN 对外地址（客户端要填的服务器地址）。
+            # 需要登录态——地址本身不算秘密，但没必要对未登录访客暴露。
+            sess = self._require_session()
+            if sess is None:
+                return
+            ip = public_ip()
+            port = Config.vpn_public_port
+            return self._send_json(200, {
+                "vpn_public_ip": ip,
+                "vpn_public_port": port,
+                "vpn_address": f"{ip}:{port}" if ip else "",
+            })
         if path.startswith("/api/"):
             return self._proxy("GET")
         return self._error(404, "not found")
@@ -493,6 +607,11 @@ def main() -> int:
                     help="本服务 HTTPS 证书链（fullchain.pem）")
     ap.add_argument("--tls-key", default=os.environ.get("WEBADMIN_TLS_KEY", ""),
                     help="本服务 HTTPS 私钥（privkey.pem，0600）")
+    ap.add_argument("--vpn-public-ip", default=os.environ.get("VPN_PUBLIC_IP", ""),
+                    help="VPN 服务器对外地址（公网 IP 或域名），页面展示供复制；"
+                         "留空则自动探测出口 IP")
+    ap.add_argument("--vpn-public-port", default=os.environ.get("VPN_PUBLIC_PORT", "51820"),
+                    help="VPN 对外端口，默认 51820")
     args = ap.parse_args()
 
     Config.controller = args.controller.rstrip("/")
@@ -503,6 +622,11 @@ def main() -> int:
     Config.db_path = args.db
     Config.tls_cert = args.tls_cert or ""
     Config.tls_key = args.tls_key or ""
+    Config.vpn_public_ip = (args.vpn_public_ip or "").strip()
+    try:
+        Config.vpn_public_port = int(args.vpn_public_port)
+    except (TypeError, ValueError):
+        Config.vpn_public_port = 51820
 
     if (Config.tls_cert and not Config.tls_key) or (Config.tls_key and not Config.tls_cert):
         log("[x] --tls-cert 与 --tls-key 必须同时提供")
@@ -528,14 +652,16 @@ def main() -> int:
         log(f"[x] 初始化数据库失败 {Config.db_path}: {e}")
         return 1
 
-    srv = ThreadingHTTPServer((Config.bind, Config.port), Handler)
+    srv = TimeoutThreadingHTTPServer((Config.bind, Config.port), Handler)
     srv.daemon_threads = True
 
     if Config.tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(Config.tls_cert, Config.tls_key)
-        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        # 注意：**不要** wrap srv.socket。交给 get_request 手动握手，
+        # 否则 SSLSocket.accept() 内的握手不受超时约束，半开连接会卡死整个服务。
+        srv.ssl_context = ctx
     elif Config.bind not in ("127.0.0.1", "::1", "localhost"):
         log("[!] 警告: 管理页面以明文 HTTP 暴露在非环回地址。"
             "生产环境请配置 --tls-cert/--tls-key，或只绑 127.0.0.1 走 SSH 隧道。")

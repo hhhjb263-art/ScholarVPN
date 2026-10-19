@@ -145,6 +145,8 @@
 <main>
   <aside>
     <h2>服务器</h2>
+    <div id="vpnAddr" style="margin:-2px 0 10px;font-size:12px;display:none;
+         align-items:center;gap:6px;flex-wrap:wrap"></div>
     <div id="servers"><div class="empty" style="padding:20px 0">加载中…</div></div>
   </aside>
   <section id="detail">
@@ -239,6 +241,38 @@ async function api(path, opts = {}) {
 }
 
 /* ------------------------------------------------------------------ 列表 */
+/* 左侧栏顶部的 VPN 公网地址 —— 客户端配置里要填的就是这个。
+   controller 只报告 agent 的连接源地址（同机部署时就是 127.0.0.1），对外没有意义，
+   所以公网地址由 webadmin 自己提供（显式配置或自动探测出口 IP）。 */
+async function loadMeta() {
+  const box = $("vpnAddr");
+  let addr = "";
+  try {
+    const meta = await api("/api/meta");
+    addr = (meta && meta.vpn_address) || "";
+  } catch (_) {
+    addr = "";
+  }
+  box.innerHTML = "";
+  if (!addr) { box.style.display = "none"; return; }
+
+  const label = document.createElement("span");
+  label.style.color = "var(--dim)";
+  label.textContent = "公网";
+
+  const code = document.createElement("code");
+  code.style.fontFamily = "var(--mono)";
+  code.textContent = addr;
+
+  const btn = document.createElement("button");
+  btn.className = "sm";
+  btn.textContent = "复制";
+  btn.onclick = () => copyText(addr);
+
+  box.append(label, code, btn);
+  box.style.display = "flex";
+}
+
 async function loadServers() {
   const box = $("servers");
   try {
@@ -300,11 +334,13 @@ async function selectServer(id) {
   });
   $("detail").innerHTML = '<div class="empty">加载中…</div>';
   try {
-    const [info, toks] = await Promise.all([
+    const [info, toks, meta] = await Promise.all([
       api(`/api/servers/${encodeURIComponent(id)}/info`).catch((e) => ({ __err: e })),
       api(`/api/servers/${encodeURIComponent(id)}/tokens`).catch((e) => ({ __err: e })),
+      /* 公网地址由 webadmin 自己提供（controller 只知道 agent 的 127.0.0.1） */
+      api(`/api/meta`).catch(() => null),
     ]);
-    renderDetail(id, info, toks);
+    renderDetail(id, info, toks, meta);
     alertBox(null);
   } catch (e) {
     alertBox("err", e.message);
@@ -317,7 +353,7 @@ function kv(parent, k, v) {
   parent.appendChild(kd); parent.appendChild(vd);
 }
 
-function renderDetail(id, info, toks) {
+function renderDetail(id, info, toks, meta) {
   const root = $("detail");
   root.innerHTML = "";
 
@@ -337,6 +373,38 @@ function renderDetail(id, info, toks) {
     const grid = document.createElement("div"); grid.className = "kv";
     kv(grid, "版本", info.version || "—");
     kv(grid, "监听", (info.ip || "?") + ":" + (info.port != null ? info.port : "?"));
+
+    /* 公网地址：客户端配置里要填的就是这个。
+       上面那行"监听"多半是 127.0.0.1（后台与 VPN 同机），对外没有意义。 */
+    if (meta) {
+      const addr = meta.vpn_address || "";
+      const kd = document.createElement("div");
+      kd.className = "k";
+      kd.textContent = "公网地址";
+      const vd = document.createElement("div");
+      vd.className = "v";
+      vd.style.display = "flex";
+      vd.style.alignItems = "center";
+      vd.style.gap = "8px";
+      vd.style.flexWrap = "wrap";
+      const span = document.createElement("span");
+      span.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+      span.textContent = addr || "—";
+      vd.appendChild(span);
+      if (addr) {
+        const cp = document.createElement("button");
+        cp.className = "sm";
+        cp.textContent = "复制";
+        cp.onclick = () => copyText(addr);
+        vd.appendChild(cp);
+      } else {
+        vd.title = "未能获取公网地址：可在启动 webadmin 时用 --vpn-public-ip 显式指定";
+        vd.style.opacity = "0.6";
+      }
+      grid.appendChild(kd);
+      grid.appendChild(vd);
+    }
+
     kv(grid, "指纹 (hex)", info.pubkey_hex || "—");
     c1.appendChild(grid);
 
@@ -527,7 +595,7 @@ async function loadAdmins() {
 }
 
 /* ------------------------------------------------------------------ 启动 */
-$("btnRefresh").onclick = () => loadServers();
+$("btnRefresh").onclick = () => { loadServers(); loadMeta(); };
 
 async function init() {
   try {
@@ -538,6 +606,7 @@ async function init() {
   } catch (_) {
     return; // api() 已处理 401 跳转
   }
+  loadMeta();
   loadServers();
   setInterval(() => { if (!document.hidden) loadServers(); }, 15000);
 }

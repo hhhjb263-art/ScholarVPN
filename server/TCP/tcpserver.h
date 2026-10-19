@@ -48,9 +48,6 @@ private:
     {
         std::shared_ptr<Session> session;
         std::vector<uint8_t> rxBuf;
-        // rxBuf 中已消费的前缀长度：分帧时只推进偏移，整批读完/下一轮
-        // 进入时才做一次 memmove（原先每帧 vector::erase 一次，O(n²)）
-        size_t rxOff = 0;
         // recv() 的临时接收缓冲（每连接一个，复用）：这条路径每来一段数据就
         // 走一次，原先每次调用都新建/释放一个 1.5KB vector（热路径堆分配）
         std::vector<uint8_t> readTmp;

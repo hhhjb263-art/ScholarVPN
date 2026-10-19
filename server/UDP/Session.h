@@ -7,6 +7,7 @@
 #include <deque>
 #include <mutex>
 #include <netinet/in.h>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -232,6 +233,10 @@ class VirtualIpPool
 {
 public:
     explicit VirtualIpPool(uint32_t gateway_net, int prefix)
+        // 随机分配虚拟 IP：每次进程启动重新播种（random_device + 高精度时钟混合）
+        : rng(std::random_device{}() ^
+              static_cast<uint32_t>(std::chrono::steady_clock::now()
+                                        .time_since_epoch().count()))
     {
         const uint32_t mask = (prefix <= 0) ? 0u
                             : (prefix >= 32) ? 0xFFFFFFFFu
@@ -243,12 +248,41 @@ public:
         if (last > 0)
             last -= 1;                // 排除广播地址
         this->gw = gw;
+        // /31、/32 这类没有可用主机地址的网段：置为无效，allocate 直接返回 0
+        if (last < first)
+        {
+            first = 0;
+            last = 0;
+        }
     }
 
-    // 分配一个未占用地址（网络字节序）；池满返回 0
+    // 分配一个未占用地址（网络字节序）；池满返回 0。
+    //
+    // 分配策略（2026-10-19 改为随机）：原实现从 first 顺序扫描，
+    // 虚拟 IP 严格按 10.8.0.2、10.8.0.3 … 递增，问题有二：
+    //   1) 同一客户端重连后拿到的地址高度可预测，隧道内其他客户端能据此
+    //      推测地址布局（隧道内另有身份校验，但没必要额外暴露这层信息）；
+    //   2) 地址与接入顺序强绑定，便于旁路统计"第几个连上来的"。
+    // 现在先在可用区间内随机取，撞到已占用就重试；32 次都失败说明池接近满，
+    // 回退线性扫描兜底——保证不会因为随机碰撞把"还有空位"误判成池满。
     uint32_t allocate()
     {
+        if (first == 0 || last < first)
+            return 0;                    // 网段没有可用主机地址（/31、/32）
         std::lock_guard<std::mutex> lock(m_mutex);
+
+        std::uniform_int_distribution<uint32_t> dist(first, last);
+        for (int i = 0; i < 32; ++i)
+        {
+            const uint32_t ip = dist(rng);
+            if (ip != gw && used.find(ip) == used.end())
+            {
+                used.insert(ip);
+                return htonl(ip);
+            }
+        }
+
+        // 兜底：池接近满时随机碰撞概率变高，线性扫描把剩余地址找出来
         uint32_t ip = first;
         while (ip <= last)
         {
@@ -279,6 +313,7 @@ public:
 private:
     mutable std::mutex m_mutex;
     std::set<uint32_t> used;          // 已占用（主机序）
+    std::mt19937 rng;                 // 随机分配用；仅在持锁时访问
     uint32_t first = 0;
     uint32_t last = 0;
     uint32_t gw = 0;

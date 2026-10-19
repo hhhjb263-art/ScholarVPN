@@ -1,6 +1,7 @@
 
 #include "ClientApp.h"
 #include <cstdarg>
+#include <cstring>   // memcpy：上行报文的源地址终检
 #include "tun_macro.h"   // LOG_INFO 等分级日志宏（logger.h 只有 LOG_ERR/LOG_KEY/LOG_DBG）
 #include"../src/util/utf.h"   // narrow/to_wstring/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
 namespace {
@@ -280,6 +281,22 @@ bool ClientApp::init()
         LOG_KEY("[Identity] 已应用服务器 %ls 配置的 ServerPubKey 验签", m_cfg.ServerIP.c_str());
     }
 
+    // 传输方式：servers[0] 就是默认/活动服务器。不经过 set_server() 的启动路径
+    // （AppBridge::start、Debug 直连、自动重连后的首次启动）必须在这里同步，
+    // 否则 config.ini 里写着 Transport=1（TCP），程序却永远按默认 UDP 去连——
+    // 现象就是"切成 TCP 后仍然连不上，而且服务端根本看不到 TCP 连接进来"。
+    if (!m_cfg.servers.empty())
+    {
+        m_transport = m_cfg.servers[0].transport ? Transport::TCP : Transport::UDP;
+    }
+    else
+    {
+        m_transport = Transport::UDP;
+    }
+    LOG_KEY("[Config] 传输方式: %s（[Server1] Transport=%d）",
+            (m_transport == Transport::TCP) ? "TCP" : "UDP",
+            static_cast<int>(m_transport));
+
 #ifndef _DEBUG
     m_remote = narrow(m_cfg.ServerIP);
     // 空 = 多服务器模式：init 只建网卡/路由，目标服务器稍后由 set_server() 指定
@@ -388,10 +405,17 @@ bool ClientApp::start()
         return false;
     }
 
-    m_mgr = std::make_unique<ReconnectManager>(m_remote, m_port, 256);
+    // 收发队列深度：4096 包（单向 ≈5.6MB）。
+    // 原值 256 包（≈350KB）在高带宽高 RTT 链路上小于带宽延迟积
+    // （100Mbps×50ms ≈ 625KB）：一有突发就队列满 → 静默丢包 →
+    // 上层 TCP 疯狂重传 → 越重传越慢。队列深度至少要能吸收一个 BDP 的突发。
+    m_mgr = std::make_unique<ReconnectManager>(m_remote, m_port, 4096);
     m_mgr->set_transport(m_transport);
     m_mgr->set_identity(m_ed25519Priv, m_serverSigPubPem,
                         narrow(m_cfg.ClientID), narrow(m_cfg.RegisterToken));
+
+    // 上行闸门先关：新连接会重新协商虚拟 IP，网卡地址还没同步前不能发包
+    m_tunIpReady.store(false);
 
     // 状态回调：断线/重连时撤销\"全流量进 TUN\"的黑洞，让物理网卡恢复上网，
     // 同时恢复物理网卡 DNS（防泄漏守卫反向操作），握手包仍走 bypass 路由。
@@ -408,11 +432,18 @@ bool ClientApp::start()
                 // Connecting 是首次连接/握手开始，DNS 防护尚未激活，无需恢复，白遍历网卡。
                 if (s == ConnState::Reconnecting)
                 {
+                    // 断线/换传输方式：下次连接会重新协商虚拟 IP，先关上行闸门，
+                    // 避免"旧地址的包"在重连成功的瞬间被当成有效上行发出去
+                    m_tunIpReady.store(false);
                     if (m_route)
                     {
                         m_route->remove_default_route();   // 只撤默认路由，保留服务器 bypass
                     }
                     m_dnsGuard.restore();                 // 恢复物理网卡 DNS（断线期间可正常上网）
+                }
+                if (s == ConnState::Stopped || s == ConnState::Error)
+                {
+                    m_tunIpReady.store(false);
                 }
                 if (m_onState)
                 {
@@ -454,7 +485,16 @@ bool ClientApp::start()
             emit_log("[Reconnect] Connected, routes + DNS guard active");
 
             // 多用户服务端：identity_ok 通告的虚拟 IP 覆盖网卡地址
+            //
+            // 顺序很关键：先关上行闸门（m_tunIpReady=false），改完网卡地址再开。
+            // 2026-10-19 回归事故：服务端改成"随机分配虚拟 IP"后，每次连接
+            // （含重连、含 UDP↔TCP 切换）客户端都会拿到一个【新】地址，而
+            // tun_to_udp_loop 在握手一成功就开始转发——网卡地址还没切过来的
+            // 那几百毫秒里，发出的包源地址还是旧 IP，被服务端源地址防伪校验
+            // 整片丢弃。现象就是：网速掉到几十 K、隧道内 TCP 三次握手 SYN 都
+            // 上不去（"TCP 连不上"）、切换传输后彻底连不上。
             auto u = m_mgr->udp();
+            m_tunIpReady.store(u == nullptr || u->assigned_ip() == 0);
             if (u && u->assigned_ip() != 0 && m_adapter)
             {
                 const uint32_t ip = u->assigned_ip();
@@ -486,8 +526,16 @@ bool ClientApp::start()
                 }
                 else
                 {
-                    LOG_ERR("[TUN] 设置服务端分配的 IP 失败: %s/%u", ipstr, static_cast<unsigned>(prefix));
+                    // 网卡地址没改成功 = 上行每个包都会被服务端丢掉。
+                    // 闸门仍然打开（万一旧地址恰好就是本次分配的地址，流量还能走），
+                    // 由 tun_to_udp_loop 的源地址终检逐包兜住并计数，不再静默：
+                    // 否则用户看到的是"显示已连接、一个包都上不去"。
+                    LOG_ERR("[TUN] 设置服务端分配的 IP 失败: %s/%u —— 上行数据可能被服务端"
+                            "源地址校验丢弃；请重连（或检查 Wintun 网卡地址是否被占用）",
+                            ipstr, static_cast<unsigned>(prefix));
                 }
+                // 地址（含清理残留）已处理：放行上行（不匹配的包由终检拦下）
+                m_tunIpReady.store(true);
             }
             // 注册模式连上 = 注册成功：清空 RegisterToken，下次自动登录
             if (!m_cfg.RegisterToken.empty())
@@ -546,7 +594,8 @@ bool ClientApp::start()
     m_threadTunToUdp = std::thread([this]() { tun_to_udp_loop(); });
     m_threadUdpToTun = std::thread([this]() { udp_to_tun_loop(); });
 
-    emit_log("VPN started, connecting to %s:%d", m_remote.c_str(), static_cast<int>(m_port));
+    emit_log("VPN started, connecting to %s:%d (%s)", m_remote.c_str(), static_cast<int>(m_port),
+             (m_transport == Transport::TCP) ? "TCP" : "UDP");
     return true;
 }
 
@@ -562,6 +611,15 @@ void ClientApp::tun_to_udp_loop()
             if (!u || !u->is_handshaked())
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            // 上行闸门：服务端通告了虚拟 IP，但网卡地址还没切过去（connected
+            // 回调里改地址）——这段时间发出的包源地址是旧的，服务端会整片丢弃。
+            // 宁可先不发（应用侧看到的是短暂拥塞），也不要把注定被丢的包打出去。
+            const uint32_t assigned = u->assigned_ip();
+            if (assigned != 0 && !m_tunIpReady.load())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
             DWORD len = 0;
@@ -582,6 +640,27 @@ void ClientApp::tun_to_udp_loop()
                                  (n == 2) ? "（同类日志已抑制）" : "");
                     }
                     continue;
+                }
+                // 源地址终检（最后一道保险）：包内源 IP 必须等于本会话的虚拟 IP，
+                // 否则服务端必然按"冒用源地址"丢弃（白耗上行 + 服务端刷拒绝日志）。
+                // 闸门已经挡住主要窗口，这里兜的是"网卡上残留旧地址、Windows 挑错
+                // 源地址"这种闸门管不到的情况。
+                if (assigned != 0)
+                {
+                    uint32_t src = 0;
+                    memcpy(&src, pkt + 12, 4);          // IPv4 头 offset 12 = 源地址
+                    if (src != htonl(assigned))
+                    {
+                        m_tun->release_read_packet(pkt);
+                        const uint32_t n = m_srcMismatchDropped.fetch_add(1);
+                        if (n < 3)
+                        {
+                            LOG_ERR("[TUN] 丢弃源地址不匹配的上行报文（包内源地址非本会话虚拟 IP），"
+                                    "累计 %u 个%s", n + 1,
+                                    (n == 2) ? "（同类日志已抑制，请检查网卡是否残留旧地址）" : "");
+                        }
+                        continue;
+                    }
                 }
                 m_txPkts.fetch_add(1);
                 m_txBytes.fetch_add(len);
@@ -655,6 +734,7 @@ void ClientApp::udp_to_tun_loop()
 void ClientApp::stop()
 {
     const bool wasRunning = m_running.exchange(false);
+    m_tunIpReady.store(false);   // 停止即关上行闸门
     if (m_mgr)
     {
         m_mgr->stop();
@@ -725,6 +805,21 @@ void ClientApp::set_server(const ServerEntry& entry)
     m_transport = entry.transport ? Transport::TCP : Transport::UDP;
     m_cfg.ClientID = entry.ClientID;
     m_cfg.RegisterToken = entry.RegisterToken;
+    // 把本条的传输方式/身份同步回 m_cfg.servers：
+    // save_config() 会按 m_cfg.servers 全量重写 config.ini，"注册成功清 Token"
+    // 或"令牌被拒清 Token"那两次保存会把 Transport 写回 init() 时缓存的值。
+    // 不同步的话：用户切到 TCP 连一次 -> 保存把 Transport 改回 0 -> 下次又变 UDP。
+    for (auto& s : m_cfg.servers)
+    {
+        if (s.ServerIP == entry.ServerIP && s.ServerPort == entry.ServerPort)
+        {
+            s.transport = entry.transport;
+            s.ClientID = entry.ClientID;
+            s.RegisterToken = entry.RegisterToken;
+            s.ServerPubKey = entry.ServerPubKey;
+            break;
+        }
+    }
     // 服务器身份公钥：该服务器配置了公钥就用它验签（多服务器各自独立）；
     // 为空则恢复内置硬编码公钥——绝不能保留上一台服务器的自定义公钥，
     // 否则切换服务器后拿 A 的公钥验 B 的签名，验签必失败（公钥串台）
@@ -746,7 +841,8 @@ void ClientApp::set_server(const ServerEntry& entry)
         emit_log("服务器条目未配置 ServerPubKey，使用内置固定公钥验签"
                  "（若与服务器身份不符会在握手时验签失败）");
     }
-    emit_log("已选择服务器: %s:%u, ClientID=%s", m_remote.c_str(), static_cast<int>(m_port),
+    emit_log("已选择服务器: %s:%u, 传输=%s, ClientID=%s", m_remote.c_str(), static_cast<int>(m_port),
+             (m_transport == Transport::TCP) ? "TCP" : "UDP",
              narrow(m_cfg.ClientID).c_str());
 }
 

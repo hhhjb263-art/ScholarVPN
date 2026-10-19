@@ -88,7 +88,8 @@ private:
     uint32_t allocate_virtual_ip(const std::string& client_id);
     void release_virtual_ip(uint32_t ip);
     void load_vip_leases();
-    void save_vip_leases();
+    // 入参是锁外快照：m_vip_mutex 同时服务于转发查表，不能持锁落盘
+    void save_vip_leases(const std::unordered_map<std::string, uint32_t>& leases);
 
     // 握手重算限速（令牌桶，按来源 IP）：只有"需要重算握手"的 auth_hello
     // （携带新 nonce → 要生成临时 X25519 密钥对 + Ed25519 签名）才消耗令牌；

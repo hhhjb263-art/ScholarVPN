@@ -10,8 +10,12 @@
 
 namespace
 {
-    // 单次连接：等待握手完成的上限（服务端正常 <1s 回包；4s 无回包即判死）
-    constexpr auto kHandshakeWait = std::chrono::seconds(4);
+    // 单次连接：等待握手完成的上限。
+    // 必须【大于】隧道内部的握手总超时（UDP.cpp 的 kAuthTimeout = 8s），
+    // 否则本状态机会在隧道还在正常重传时就把实例拆掉：
+    // 原值是 4s < kAuthTimeout 5s，移动网/跨境链路一次握手要 3~4s，
+    // 于是每次都"差一点成功就被掐断"，表现为永远连不上、无限重连。
+    constexpr auto kHandshakeWait = std::chrono::seconds(12);
     // 重连退避：500ms -> 1s -> 2s -> 5s（封顶）
     constexpr auto kMinBackoff = std::chrono::milliseconds(500);
     constexpr auto kMaxBackoff = std::chrono::milliseconds(5000);
@@ -227,6 +231,7 @@ void ReconnectManager::worker_loop()
 
 bool ReconnectManager::connect_once()
 {
+    const char* tname = (m_transport == Transport::TCP) ? "TCP" : "UDP";
     std::shared_ptr<UDP> u;
     try
     {
@@ -239,7 +244,10 @@ bool ReconnectManager::connect_once()
     }
     catch (const std::exception& e)
     {
-        LOG_ERROR("[Reconnect] 参数错误（%s），状态机停止", e.what());
+        // 走到这里几乎一定是 ServerIP 不是合法的 IPv4 字面量（本协议不支持域名）
+        LOG_ERROR("[Reconnect] 参数错误（%s）：remote=%s:%u 不是合法 IPv4 —— "
+                  "服务器条目只接受 IP 地址（如 1.2.3.4），不支持域名",
+                  e.what(), m_remote.c_str(), static_cast<unsigned>(m_port));
         set_state(ConnState::Error);
         m_running.store(false);
         return false;
@@ -247,14 +255,17 @@ bool ReconnectManager::connect_once()
 
     if (!u->init())
     {
-        LOG_ERROR("[Reconnect] UDP init 失败 remote=%s:%u", m_remote.c_str(), m_port);
+        // 具体原因（RST/超时/不可达）已由 UDP::init / TCP::establish 打印
+        LOG_ERROR("[Reconnect] %s 建立隧道失败 remote=%s:%u（原因见上一行）",
+                  tname, m_remote.c_str(), static_cast<unsigned>(m_port));
         return false;
     }
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_current = u;
     }
-    LOG_INFO("[Reconnect] 已创建隧道，等待握手 remote=%s:%u ...", m_remote.c_str(), m_port);
+    LOG_INFO("[Reconnect] 已创建 %s 隧道，等待握手 remote=%s:%u ...",
+             tname, m_remote.c_str(), static_cast<unsigned>(m_port));
 
     const auto deadline = std::chrono::steady_clock::now() + kHandshakeWait;
     while (m_running.load())
@@ -285,7 +296,8 @@ bool ReconnectManager::connect_once()
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    LOG_WARN("[Reconnect] 握手等待超时");
+    LOG_WARN("[Reconnect] 握手等待超时（%llds）",
+             static_cast<long long>(kHandshakeWait.count()));
     return u->is_handshaked();
 }
 

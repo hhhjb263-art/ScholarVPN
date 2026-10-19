@@ -37,8 +37,11 @@ protected:
 private:
     // 从接收缓冲取一帧（不动 socket）：1=整帧已交付 0=数据不足 -1=非法帧（连接作废）
     int take_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_len);
+    // 回收已消费的前缀（只在"读空"或"已消费超过 64KB"时做一次 memmove，
+    // 不再是每帧一次 vector::erase）
+    void compact_rx();
 
-    std::vector<uint8_t> m_rxBuf;       // 接收累积缓冲
-    size_t m_rxHave = 0;                // 已收字节数
-    size_t m_consumed = 0;              // 已交付帧字节数（下次调用先消费）
+    std::vector<uint8_t> m_rxBuf;       // 接收累积缓冲（可能同时含多帧）
+    size_t m_rxOff = 0;                 // 已消费前缀长度（有效数据从 data()+m_rxOff 起）
+    size_t m_consumed = 0;              // 上一帧交付的字节数（下次调用先推进 m_rxOff）
 };

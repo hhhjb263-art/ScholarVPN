@@ -366,10 +366,23 @@ void TCPServer::handle_accept()
 // 返回 false = 连接作废（对端关闭/致命错误/非法帧头），调用方 drop
 bool TCPServer::read_conn(int fd, Conn& c)
 {
+    // 上一轮消费掉的前缀：进函数时统一回收一次（memmove 每轮 ≤1 次）
+    if (c.rxOff > 0) {
+        if (c.rxOff >= c.rxBuf.size()) {
+            c.rxBuf.clear();
+        } else {
+            c.rxBuf.erase(c.rxBuf.begin(),
+                          c.rxBuf.begin() + static_cast<std::ptrdiff_t>(c.rxOff));
+        }
+        c.rxOff = 0;
+    }
     // 临时接收缓冲挂在连接上复用（原先每次调用新建一个 1.5KB vector：
-    // 这函数每收到一段数据就跑一次，是热路径上的堆分配/释放）
-    if (c.readTmp.size() < 1441 + 64)
-        c.readTmp.resize(1441 + 64);
+    // 这函数每收到一段数据就跑一次，是热路径上的堆分配/释放）。
+    // 单次 recv 取 16KB（原 1.5KB ≈ 一帧）：上传方向上把"每帧一次 syscall"
+    // 降到"每 16KB 一次"。半包由下面的分帧状态机处理，读多少都不影响正确性。
+    constexpr size_t kReadChunk = 16 * 1024;
+    if (c.readTmp.size() < kReadChunk)
+        c.readTmp.resize(kReadChunk);
     std::vector<uint8_t>& tmp = c.readTmp;
     int frames = 0;
     for (;;) {
@@ -385,19 +398,23 @@ bool TCPServer::read_conn(int fd, Conn& c)
                     c.session ? c.session->peer_key.c_str() : "?", strerror(errno));
             return false;
         }
-        if (c.rxBuf.size() + static_cast<size_t>(n) > kMaxRxBufBytes) {
+        if (c.rxBuf.size() - c.rxOff + static_cast<size_t>(n) > kMaxRxBufBytes) {
             fprintf(stderr, "[TCP] 接收缓冲超限 %zu，连接作废 (%s)\n",
                     kMaxRxBufBytes, c.session ? c.session->peer_key.c_str() : "?");
             return false;
         }
         c.rxBuf.insert(c.rxBuf.end(), tmp.data(), tmp.data() + n);
 
-        // 分帧：一次 recv 携带的多条粘包全部处理完再回读（预算内）
+        // 分帧：一次 recv 携带的多条粘包全部处理完再回读（预算内）。
+        // 用读偏移 rxOff 前进而不是逐帧 erase：16KB 一批约 11 帧，
+        // 逐帧 erase 要做 11 次 memmove（O(n²)），越快的链路越亏
         for (;;) {
-            if (c.rxBuf.size() < Ktunnel_header)
+            const size_t avail = c.rxBuf.size() - c.rxOff;
+            if (avail < Ktunnel_header)
                 break;         // 半包：等下一段数据
+            const uint8_t* base = c.rxBuf.data() + c.rxOff;
             tunnel_header hdr{};
-            memcpy(&hdr, c.rxBuf.data(), Ktunnel_header);
+            memcpy(&hdr, base, Ktunnel_header);
             if (hdr.magic != Kmagic) {
                 fprintf(stderr, "[TCP] 非法 magic=0x%08X，连接作废 (%s)\n",
                         hdr.magic, c.session ? c.session->peer_key.c_str() : "?");
@@ -409,17 +426,15 @@ bool TCPServer::read_conn(int fd, Conn& c)
                         c.session ? c.session->peer_key.c_str() : "?");
                 return false;
             }
-            if (c.rxBuf.size() < Ktunnel_header + pay_len)
+            if (avail < Ktunnel_header + pay_len)
                 break;         // 半包：等下一段数据
 
             // 整帧到手：AAD = 帧头起始（handle_framed 内部由 payload 推导）。
             // handle_framed 的 disconnect 分支只置 tcp_drop（release 交本函数
             // 调用后的 drop_conn 统一收尾），之后不要再直接使用 session 表状态
             if (c.session)
-                m_udp.handle_framed(*c.session, hdr,
-                                     c.rxBuf.data() + Ktunnel_header, pay_len);
-            c.rxBuf.erase(c.rxBuf.begin(),
-                          c.rxBuf.begin() + static_cast<std::ptrdiff_t>(Ktunnel_header + pay_len));
+                m_udp.handle_framed(*c.session, hdr, base + Ktunnel_header, pay_len);
+            c.rxOff += Ktunnel_header + pay_len;
 
             if (c.session && c.session->tcp_drop.load())
                 return false;  // 处理中断开请求（disconnect/互踢等）：立即收尾

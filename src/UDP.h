@@ -136,6 +136,9 @@ protected:
     // 完全静默，日志里"密钥不匹配/被丢弃"与"对端不可达"无法区分，排查极易走偏
     std::atomic<uint32_t> m_auth_fail_logged{ 0 };
     std::atomic<uint32_t> m_replay_reject_logged{ 0 };
+    // 上行（TUN → 隧道）发送队列满导致的丢包计数：原先 push 失败完全静默，
+    // 表现只有"网速慢"，日志里没有任何线索（见 send_ip_packet）
+    std::atomic<uint32_t> m_tx_queue_drop{ 0 };
 protected:
     // 数据面明文载荷上限 KMax_data_payload(1400) 定义在 tunnel_protoco.h（两端一致）；
     // KMax_packet_size = 头部 12 + Max_payload_len 1429，作收发缓冲上限

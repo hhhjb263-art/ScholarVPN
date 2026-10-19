@@ -105,10 +105,18 @@ private:
 	TokenRejectedCallback m_onTokenRejected;
 	// 统计
 	std::atomic<bool> m_running{ false };
+	// 上行闸门：服务端通告的虚拟 IP 还没落到网卡上之前，禁止把 TUN 包送上隧道。
+	// 否则"源地址=旧 IP"的包会被服务端源地址防伪整片丢弃（认证成功却一个包都
+	// 上不去，表现为网速几十 K / 隧道内 TCP 连不上）。握手成功 -> 改网卡地址
+	// -> 置 true 放行，见 start() 的 connected 回调。
+	std::atomic<bool> m_tunIpReady{ false };
 	std::atomic<ConnState> m_state{ ConnState::Stopped };
 	std::atomic<uint64_t> m_txBytes{ 0 }, m_rxBytes{ 0 };
 	std::atomic<uint64_t> m_txPkts{ 0 }, m_rxPkts{ 0 };
 	// 本地丢弃的非 IPv4 报文计数（Wintun 网卡上的 IPv6 链路本地控制报文等）：
 	// 隧道只承载 IPv4，这类报文不该上行（服务端必拒），限流日志用
 	std::atomic<uint32_t> m_nonIpv4Dropped{ 0 };
+	// 源地址与本会话虚拟 IP 不符而被本地丢弃的上行报文计数：
+	// 这类包服务端必按"冒用源地址"丢弃，本地先拦下（限流日志用）
+	std::atomic<uint32_t> m_srcMismatchDropped{ 0 };
 };

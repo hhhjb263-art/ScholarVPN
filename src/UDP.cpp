@@ -18,7 +18,11 @@ namespace {
 //   阶段2：X25519 ECDH → HKDF-Extract(salt=nonce_c||nonce_s) → Expand 出 key_tx/key_rx，加密隧道开启
 //   阶段3（密文）：客户端发送身份报文（会话上下文 + client_id + SIG_CLI_PUB + register_token + 签名），
 //                  服务器验签后按 注册/登录 分支校验，通过才放行 TUN 流量
-constexpr auto kAuthTimeout = std::chrono::seconds(5);          // 每个阶段的总超时
+// 每个阶段的总超时。8s（原 5s）：移动网/跨境链路一次完整握手实测可到 3~4s
+// （服务端 UDP.cpp 的注释里有同类观测），5s 只剩不到 1 次重传余量，
+// 链路一抖就整体失败 → 重连 → 再失败。上层的握手等待窗口必须大于本值，
+// 见 reconnect_manager.cpp 的 kHandshakeWait。
+constexpr auto kAuthTimeout = std::chrono::seconds(8);
 constexpr auto kAuthRetryInterval = std::chrono::milliseconds(500);
 constexpr int kAuthMaxRetries = 10;
 
@@ -109,8 +113,10 @@ bool UDP::init()
 		return false;
 	}
 	// 传输差异全部走钩子：基类实现 = UDP；TCP 子类覆写 open_socket/establish
+	const char* tname = (proto_version() == static_cast<uint8_t>(v_tcp)) ? "TCP" : "UDP";
 	m_sock = open_socket();
 	if (m_sock == INVALID_SOCKET) {
+		LOG_ERR("[%s] socket() 创建失败: WSA=%d\n", tname, WSAGetLastError());
 		WSACleanup();
 		return false;
 	}
@@ -125,6 +131,12 @@ bool UDP::init()
 			reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
 	}
 	if (!establish()) {
+		// 具体原因已由 establish()（TCP 为 connect 失败分类）打印；
+		// 这里补上"哪个传输、连的哪个地址"，否则上层只能看到"UDP init 失败"
+		char ipbuf[INET_ADDRSTRLEN] = { 0 };
+		::InetNtopA(AF_INET, &m_sockaddr.sin_addr, ipbuf, sizeof(ipbuf));
+		LOG_ERR("[%s] 建立隧道失败：%s:%u（详见上一行原因）\n",
+			tname, ipbuf, ntohs(m_sockaddr.sin_port));
 		closesocket(m_sock);
 		m_sock = INVALID_SOCKET;
 		WSACleanup();
@@ -248,7 +260,19 @@ void UDP::send_ip_packet(packet_buffer&& buf)
 	if (!m_running.load()) {
 		return;
 	}
-	m_sendqueue.push(std::move(buf));
+	if (!m_sendqueue.push(std::move(buf))) {
+		// 队列满 = 上行突发超过发送线程的消化速度（拥塞/链路变慢）。
+		// 这是【丢包】而不是断线：原来的实现完全静默，用户只感觉到"网速慢"，
+		// 日志里连一条线索都没有（发送线程侧也不会报错）。
+		// 限流报前 3 条，之后只计数。
+		const uint32_t n = m_tx_queue_drop.fetch_add(1);
+		if (n < 3) {
+			LOG_ERR("[%s] 上行发送队列已满（上限 %zu 包），丢弃报文%s\n",
+				(proto_version() == static_cast<uint8_t>(v_tcp)) ? "TCP" : "UDP",
+				m_sendqueue.size(),
+				(n == 2) ? "（同类日志已抑制，累计丢包数见退出前统计）" : "");
+		}
+	}
 }
 
 bool UDP::recv_ip_packet(packet_buffer& buf)

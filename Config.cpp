@@ -1,8 +1,10 @@
 #include "Config.h"
+#include "src/logger.h"   // LOG_ERR（Transport 等配置项解析异常要能看见）
 
 #include <algorithm>   // std::sort（多服务器节按编号排序）
 #include <cstdlib>     // _wtoi
 #include <cwchar>      // wcslen
+#include <cwctype>     // towlower（Transport 字符串容错解析）
 #include <fstream>
 #include <sstream>
 #include <utility>     // std::pair
@@ -177,8 +179,29 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
                 if (e.ServerPubKey.size() >= 2 &&
                     e.ServerPubKey.front() == L'"' && e.ServerPubKey.back() == L'"')
                     e.ServerPubKey = e.ServerPubKey.substr(1, e.ServerPubKey.size() - 2);
-                e.transport = static_cast<uint8_t>(
-                    GetPrivateProfileIntW(sec.c_str(), L"Transport", 0, ini_path.c_str()));
+                // 传输方式：0=UDP（默认）1=TCP。
+                // 必须按字符串容错解析：原来直接用 GetPrivateProfileIntW，
+                // 手工把 ini 写成 "Transport=TCP" 时会被静默当成 0，
+                // 用户以为切了 TCP、实际一直走 UDP，日志里连一句提示都没有。
+                {
+                    std::wstring tv = ReadIniString(sec.c_str(), L"Transport", L"", ini_path);
+                    for (auto& ch : tv)
+                        ch = static_cast<wchar_t>(::towlower(ch));
+                    if (tv.empty() || tv == L"0" || tv == L"udp" || tv == L"false" || tv == L"no")
+                    {
+                        e.transport = 0;
+                    }
+                    else if (tv == L"1" || tv == L"tcp" || tv == L"true" || tv == L"yes")
+                    {
+                        e.transport = 1;
+                    }
+                    else
+                    {
+                        e.transport = 0;
+                        LOG_ERR("[Config] [%ls] Transport=%ls 无法识别（应为 udp/tcp 或 0/1），按 UDP 处理",
+                                sec.c_str(), tv.c_str());
+                    }
+                }
                 if (!e.ServerIP.empty())
                     found.emplace_back(idx, std::move(e));
             }

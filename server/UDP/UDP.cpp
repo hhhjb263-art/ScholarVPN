@@ -70,7 +70,14 @@ constexpr auto kHeartbeatTimeout  = std::chrono::seconds(30);   // 30s 未收到
 // 最早的未认证会话），单个手机重连风暴最多占 3 条 pending。
 constexpr auto kHandshakeTimeout  = std::chrono::seconds(30);   // 未认证会话 30s 未完成握手即清理
 constexpr size_t kMaxPendingSessions = 32;                      // 未认证会话独立配额（不挤占已认证容量）
-constexpr size_t kMaxSessionsPerIp   = 3;                       // 每来源 IP 最多同时持有的会话数
+// 每来源 IP 会话数上限。8（原 3）：原值会把两种正常行为判成攻击：
+//   ① 同一出口 NAT 后的多台设备（办公室/校园网）共用公网 IP；
+//   ② 同一台设备反复切换传输方式（UDP↔TCP）或快速重连——旧会话要等
+//      30s 心跳超时才释放，每次切换都新占一条（会话键含传输协议 +
+//      新临时端口），3 条配额两三次切换就耗尽，之后 accept 的新连接会被
+//      直接 close：客户端看到"连接建立后立刻被断开"，重试 5 次后报连接失败。
+// 上限仍然存在（配合 32 条 pending 配额 + max_clients），只是不再误伤。
+constexpr size_t kMaxSessionsPerIp   = 8;                       // 每来源 IP 最多同时持有的会话数
 
 // 单套会话密钥的寿命上限（毫秒）：到期由 heartbeat_work 主动换会话（客户端重连
 // 即重新握手、全新密钥）。本协议没有 in-protocol rekey，用这条给前向安全窗口
@@ -246,20 +253,50 @@ void UDP::release_session(const std::string& key)
 }
 
 // 虚拟 IP
-// 分配策略：**租约记忆优先** —— 同一 ClientID 优先拿回上次分配的地址。
+// 分配策略（三级，优先级从高到低）：
+//   ① 租约记忆：同一 ClientID 上次拿到的地址（进程内记忆 + vip_leases.txt 持久化）
+//   ② 身份派生：由 ClientID 哈希确定性地映射到池内一个地址 preferred_for()
+//   ③ 随机 + 线性探测：兜底（候选地址被别的客户端占着、或池接近满）
 //
-// 为什么（2026-10-19 生产事故）：地址改为随机分配后，服务端重启会把客户端
-// 重连拿到的新地址通告给客户端，但 Android 客户端重连路径不会用新地址重建
-// TUN——客户端网卡还挂着旧 IP，发出的每个包都被源地址防伪校验丢弃
-// （"包内源地址=10.8.0.2，本会话虚拟 IP=10.8.0.7"），上行全丢，表现为网速
-// 骤降到几十 K、连接假死。线性分配时代这个问题被"重启后第一个客户端总是
-// 拿回 .2"的巧合掩盖了。
+// 为什么（2026-10-19 生产事故）：地址改为纯随机分配后，服务端每次连接都给出
+// 一个新地址，客户端必须跟着改网卡地址；改地址窗口里发出的包源地址还是旧 IP，
+// 被服务端源地址防伪校验整片丢弃（"包内源地址=10.8.0.2，本会话虚拟 IP=10.8.0.7"）。
+// 结果同时表现为三件事：上行全丢 → 网速降到几十 K；隧道内 TCP 三次握手 SYN
+// 发不出去 → "TCP 连不上"；切换 UDP/TCP 后重新分配地址 → 同样连不上。
+// 线性分配时代被"重连总是拿回同一个 .2"的巧合掩盖了。
 //
-// 租约记忆 + 持久化让"服务端重启/客户端重连"都稳定拿回同一地址；
-// 若记忆地址已被其他客户端占用，回退随机分配并更新记忆。
+// 根治点不是"记住上次地址"（那依赖文件可写、依赖 ClientID 不重复），而是
+// ②：地址由身份【算出来】而不是【抽出来】。即使租约文件丢了/被删了/
+// 服务端换了机器，同一身份仍然拿回同一个地址，客户端永远不用改网卡。
 uint32_t UDP::allocate_virtual_ip(const std::string& client_id)
 {
-    if (!client_id.empty() && m_ip_pool)
+    if (!m_ip_pool)
+        return 0;
+
+    // 写租约：快照在锁内取，落盘在锁外——m_vip_mutex 同时被下行转发查表
+    // （forward_tun_packet）使用，在这里做文件 I/O 会把转发线程一起拖住
+    auto remember = [this](const std::string& key, uint32_t ip_host) {
+        if (key.empty())
+            return;
+        std::unordered_map<std::string, uint32_t> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_vip_mutex);
+            if (m_last_vip.size() > 10000)
+                m_last_vip.clear();   // 极端防御：注册用户有限，正常到不了
+            m_last_vip[key] = ip_host;
+            snapshot = m_last_vip;
+        }
+        save_vip_leases(snapshot);
+    };
+
+    // ① 租约：上次的地址（先到先得）
+    //
+    // 关于脏租约：随机分配时代"谁抢到就记给谁"会造出交叉租约——线上实例的
+    // vip_leases.txt 就是 user1 与 user3 都记着 10.8.0.2。这里【不做】额外的
+    // "别的身份也记着就否决"检查，否则先连接的人反而要给后连接的人让路。
+    // 用 try_acquire 的成败天然裁决即可：谁先连谁拿到，抢不到的一方走 ②
+    // 按身份换一个地址并写回自己的租约，冲突当场自愈，之后双方各自稳定。
+    if (!client_id.empty())
     {
         uint32_t preferred = 0;
         {
@@ -271,19 +308,42 @@ uint32_t UDP::allocate_virtual_ip(const std::string& client_id)
         if (preferred != 0 && m_ip_pool->try_acquire(preferred))
             return htonl(preferred);   // 归还上次地址，客户端 TUN 无需改地址
     }
-    if (!m_ip_pool)
-        return 0;
-    const uint32_t ip_net = m_ip_pool->allocate();   // 随机分配（网络序）
-    if (ip_net == 0)
-        return 0;
+
+    // ② 身份派生：同一身份永远同一个候选（不受租约文件影响）。
+    // 候选地址若被【别的身份】的租约占着就不抢——租约代表归属，
+    // 否则两个身份会长期互相顶替、地址反复交换。
     if (!client_id.empty())
     {
-        std::lock_guard<std::mutex> lock(m_vip_mutex);
-        if (m_last_vip.size() > 10000)
-            m_last_vip.clear();   // 极端防御：注册用户有限，正常到不了
-        m_last_vip[client_id] = ntohl(ip_net);
-        save_vip_leases();
+        const uint32_t hint = m_ip_pool->preferred_for(client_id);
+        if (hint != 0)
+        {
+            bool leased_elsewhere = false;
+            {
+                std::lock_guard<std::mutex> lock(m_vip_mutex);
+                for (const auto& kv : m_last_vip)
+                {
+                    if (kv.first != client_id && kv.second == hint)
+                    {
+                        leased_elsewhere = true;
+                        break;
+                    }
+                }
+            }
+            if (!leased_elsewhere && m_ip_pool->try_acquire(hint))
+            {
+                remember(client_id, hint);
+                fprintf(stderr, "[UDP][VIP] 按身份派生分配 %s -> 0x%08X（主机序）\n",
+                        client_id.c_str(), hint);
+                return htonl(hint);
+            }
+        }
     }
+
+    // ③ 兜底：候选被占用 / 无 ClientID
+    const uint32_t ip_net = m_ip_pool->allocate();
+    if (ip_net == 0)
+        return 0;
+    remember(client_id, ntohl(ip_net));
     return ip_net;
 }
 
@@ -319,9 +379,10 @@ void UDP::load_vip_leases()
                 m_last_vip.size(), path.c_str());
 }
 
-void UDP::save_vip_leases()
+void UDP::save_vip_leases(const std::unordered_map<std::string, uint32_t>& leases)
 {
-    // 调用方已持 m_vip_mutex；写临时文件再 rename，避免写一半被读到残缺
+    // 写临时文件再 rename，避免写一半被读到残缺。
+    // 调用方传入的是锁外快照（不能持 m_vip_mutex 做磁盘 I/O）
     const std::string path = m_keys_dir + "/vip_leases.txt";
     const std::string tmp = path + ".tmp";
     {
@@ -331,7 +392,7 @@ void UDP::save_vip_leases()
             fprintf(stderr, "[UDP] 租约文件写入失败: %s\n", tmp.c_str());
             return;
         }
-        for (const auto& kv : m_last_vip)
+        for (const auto& kv : leases)
             out << kv.first << " " << kv.second << "\n";
     }
     std::rename(tmp.c_str(), path.c_str());

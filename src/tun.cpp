@@ -1,5 +1,6 @@
 #pragma once
 #include "tun.h"
+#include <atomic>       // 环形缓冲丢包日志限流（热路径，不能逐包打日志）
 #include <cstring>
 #include <type_traits>
 #include <cstdint>
@@ -297,7 +298,22 @@ bool WintunTun::write_packet(const uint8_t* RawIPdata, DWORD len)
 	BYTE* send_packet = m_fnAllocateSendPacket(m_hsession, len);
 	if (send_packet == nullptr) {
 		DWORD err = ::GetLastError();
-		LOG_WARN("分配发送缓冲区失败 err=%lu（环形缓冲区满）", err);
+		// 环形缓冲满 = 下行突发超过网卡消费速度（背压，属正常现象）。
+		// 这里在热路径上：一次大流量下载可能每秒触发上千次。而 Logger 每条
+		// 日志都会 fflush 落盘并同步回调 UI——逐包打日志本身就成了瓶颈
+		// （实测表现：下载速度在几 MB/s 卡住、日志文件暴涨）。
+		// 改为 1s 最多一条 + 累计计数。
+		static std::atomic<uint64_t> s_ringDropTotal{ 0 };
+		static std::atomic<uint64_t> s_ringDropLastLogTick{ 0 };
+		const uint64_t total = s_ringDropTotal.fetch_add(1) + 1;
+		const uint64_t nowTick = ::GetTickCount64();
+		const uint64_t lastTick = s_ringDropLastLogTick.load();
+		// 竞态下多打一条无所谓（丢包日志不是审计日志）
+		if (nowTick - lastTick >= 1000) {
+			s_ringDropLastLogTick.store(nowTick);
+			LOG_WARN("分配发送缓冲区失败 err=%lu（环形缓冲区满），累计丢弃 %llu 包",
+				err, static_cast<unsigned long long>(total));
+		}
 		return false;
 	}
 	std::memcpy(send_packet, RawIPdata, len);

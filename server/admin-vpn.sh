@@ -20,6 +20,10 @@
 #   ./admin-vpn.sh status             查看状态
 #   ./admin-vpn.sh logs [组件]        跟踪日志（组件=admin_server|admin_agent，默认两者）
 #   ./admin-vpn.sh doctor             环境自检（不启动任何东西）
+#   ./admin-vpn.sh install            装成 systemd 服务（开机自启 + 崩溃自动拉起，需 root）
+#   ./admin-vpn.sh uninstall          卸载服务（停止 + 取消自启 + 删 unit，需 root）
+#   ./admin-vpn.sh enable | disable   仅控制开机自启（需 root）
+#   ./admin-vpn.sh unit               打印 systemd unit 内容（不写盘，检查用）
 #   ./admin-vpn.sh fingerprint        打印本机身份指纹（拿去中转端 add-agent）
 #   ./admin-vpn.sh token              打印管理令牌（admin_cli / curl 用）
 #
@@ -39,6 +43,7 @@
 #   KEYS_DIR=<脚本目录>/keys   密钥与令牌目录
 #   LOGS_DIR / RUN_DIR         日志 / PID 目录
 #   ADMIN_TOKEN=（空）         管理令牌；留空则用 KEYS_DIR/admin_token.txt（没有就自动生成）
+#   UNIT_NAME=scholarvpn-admin-vpn  systemd 服务名（同机跑多套隔离实例时改它）
 #
 # 首次运行会自动完成：依赖检查 → 构建 → 建目录 → 生成 Ed25519 身份密钥
 # ============================================================================
@@ -89,6 +94,16 @@ AS_LOG="$LOGS_DIR/admin_server.log"
 AG_LOG="$LOGS_DIR/admin_agent.log"
 AS_PID="$RUN_DIR/admin_server.pid"
 AG_PID="$RUN_DIR/admin_agent.pid"
+
+# ---------------------------------------------------------------- systemd
+# 服务名（可用 UNIT_NAME 覆盖，便于同一台机器跑多套隔离实例）
+UNIT_NAME="${UNIT_NAME:-scholarvpn-admin-vpn}"
+UNIT_FILE="/etc/systemd/system/${UNIT_NAME}.service"
+UNIT_ENV_FILE="/etc/default/${UNIT_NAME}"
+
+# 实例标识：注入到子进程环境里，供 sweep_orphans 区分"本实例"与"同机其他实例"。
+# 默认取 RUN_DIR（不同实例的 PID 目录本就该不同）。
+INSTANCE_TAG="${INSTANCE_TAG:-$RUN_DIR}"
 
 # ---------------------------------------------------------------- 输出
 if [ -t 2 ]; then
@@ -269,7 +284,8 @@ start_one() {  # start_one <名字> <pid文件> <日志文件> <命令...>
         err "$name 无法写入日志文件: $log"
         return 1
     fi
-    "$@" >>"$log" 2>&1 &
+    # 注入实例标识：sweep_orphans 靠它区分本实例与同机其他实例的进程
+    SCHOLARVPN_INSTANCE="$INSTANCE_TAG" "$@" >>"$log" 2>&1 &
     local child=$!
     # PID 文件写不进去必须当失败处理：否则进程活着但 stop/status 永远管不到它
     if ! echo "$child" > "$pid" 2>/dev/null; then
@@ -324,27 +340,54 @@ find_pids() {   # find_pids <ERE 模式>
 # 兜底清扫：PID 文件可能丢失（旧脚本起的 / 手动起的），只按 pid 文件停会留下孤儿进程
 # —— 也就是"退都没退干净"。
 sweep_orphans() {   # sweep_orphans <可执行文件绝对路径>
-    local bin="$1" pat pids
+    local bin="$1" pat pids pid tag mine others left
     # 同时匹配绝对路径启动和 ./basename / basename 启动（旧脚本、手动起的常见）；
     # 边界 (^|/)...( |$) 保证不误伤 admin_server.log、admin_server_old 之类。
     pat="(^|/)${bin##*/}( |\$)"
     pids="$(find_pids "$pat")"
     [ -n "$pids" ] || return 0
-    warn "发现残留进程，一并清理：$bin"
-    printf '%s\n' "$pids" | sed 's/^/    pid /' >&2
+
+    # 按实例标识分流：只杀本实例的，其余只报告不动手。
+    #
+    # 为什么必须这么做（2026-10-19 在真机上踩过）：
+    # 同机跑两套部署（生产 + 测试）时二进制路径相同，原来按 basename 无差别 kill，
+    # 测试实例 stop 时把生产的 admin_server 一并干掉，导致生产后台管理中断数秒。
+    # 现在只清理 environ 里 SCHOLARVPN_INSTANCE == $INSTANCE_TAG 的进程；
+    # 旧脚本/手动起的进程没有该变量，一律跳过（宁可漏杀，不可误杀）。
+    mine=""; others=""
+    for pid in $pids; do
+        tag="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+               | sed -n 's/^SCHOLARVPN_INSTANCE=//p' | head -1)"
+        if [ "$tag" = "$INSTANCE_TAG" ]; then
+            mine="$mine $pid"
+        else
+            others="$others $pid"
+        fi
+    done
+
+    if [ -n "$others" ]; then
+        warn "跳过非本实例（$INSTANCE_TAG）的进程：$others"
+        warn "  它们属于同机其他部署或旧脚本启动；确需清理请自行确认后 kill"
+    fi
+    [ -n "$mine" ] || return 0
+
+    warn "发现本实例的残留进程，一并清理：$bin"
+    printf '%s\n' $mine | sed 's/^/    pid /' >&2
     # shellcheck disable=SC2086
-    kill $pids 2>/dev/null || true
+    kill $mine 2>/dev/null || true
     sleep 0.5
-    pids="$(find_pids "$pat")"
-    if [ -n "$pids" ]; then
+    left=""
+    for pid in $mine; do [ -d "/proc/$pid" ] && left="$left $pid"; done
+    if [ -n "$left" ]; then
         warn "仍未退出，改用 KILL"
         # shellcheck disable=SC2086
-        kill -9 $pids 2>/dev/null || true
+        kill -9 $left 2>/dev/null || true
         sleep 0.3
-        pids="$(find_pids "$pat")"
+        left=""
+        for pid in $mine; do [ -d "/proc/$pid" ] && left="$left $pid"; done
     fi
-    if [ -n "$pids" ]; then                # 复核后仍在 = 清理失败（多半权限不足）
-        warn "仍有残留未清理（权限不足？）：$(printf '%s' "$pids" | tr '\n' ' ')"
+    if [ -n "$left" ]; then                # 复核后仍在 = 清理失败（多半权限不足）
+        warn "仍有残留未清理（权限不足？）：$left"
         return 1
     fi
     return 0
@@ -428,7 +471,11 @@ fg_cleanup() {
 }
 
 do_fg() {
-    check_deps || die "依赖检查未通过"
+    # 二进制已就绪时跳过工具链检查：systemd 的 PATH 只有标准目录，
+    # cmake/g++ 装在 /opt 或 snap 里就会让服务起不来（install 阶段已经查过一次）
+    if [ ! -x "$ADMIN_BIN" ] || [ ! -x "$AGENT_BIN" ]; then
+        check_deps || die "依赖检查未通过"
+    fi
     build_if_needed
     prepare_dirs
     ensure_keys
@@ -472,6 +519,12 @@ do_fg() {
     do_stop
     if [ -n "$FG_TAIL_PID" ]; then kill "$FG_TAIL_PID" 2>/dev/null || true; fi
     ok "已全部退出"
+    # 关键：systemd 下必须以非 0 退出，否则 Restart=on-failure 不会拉起服务，
+    # 子进程崩一次就永久躺平，"常驻"名存实亡。
+    # INVOCATION_ID 只有 systemd 启动的进程才有，手动跑 fg 时保持退出码 0。
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        exit 1
+    fi
 }
 
 do_stop() {
@@ -579,6 +632,135 @@ do_doctor() {
     if pgrep -af 'build/(admin_server|admin_agent)' 2>/dev/null; then :; else ok "无残留"; fi
 }
 
+# ---------------------------------------------------------------- systemd
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "该操作需要 root：sudo $0 $1"
+}
+
+need_systemd() {
+    have systemctl || die "未检测到 systemctl（当前系统不是 systemd）"
+    [ -d /run/systemd/system ] || die "systemd 未在运行（容器/非 systemd 环境）——请用 start / fg 手动运行"
+}
+
+# 生成 unit 内容（不落盘；install 与 unit 子命令共用同一份模板）
+render_unit() {
+    cat <<UNIT
+[Unit]
+Description=ScholarVPN Admin (VPN side: admin_server + admin_agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 以安装者身份运行，避免 logs/ run/ keys/ 被 root 接管
+# （否则之后用普通用户跑本脚本会撞"权限不够"）
+User=${UNIT_USER:-root}
+# 运行参数从 $UNIT_ENV_FILE 读取；改完 systemctl restart $UNIT_NAME 生效
+EnvironmentFile=-$UNIT_ENV_FILE
+ExecStartPre=/bin/mkdir -p $LOGS_DIR $RUN_DIR
+ExecStart=$SCRIPT_DIR/admin-vpn.sh fg
+# 只在异常退出时拉起；systemctl stop 不会触发重启
+Restart=on-failure
+RestartSec=5
+# SIGTERM 只发给主进程（本脚本），由它的 trap 优雅停掉两个子进程；
+# 超时后 systemd 再 SIGKILL 整个 cgroup 兜底，避免留下孤儿
+KillMode=mixed
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# 把当前生效的配置固化进 EnvironmentFile。
+# 刻意不写 ADMIN_TOKEN：令牌始终由脚本从 $TOKEN_FILE 读取，
+# 免得明文落在 /etc/default（那里是 644，任何本地用户可读）。
+write_unit_env() {
+    cat > "$UNIT_ENV_FILE" <<ENV
+# 由 admin-vpn.sh install 生成 $(date -Iseconds 2>/dev/null || date)
+# 改完执行：systemctl restart $UNIT_NAME
+BUILD_TYPE=${BUILD_TYPE-Release}
+ADMIN_BIND=$ADMIN_BIND
+ADMIN_PORT=$ADMIN_PORT
+ADMIN_NAME=$ADMIN_NAME
+RELAY_HOST=$RELAY_HOST
+RELAY_PORT=$RELAY_PORT
+RELAY_TLS=$RELAY_TLS
+RELAY_TLS_CA=$RELAY_TLS_CA
+RELAY_TLS_NAME=$RELAY_TLS_NAME
+KEYS_DIR=$KEYS_DIR
+LOGS_DIR=$LOGS_DIR
+RUN_DIR=$RUN_DIR
+ENV
+    chmod 644 "$UNIT_ENV_FILE"
+}
+
+do_install() {
+    need_root install
+    need_systemd
+
+    # 服务以安装者身份运行：sudo 场景取 SUDO_USER，直接 root 登录则仍用 root。
+    # 目的不是降权，而是让 logs/run/keys 的属主保持一致——
+    # 之前踩过"root 跑了脚本，之后普通用户 run/ 权限不够"的坑。
+    UNIT_USER="${SUDO_USER:-root}"
+
+    # 先把依赖/构建/密钥备齐，否则装完服务也起不来，排查起来更绕
+    check_deps || die "依赖检查未通过，修好再安装"
+    build_if_needed
+    prepare_dirs
+    ensure_keys
+
+    # 目录与密钥交给运行用户，服务才读得动；
+    # build/ 也一并交出——否则 root 编译出的产物会让之后普通用户 rebuild 撞权限
+    if [ "$UNIT_USER" != "root" ]; then
+        chown -R "$UNIT_USER" "$LOGS_DIR" "$RUN_DIR" "$KEYS_DIR" "$BUILD_DIR" 2>/dev/null \
+            || warn "chown 到 $UNIT_USER 失败（服务可能读不到密钥）"
+    fi
+
+    write_unit_env
+    render_unit > "$UNIT_FILE"
+    chmod 644 "$UNIT_FILE"
+
+    systemctl daemon-reload
+    systemctl enable "$UNIT_NAME" >/dev/null 2>&1 || warn "enable 失败（不影响本次启动）"
+    systemctl restart "$UNIT_NAME" || die "启动失败：journalctl -u $UNIT_NAME -n 50 --no-pager"
+
+    ok "已安装并设为开机自启：$UNIT_NAME"
+    info "运行用户     : $UNIT_USER"
+    info "unit 文件    : $UNIT_FILE"
+    info "环境变量     : $UNIT_ENV_FILE"
+    info "查看状态     : systemctl status $UNIT_NAME"
+    info "跟踪日志     : journalctl -u $UNIT_NAME -f"
+    info "本机身份指纹 : $(fingerprint 2>/dev/null || echo '(未生成)')"
+}
+
+do_uninstall() {
+    need_root uninstall
+    need_systemd
+    systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+    rm -f "$UNIT_FILE" "$UNIT_ENV_FILE"
+    systemctl daemon-reload
+    ok "已卸载 $UNIT_NAME"
+    info "keys/ logs/ run/ 保留未删（要彻底清理请手动删）"
+}
+
+do_enable() {
+    need_root enable
+    need_systemd
+    systemctl enable "$UNIT_NAME" || die "enable 失败（先执行 install？）"
+    ok "已设为开机自启：$UNIT_NAME"
+}
+
+do_disable() {
+    need_root disable
+    need_systemd
+    systemctl disable "$UNIT_NAME" || die "disable 失败"
+    ok "已取消开机自启：$UNIT_NAME（当前进程仍在跑，要停请用 stop）"
+}
+
 usage() {
     # 只打印文件开头的注释块（跳过 shebang）
     awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"
@@ -597,6 +779,11 @@ case "$cmd" in
     status)      do_status ;;
     logs)        do_logs "${1:-all}" ;;
     doctor)      do_doctor ;;
+    install)     do_install ;;       # 装成 systemd 服务：开机自启 + 崩溃自动拉起
+    uninstall)   do_uninstall ;;     # 停止 + 取消自启 + 删除 unit
+    enable)      do_enable ;;        # 仅设开机自启
+    disable)     do_disable ;;       # 仅取消开机自启
+    unit)        render_unit ;;      # 打印 unit 内容（不写盘，用于检查）
     fingerprint) fingerprint || exit 1; printf '\n' ;;
     token)       t="$(read_token)" || die "读不到令牌（$TOKEN_FILE）"; printf '%s\n' "$t" ;;
     help|-h|--help) usage ;;

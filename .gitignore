@@ -455,3 +455,7 @@ tools/webadmin/__pycache__/
 
 # 后台管理管理员数据库（含密码哈希/会话）
 tools/webadmin/data/
+
+# Linux 客户端本地构建目录与助手会话数据
+build-client/
+.workbuddy/

@@ -1,41 +1,50 @@
 #pragma once
-#include <windows.h>
-#include <shlobj.h>
+
+#include "src/platform/cfgstr.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
 
+// ============================================================================
+// 配置层（跨平台）
+//
+// 字符串类型统一用 cfgstr：
+//   Windows = std::wstring（Win32 INI API / 宽字符路径，行为与改造前完全一致）
+//   Linux   = std::string UTF-8
+// 业务代码一律不要写 std::wstring 或 L"..."，用 cfgstr + CS("...")
+// ============================================================================
+
 // 一台服务器的配置
 struct ServerEntry
 {
-    std::wstring Name;          // 显示名，如 "服务器A"
-    std::wstring ServerIP;      // 服务器 IP
+    cfgstr Name;            // 显示名，如 "服务器A"
+    cfgstr ServerIP;        // 服务器 IP
     int ServerPort = 51820;
     // 传输方式：0 = UDP（默认），1 = TCP（应对运营商丢 UDP，可配合 443 端口）
     uint8_t transport = 0;
     // 每台服务器各自的认证身份（各服务器独立注册）
-    std::wstring ClientID;      // 该服务器的客户端标识
-    std::wstring RegisterToken; // 该服务器的一次性注册令牌（空=登录模式）
-    // 该服务器的身份公钥（Ed25519 SPKI PEM 的 base64 正文，60 字符单行，不带头尾行）。
+    cfgstr ClientID;        // 该服务器的客户端标识
+    cfgstr RegisterToken;   // 该服务器的一次性注册令牌（空=登录模式）
+    // 该服务器的身份公钥（Ed25519 SPKI PEM 的 base64 正文，单行，不带头尾行）。
     // 每台服务器密钥独立，客户端用它验证该服务器签名（防中间人）；留空=用内置硬编码公钥。
-    std::wstring ServerPubKey;
+    cfgstr ServerPubKey;
 };
 
 // Client runtime settings, loaded from / saved to an INI file.
 struct ClientConfig
 {
 #ifdef _DEBUG
-    std::wstring ServerIP = L"192.168.1.12";
+    cfgstr ServerIP = CS("192.168.1.12");
 #else
     // Release builds: no hardcoded server; user fills it in config.ini (empty default avoids mojibake)
-    std::wstring ServerIP = L"";
+    cfgstr ServerIP = CS("");
 #endif
     // Debug-only server override: DEBUG builds prefer this key, RELEASE builds ignore it.
-    // Debug default = local test server; Release default = empty (never used).
 #ifdef _DEBUG
-    std::wstring DebugServerIP = L"192.168.1.12";
+    cfgstr DebugServerIP = CS("192.168.1.12");
 #else
-    std::wstring DebugServerIP = L"";
+    cfgstr DebugServerIP = CS("");
 #endif
     int ServerPort = 51820;
 
@@ -47,37 +56,38 @@ struct ClientConfig
     // VirtualIP: optional. Empty = adopt the server-assigned virtual IP after
     // authentication (multi-user servers always assign one); non-empty = fallback
     // for old servers that do not advertise an address.
-    std::wstring VirtualIP = L"";
+    cfgstr VirtualIP = CS("");
     int VirtualPrefix = 24;
-    std::wstring DNS = L"8.8.8.8,1.1.1.1";
+    cfgstr DNS = CS("8.8.8.8,1.1.1.1");
     uint32_t MTU = 1400;
     uint8_t Metric = 5;
 
     // Identity (three-phase auth)
-    std::wstring ClientID = L"user";        // client identifier
-    std::wstring RegisterToken = L"";       // one-time register token (empty = login mode)
-    // 默认/活动服务器的身份公钥（与 servers[0].ServerPubKey 同步，base64 正文单行，空=用内置公钥）
-    std::wstring ServerPubKey;
+    cfgstr ClientID = CS("user");        // client identifier
+    cfgstr RegisterToken = CS("");       // one-time register token (empty = login mode)
+    // 默认/活动服务器的身份公钥（与 servers[0].ServerPubKey 同步，空=用内置公钥）
+    cfgstr ServerPubKey;
 };
 
 class Config
 {
 public:
-    std::wstring ini_path;
-    std::wstring dir_path;
+    cfgstr ini_path;
+    cfgstr dir_path;
 
-    Config(std::wstring path, std::wstring dirPath);
+    Config(cfgstr path, cfgstr dirPath);
     ~Config();
 
-    static std::wstring GetAppDataRoaming();
+    // 配置根目录：Windows=%APPDATA%；Linux=$XDG_CONFIG_HOME 或 ~/.config
+    // （保留原函数名与语义，Windows 端行为不变；程序数据目录用 cfg_app_dir()）
+    static cfgstr GetAppDataRoaming();
 
     // Directory / file helpers
-    static bool CreateDir(const std::wstring& dirPath);
-    static bool FileExists(const std::wstring& filePath);
-    static bool DirExists(const std::wstring& dirPath);
-    static std::string ReadTextFile(const std::wstring& filePath);
-    static bool WriteTextFile(const std::wstring& filePath, const std::string& content);
-    static std::wstring ExpandEnvStr(const std::wstring& src);
+    static bool CreateDir(const cfgstr& dirPath);
+    static bool FileExists(const cfgstr& filePath);
+    static bool DirExists(const cfgstr& dirPath);
+    static std::string ReadTextFile(const cfgstr& filePath);
+    static bool WriteTextFile(const cfgstr& filePath, const std::string& content);
 
     // Load settings from the INI file; creates it with defaults when missing.
     bool LoadClientConfig(ClientConfig& outCfg);

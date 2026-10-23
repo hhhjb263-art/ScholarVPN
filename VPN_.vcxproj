@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -133,6 +133,12 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)im
     <ClInclude Include="src\itun_device.h" />
     <ClInclude Include="src\logger.h" />
     <ClInclude Include="src\PacketQueue.h" />
+    <ClInclude Include="src\platform\cfgstr.h" />
+    <ClInclude Include="src\platform\sock_compat.h" />
+    <ClInclude Include="src\platform\ini_doc.h" />
+    <ClInclude Include="src\platform\exec.h" />
+    <ClInclude Include="src\gui\QtCfg.h" />
+    <ClInclude Include="src\gui\CenteredComboBox.h" />
     <ClInclude Include="src\packet_buffer.h" />
     <ClInclude Include="src\route_manager.h" />
     <ClInclude Include="src\reconnect_manager.h" />
@@ -155,6 +161,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)im
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\logger.cpp" />
     <ClCompile Include="src\PacketQueue.cpp" />
+    <ClCompile Include="src\platform\cfgstr.cpp" />
     <ClCompile Include="src\packet_buffer.cpp" />
     <ClCompile Include="src\route_manager.cpp" />
     <ClCompile Include="src\reconnect_manager.cpp" />

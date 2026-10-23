@@ -39,6 +39,24 @@
     <ClInclude Include="src\PacketQueue.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="src\platform\cfgstr.h">
+    <ClInclude Include="src\platform\sock_compat.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\platform\exec.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\platform\ini_doc.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\QtCfg.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\CenteredComboBox.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="src\packet_buffer.h">
       <Filter>头文件</Filter>
     </ClInclude>
@@ -96,6 +114,9 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\PacketQueue.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\platform\cfgstr.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\packet_buffer.cpp">

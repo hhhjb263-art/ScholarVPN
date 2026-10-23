@@ -2,62 +2,293 @@
 #include "src/logger.h"   // LOG_ERR（Transport 等配置项解析异常要能看见）
 
 #include <algorithm>   // std::sort（多服务器节按编号排序）
-#include <cstdlib>     // _wtoi
-#include <cwchar>      // wcslen
-#include <cwctype>     // towlower（Transport 字符串容错解析）
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <utility>     // std::pair
 
-#pragma comment(lib, "shell32.lib")   // SHGetFolderPathW（Config::GetAppDataRoaming）
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include "src/platform/ini_doc.h"
+#endif
 
-Config::Config(std::wstring path, std::wstring dirPath)
+// ============================================================================
+// 平台无关的 INI 原语。上层 LoadClientConfig / SaveClientConfig 只用这几个函数，
+// 不再直接调 Win32 API，也不用关心编码：
+//   Windows：GetPrivateProfileStringW 等（行为与改造前逐字节一致）
+//   Linux  ：自实现解析（保留注释/未知键，原子写回，UTF-8）
+// ============================================================================
+
+namespace
+{
+    // ---- 字符串小工具（cfgstr 两种底层类型都要能编） ----
+
+    cfgstr TrimStr(const cfgstr& s)
+    {
+        const cfgstr::size_type b = s.find_first_not_of(CS(" \t\r\n"));
+        if (b == cfgstr::npos)
+        {
+            return cfgstr();
+        }
+        const cfgstr::size_type e = s.find_last_not_of(CS(" \t\r\n"));
+        return s.substr(b, e - b + 1);
+    }
+
+    // ASCII 小写化：只用于 udp/tcp 这类关键字判断，不引入 locale
+    cfgstr LowerAscii(const cfgstr& s)
+    {
+        cfgstr out = s;
+        for (auto& c : out)
+        {
+            if (c >= CS('A') && c <= CS('Z'))
+            {
+                c = static_cast<cfgstr::value_type>(c - CS('A') + CS('a'));
+            }
+        }
+        return out;
+    }
+
+    int CfgToInt(const cfgstr& s, int def)
+    {
+        try
+        {
+            const std::size_t used = s.find_first_not_of(CS(" \t"));
+            if (used == cfgstr::npos)
+            {
+                return def;
+            }
+            return static_cast<int>(std::stoll(s.substr(used)));
+        }
+        catch (const std::exception&)
+        {
+            return def;
+        }
+    }
+
+    // 剥掉 QSettings 写入时加的成对双引号（引号混进 PEM 正文会污染公钥）
+    cfgstr StripQuotes(cfgstr s)
+    {
+        if (s.size() >= 2 && s.front() == CS('"') && s.back() == CS('"'))
+        {
+            s = s.substr(1, s.size() - 2);
+        }
+        return s;
+    }
+
+#if defined(_WIN32)
+
+    // ---------------- Windows：直接用 Win32 INI API ----------------
+
+    cfgstr IniGetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& def)
+    {
+        wchar_t buffer[4096] = { 0 };
+        const DWORD n = ::GetPrivateProfileStringW(sec.c_str(), key.c_str(), def.c_str(),
+                                                   buffer, 4096, path.c_str());
+        // 统一剥掉 QSettings 写入时加的成对引号：值里含逗号/空格/非 ASCII 时 Qt 会加引号，
+        // 引号混进 PEM 正文或 DNS 列表会让上层解析失败
+        return StripQuotes(TrimStr(cfgstr(buffer, n)));
+    }
+
+    int IniGetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int def)
+    {
+        return static_cast<int>(::GetPrivateProfileIntW(sec.c_str(), key.c_str(), def, path.c_str()));
+    }
+
+    bool IniSetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& val)
+    {
+        return ::WritePrivateProfileStringW(sec.c_str(), key.c_str(), val.c_str(), path.c_str()) != 0;
+    }
+
+    bool IniSetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int val)
+    {
+        return IniSetStr(path, sec, key, cfg_num(val));
+    }
+
+    void IniDelKey(const cfgstr& path, const cfgstr& sec, const cfgstr& key)
+    {
+        // 值为 nullptr = 删除该键
+        ::WritePrivateProfileStringW(sec.c_str(), key.c_str(), nullptr, path.c_str());
+    }
+
+    void IniDelSection(const cfgstr& path, const cfgstr& sec)
+    {
+        // 节 + 键均为 nullptr = 删除整节
+        ::WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, path.c_str());
+    }
+
+    std::vector<cfgstr> IniSections(const cfgstr& path)
+    {
+        std::vector<cfgstr> out;
+        std::vector<wchar_t> names(16384, L'\0');   // 双 NULL 结尾
+        const UINT n = ::GetPrivateProfileSectionNamesW(names.data(),
+                                                        static_cast<DWORD>(names.size()),
+                                                        path.c_str());
+        if (n == 0)
+        {
+            return out;
+        }
+        for (const wchar_t* p = names.data(); *p; p += wcslen(p) + 1)
+        {
+            out.emplace_back(p);
+        }
+        return out;
+    }
+
+#else // ---------------- Linux：自实现解析 ----------------
+
+    // INI 文档实现已抽到 src/platform/ini_doc.h（纯标准库，可单测）
+    using PosixIni = scholinux::IniDoc;
+
+
+    // 每次 set/delete 都 load + save：配置不到 4KB、调用次数 <40，代价可忽略，
+    // 换来的是"任何一步失败都不会留下半截文件"
+    cfgstr IniGetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& def)
+    {
+        PosixIni ini;
+        ini.load(path);
+        return StripQuotes(TrimStr(ini.get(sec, key, def)));
+    }
+
+    int IniGetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int def)
+    {
+        PosixIni ini;
+        ini.load(path);
+        return CfgToInt(ini.get(sec, key, cfg_num(def)), def);
+    }
+
+    bool IniSetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& val)
+    {
+        PosixIni ini;
+        ini.load(path);
+        ini.set(sec, key, val);
+        return ini.save(path);
+    }
+
+    bool IniSetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int val)
+    {
+        return IniSetStr(path, sec, key, cfg_num(val));
+    }
+
+    void IniDelKey(const cfgstr& path, const cfgstr& sec, const cfgstr& key)
+    {
+        PosixIni ini;
+        ini.load(path);
+        ini.del_key(sec, key);
+        ini.save(path);
+    }
+
+    void IniDelSection(const cfgstr& path, const cfgstr& sec)
+    {
+        PosixIni ini;
+        ini.load(path);
+        ini.del_section(sec);
+        ini.save(path);
+    }
+
+    std::vector<cfgstr> IniSections(const cfgstr& path)
+    {
+        PosixIni ini;
+        ini.load(path);
+        return ini.sections();
+    }
+
+#endif
+
+} // namespace
+
+Config::Config(cfgstr path, cfgstr dirPath)
     : ini_path(std::move(path)), dir_path(std::move(dirPath))
 {
 }
 
 Config::~Config() = default;
 
-std::wstring Config::GetAppDataRoaming()
+cfgstr Config::GetAppDataRoaming()
 {
-    wchar_t path[MAX_PATH] = { 0 };
-    if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path) != S_OK)
+    return cfg_config_root();
+}
+
+bool Config::CreateDir(const cfgstr& dirPath)
+{
+    if (dirPath.empty())
     {
-        GetCurrentDirectoryW(MAX_PATH, path);
+        return false;
     }
-    return std::wstring(path);
+#if defined(_WIN32)
+    return ::CreateDirectoryW(dirPath.c_str(), nullptr) != 0 ||
+           ::GetLastError() == ERROR_ALREADY_EXISTS;
+#else
+    // 递归创建（~/.config 一般存在，但 XDG_CONFIG_HOME 可能是多级路径）
+    struct stat st{};
+    if (::stat(dirPath.c_str(), &st) == 0)
+    {
+        return S_ISDIR(st.st_mode);
+    }
+    for (cfgstr::size_type pos = 1; pos != cfgstr::npos;)
+    {
+        pos = dirPath.find('/', pos);
+        const cfgstr part = (pos == cfgstr::npos) ? dirPath : dirPath.substr(0, pos);
+        if (!part.empty() && ::mkdir(part.c_str(), 0755) != 0 && errno != EEXIST)
+        {
+            return false;
+        }
+        if (pos == cfgstr::npos)
+        {
+            break;
+        }
+        ++pos;
+    }
+    return ::stat(dirPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
 
-bool Config::CreateDir(const std::wstring& dirPath)
+bool Config::FileExists(const cfgstr& filePath)
 {
-    return CreateDirectoryW(dirPath.c_str(), nullptr) != 0 ||
-           GetLastError() == ERROR_ALREADY_EXISTS;
-}
-
-bool Config::FileExists(const std::wstring& filePath)
-{
-    const DWORD attr = GetFileAttributesW(filePath.c_str());
+#if defined(_WIN32)
+    const DWORD attr = ::GetFileAttributesW(filePath.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES)
     {
         return false;
     }
     // A directory is not a regular file.
     return (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+    struct stat st{};
+    return ::stat(filePath.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+#endif
 }
 
-bool Config::DirExists(const std::wstring& dirPath)
+bool Config::DirExists(const cfgstr& dirPath)
 {
-    const DWORD attr = GetFileAttributesW(dirPath.c_str());
+#if defined(_WIN32)
+    const DWORD attr = ::GetFileAttributesW(dirPath.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES)
     {
         return false;
     }
     return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat st{};
+    return ::stat(dirPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
 
-std::string Config::ReadTextFile(const std::wstring& filePath)
+std::string Config::ReadTextFile(const cfgstr& filePath)
 {
-    std::ifstream in(filePath, std::ios::binary);
+    // 用 std::filesystem::path 而不是直接传 cfgstr：
+    // std::ifstream 的 wstring 重载是 MSVC 私有扩展，libstdc++（MinGW/Linux）不认，
+    // 而 filesystem::path 是 C++17 标准，三个编译器都走同一条路
+    std::ifstream in(std::filesystem::path(filePath), std::ios::binary);
     if (!in)
     {
         return std::string();
@@ -67,58 +298,15 @@ std::string Config::ReadTextFile(const std::wstring& filePath)
     return ss.str();
 }
 
-bool Config::WriteTextFile(const std::wstring& filePath, const std::string& content)
+bool Config::WriteTextFile(const cfgstr& filePath, const std::string& content)
 {
-    std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
+    std::ofstream out(std::filesystem::path(filePath), std::ios::binary | std::ios::trunc);
     if (!out)
     {
         return false;
     }
     out.write(content.data(), static_cast<std::streamsize>(content.size()));
     return out.good();
-}
-
-std::wstring Config::ExpandEnvStr(const std::wstring& src)
-{
-    const DWORD len = ExpandEnvironmentStringsW(src.c_str(), nullptr, 0);
-    if (len == 0)
-    {
-        return src;
-    }
-    std::wstring out(len, L'\0');
-    const DWORD written = ExpandEnvironmentStringsW(src.c_str(), &out[0], len);
-    if (written > 0)
-    {
-        out.resize(written - 1); // strip the trailing null
-    }
-    return out;
-}
-
-namespace
-{
-    // Trim leading/trailing whitespace (e.g. "ServerIP=1.2.3.4 " would otherwise fail validation)
-    std::wstring TrimW(const std::wstring& s)
-    {
-        const std::size_t b = s.find_first_not_of(L" \t\r\n");
-        if (b == std::wstring::npos)
-            return std::wstring();
-        const std::size_t e = s.find_last_not_of(L" \t\r\n");
-        return s.substr(b, e - b + 1);
-    }
-
-    std::wstring ReadIniString(const std::wstring& section, const std::wstring& key,
-                               const std::wstring& defaultValue, const std::wstring& iniPath)
-    {
-        wchar_t buffer[4096] = { 0 };
-        const DWORD n = GetPrivateProfileStringW(section.c_str(), key.c_str(),
-                                                 defaultValue.c_str(), buffer, 4096, iniPath.c_str());
-        return TrimW(std::wstring(buffer, n));
-    }
-
-    bool WriteIniInt(const wchar_t* section, const wchar_t* key, int value, const std::wstring& iniPath)
-    {
-        return WritePrivateProfileStringW(section, key, std::to_wstring(value).c_str(), iniPath.c_str()) != 0;
-    }
 }
 
 bool Config::LoadClientConfig(ClientConfig& outCfg)
@@ -133,10 +321,9 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
         return SaveClientConfig(outCfg);
     }
 
-    outCfg.ServerIP = ReadIniString(L"Server", L"ServerIP", outCfg.ServerIP, ini_path);
-    outCfg.DebugServerIP = ReadIniString(L"Server", L"DebugServerIP", outCfg.DebugServerIP, ini_path);
-    outCfg.ServerPort = static_cast<int>(
-        GetPrivateProfileIntW(L"Server", L"ServerPort", outCfg.ServerPort, ini_path.c_str()));
+    outCfg.ServerIP = IniGetStr(ini_path, CS("Server"), CS("ServerIP"), outCfg.ServerIP);
+    outCfg.DebugServerIP = IniGetStr(ini_path, CS("Server"), CS("DebugServerIP"), outCfg.DebugServerIP);
+    outCfg.ServerPort = IniGetInt(ini_path, CS("Server"), CS("ServerPort"), outCfg.ServerPort);
 
     // [Server] Count=N + [ServerN] Name/IP/Port/ClientID/RegisterToken
     // 读取方式：扫描 INI 全部节名，把所有 [ServerN] 节按编号收集
@@ -146,66 +333,49 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     outCfg.servers.clear();
     std::vector<std::pair<int, ServerEntry>> found;   // (节编号, 内容)，按编号排序
 
-    wchar_t names[16384] = { 0 };   // 全部节名（双 NULL 结尾）
-    const UINT namesLen = GetPrivateProfileSectionNamesW(names, _countof(names), ini_path.c_str());
+    const std::vector<cfgstr> sections = IniSections(ini_path);
 
+    for (const auto& sec : sections)
     {
-        if (namesLen > 0)
-        {
-            for (wchar_t* p = names; *p; p += wcslen(p) + 1)
-            {
-                const std::wstring sec(p);
-                if (sec.rfind(L"Server", 0) != 0)
-                    continue;                       // 只要 [ServerN]
-                const std::wstring num = sec.substr(6);
-                if (num.empty() || num.find_first_not_of(L"0123456789") != std::wstring::npos)
-                    continue;                       // 跳过 [Server] 主节等
-                const int idx = _wtoi(num.c_str());
-                if (idx <= 0)
-                    continue;
+        if (sec.compare(0, 6, CS("Server")) != 0)
+            continue;                       // 只要 [ServerN]
+        const cfgstr num = sec.substr(6);
+        if (num.empty() || num.find_first_not_of(CS("0123456789")) != cfgstr::npos)
+            continue;                       // 跳过 [Server] 主节等
+        const int idx = CfgToInt(num, 0);
+        if (idx <= 0)
+            continue;
 
-                ServerEntry e;
-                e.Name = ReadIniString(sec.c_str(), L"Name", L"", ini_path);
-                if (e.Name.size() >= 2 && e.Name.front() == L'"' && e.Name.back() == L'"')
-                    e.Name = e.Name.substr(1, e.Name.size() - 2);   // QSettings 引号剥离
-                e.ServerIP = ReadIniString(sec.c_str(), L"ServerIP", L"", ini_path);
-                e.ServerPort = static_cast<int>(
-                    GetPrivateProfileIntW(sec.c_str(), L"ServerPort", 51820, ini_path.c_str()));
-                e.ClientID = ReadIniString(sec.c_str(), L"ClientID", outCfg.ClientID, ini_path);
-                e.RegisterToken = ReadIniString(sec.c_str(), L"RegisterToken", outCfg.RegisterToken, ini_path);
-                e.ServerPubKey = ReadIniString(sec.c_str(), L"ServerPubKey", L"", ini_path);
-                // QSettings 写入的值会带双引号（Win32 API 读取时不剥）：
-                // 引号混进 PEM 正文会污染公钥，剥掉首尾引号
-                if (e.ServerPubKey.size() >= 2 &&
-                    e.ServerPubKey.front() == L'"' && e.ServerPubKey.back() == L'"')
-                    e.ServerPubKey = e.ServerPubKey.substr(1, e.ServerPubKey.size() - 2);
-                // 传输方式：0=UDP（默认）1=TCP。
-                // 必须按字符串容错解析：原来直接用 GetPrivateProfileIntW，
-                // 手工把 ini 写成 "Transport=TCP" 时会被静默当成 0，
-                // 用户以为切了 TCP、实际一直走 UDP，日志里连一句提示都没有。
-                {
-                    std::wstring tv = ReadIniString(sec.c_str(), L"Transport", L"", ini_path);
-                    for (auto& ch : tv)
-                        ch = static_cast<wchar_t>(::towlower(ch));
-                    if (tv.empty() || tv == L"0" || tv == L"udp" || tv == L"false" || tv == L"no")
-                    {
-                        e.transport = 0;
-                    }
-                    else if (tv == L"1" || tv == L"tcp" || tv == L"true" || tv == L"yes")
-                    {
-                        e.transport = 1;
-                    }
-                    else
-                    {
-                        e.transport = 0;
-                        LOG_ERR("[Config] [%ls] Transport=%ls 无法识别（应为 udp/tcp 或 0/1），按 UDP 处理",
-                                sec.c_str(), tv.c_str());
-                    }
-                }
-                if (!e.ServerIP.empty())
-                    found.emplace_back(idx, std::move(e));
+        ServerEntry e;
+        e.Name = StripQuotes(IniGetStr(ini_path, sec, CS("Name"), CS("")));
+        e.ServerIP = IniGetStr(ini_path, sec, CS("ServerIP"), CS(""));
+        e.ServerPort = IniGetInt(ini_path, sec, CS("ServerPort"), 51820);
+        e.ClientID = IniGetStr(ini_path, sec, CS("ClientID"), outCfg.ClientID);
+        e.RegisterToken = IniGetStr(ini_path, sec, CS("RegisterToken"), outCfg.RegisterToken);
+        e.ServerPubKey = StripQuotes(IniGetStr(ini_path, sec, CS("ServerPubKey"), CS("")));
+
+        // 传输方式：0=UDP（默认）1=TCP。
+        // 必须按字符串容错解析：手工把 ini 写成 "Transport=TCP" 时不能被静默当成 0，
+        // 否则用户以为切了 TCP、实际一直走 UDP，日志里连一句提示都没有。
+        {
+            const cfgstr tv = LowerAscii(IniGetStr(ini_path, sec, CS("Transport"), CS("")));
+            if (tv.empty() || tv == CS("0") || tv == CS("udp") || tv == CS("false") || tv == CS("no"))
+            {
+                e.transport = 0;
+            }
+            else if (tv == CS("1") || tv == CS("tcp") || tv == CS("true") || tv == CS("yes"))
+            {
+                e.transport = 1;
+            }
+            else
+            {
+                e.transport = 0;
+                LOG_ERR("[Config] [%s] Transport=%s 无法识别（应为 udp/tcp 或 0/1），按 UDP 处理",
+                        cfg_to_utf8(sec).c_str(), cfg_to_utf8(tv).c_str());
             }
         }
+        if (!e.ServerIP.empty())
+            found.emplace_back(idx, std::move(e));
     }
 
     // 按节编号升序排列（保持 config.ini 里的原始顺序）
@@ -215,15 +385,14 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
 
     // 检测是否需要"连续重排"
     bool needRebuild = false;
-    const int count = static_cast<int>(
-        GetPrivateProfileIntW(L"Server", L"Count", 0, ini_path.c_str()));
+    const int count = IniGetInt(ini_path, CS("Server"), CS("Count"), 0);
     if (static_cast<int>(found.size()) != count)
     {
         needRebuild = true;
     }
     else
     {
-        for (size_t i = 0; i < found.size(); ++i)
+        for (std::size_t i = 0; i < found.size(); ++i)
         {
             if (found[i].first != static_cast<int>(i + 1))   // 期望 Server1..N 连续
             {
@@ -237,32 +406,29 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     if (needRebuild)
     {
         // 先删掉所有现有 [ServerN] 节，避免旧节编号冲突
-        if (namesLen > 0)
+        for (const auto& sec : sections)
         {
-            for (wchar_t* p = names; *p; p += wcslen(p) + 1)
-            {
-                const std::wstring sec(p);
-                if (sec.rfind(L"Server", 0) != 0)
-                    continue;
-                const std::wstring num = sec.substr(6);
-                if (num.empty() || num.find_first_not_of(L"0123456789") != std::wstring::npos)
-                    continue;
-                WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, ini_path.c_str());  // 删整节
-            }
+            if (sec.compare(0, 6, CS("Server")) != 0)
+                continue;
+            const cfgstr num = sec.substr(6);
+            if (num.empty() || num.find_first_not_of(CS("0123456789")) != cfgstr::npos)
+                continue;
+            IniDelSection(ini_path, sec);
         }
         // 连续写回 Server1..M
-        for (size_t i = 0; i < found.size(); ++i)
+        for (std::size_t i = 0; i < found.size(); ++i)
         {
-            const std::wstring sec = L"Server" + std::to_wstring(i + 1);
-            WritePrivateProfileStringW(sec.c_str(), L"Name", found[i].second.Name.c_str(), ini_path.c_str());
-            WritePrivateProfileStringW(sec.c_str(), L"ServerIP", found[i].second.ServerIP.c_str(), ini_path.c_str());
-            WriteIniInt(sec.c_str(), L"ServerPort", found[i].second.ServerPort, ini_path);
-            WriteIniInt(sec.c_str(), L"Transport", found[i].second.transport, ini_path);
-            WritePrivateProfileStringW(sec.c_str(), L"ClientID", found[i].second.ClientID.c_str(), ini_path.c_str());
-            WritePrivateProfileStringW(sec.c_str(), L"RegisterToken", found[i].second.RegisterToken.c_str(), ini_path.c_str());
-            WritePrivateProfileStringW(sec.c_str(), L"ServerPubKey", found[i].second.ServerPubKey.c_str(), ini_path.c_str());
+            const cfgstr sec = CS("Server") + cfg_num(static_cast<long long>(i + 1));
+            const ServerEntry& e = found[i].second;
+            IniSetStr(ini_path, sec, CS("Name"), e.Name);
+            IniSetStr(ini_path, sec, CS("ServerIP"), e.ServerIP);
+            IniSetInt(ini_path, sec, CS("ServerPort"), e.ServerPort);
+            IniSetInt(ini_path, sec, CS("Transport"), e.transport);
+            IniSetStr(ini_path, sec, CS("ClientID"), e.ClientID);
+            IniSetStr(ini_path, sec, CS("RegisterToken"), e.RegisterToken);
+            IniSetStr(ini_path, sec, CS("ServerPubKey"), e.ServerPubKey);
         }
-        WriteIniInt(L"Server", L"Count", static_cast<int>(found.size()), ini_path);
+        IniSetInt(ini_path, CS("Server"), CS("Count"), static_cast<int>(found.size()));
     }
 
     for (auto& f : found)
@@ -271,8 +437,7 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     if (outCfg.servers.empty() && !outCfg.ServerIP.empty())
     {
         ServerEntry e;
-        int idx = 0;
-        e.Name = L"computer" + std::to_wstring(idx++);
+        e.Name = CS("computer") + cfg_num(0);
         e.ServerIP = outCfg.ServerIP;
         e.ServerPort = outCfg.ServerPort;
         e.ClientID = outCfg.ClientID;
@@ -292,17 +457,16 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
         outCfg.ServerPubKey = outCfg.servers[0].ServerPubKey;
     }
 
-    outCfg.VirtualIP = ReadIniString(L"Network", L"VirtualIP", outCfg.VirtualIP, ini_path);
-    outCfg.VirtualPrefix = static_cast<int>(
-        GetPrivateProfileIntW(L"Network", L"VirtualPrefix", outCfg.VirtualPrefix, ini_path.c_str()));
-    outCfg.DNS = ReadIniString(L"Network", L"DNS", outCfg.DNS, ini_path);
+    outCfg.VirtualIP = IniGetStr(ini_path, CS("Network"), CS("VirtualIP"), outCfg.VirtualIP);
+    outCfg.VirtualPrefix = IniGetInt(ini_path, CS("Network"), CS("VirtualPrefix"), outCfg.VirtualPrefix);
+    outCfg.DNS = IniGetStr(ini_path, CS("Network"), CS("DNS"), outCfg.DNS);
     outCfg.MTU = static_cast<uint32_t>(
-        GetPrivateProfileIntW(L"Network", L"MTU", static_cast<int>(outCfg.MTU), ini_path.c_str()));
+        IniGetInt(ini_path, CS("Network"), CS("MTU"), static_cast<int>(outCfg.MTU)));
     outCfg.Metric = static_cast<uint8_t>(
-        GetPrivateProfileIntW(L"Network", L"Metric", outCfg.Metric, ini_path.c_str()));
+        IniGetInt(ini_path, CS("Network"), CS("Metric"), outCfg.Metric));
 
-    outCfg.ClientID = ReadIniString(L"Identity", L"ClientID", outCfg.ClientID, ini_path);
-    outCfg.RegisterToken = ReadIniString(L"Identity", L"RegisterToken", outCfg.RegisterToken, ini_path);
+    outCfg.ClientID = IniGetStr(ini_path, CS("Identity"), CS("ClientID"), outCfg.ClientID);
+    outCfg.RegisterToken = IniGetStr(ini_path, CS("Identity"), CS("RegisterToken"), outCfg.RegisterToken);
 
     return true;
 }
@@ -321,59 +485,52 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
     bool ok = true;
 
     //多服务器列表：[Server] Count + [ServerN] 节（每台含各自身份）
-    ok &= WriteIniInt(L"Server", L"Count", static_cast<int>(cfg.servers.size()), ini_path);
-    for (size_t i = 0; i < cfg.servers.size(); ++i)
+    ok &= IniSetInt(ini_path, CS("Server"), CS("Count"), static_cast<int>(cfg.servers.size()));
+    for (std::size_t i = 0; i < cfg.servers.size(); ++i)
     {
-        const std::wstring sec = L"Server" + std::to_wstring(i + 1);
-        ok &= WritePrivateProfileStringW(sec.c_str(), L"Name", cfg.servers[i].Name.c_str(), ini_path.c_str()) != 0;
-        ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerIP", cfg.servers[i].ServerIP.c_str(), ini_path.c_str()) != 0;
-        ok &= WriteIniInt(sec.c_str(), L"ServerPort", cfg.servers[i].ServerPort, ini_path);
-        ok &= WriteIniInt(sec.c_str(), L"Transport", cfg.servers[i].transport, ini_path);
+        const cfgstr sec = CS("Server") + cfg_num(static_cast<long long>(i + 1));
+        const ServerEntry& e = cfg.servers[i];
+        ok &= IniSetStr(ini_path, sec, CS("Name"), e.Name);
+        ok &= IniSetStr(ini_path, sec, CS("ServerIP"), e.ServerIP);
+        ok &= IniSetInt(ini_path, sec, CS("ServerPort"), e.ServerPort);
+        ok &= IniSetInt(ini_path, sec, CS("Transport"), e.transport);
         // 每台服务器各自的认证身份 + 服务器公钥
-        ok &= WritePrivateProfileStringW(sec.c_str(), L"ClientID", cfg.servers[i].ClientID.c_str(), ini_path.c_str()) != 0;
-        ok &= WritePrivateProfileStringW(sec.c_str(), L"RegisterToken", cfg.servers[i].RegisterToken.c_str(), ini_path.c_str()) != 0;
-        ok &= WritePrivateProfileStringW(sec.c_str(), L"ServerPubKey", cfg.servers[i].ServerPubKey.c_str(), ini_path.c_str()) != 0;
+        ok &= IniSetStr(ini_path, sec, CS("ClientID"), e.ClientID);
+        ok &= IniSetStr(ini_path, sec, CS("RegisterToken"), e.RegisterToken);
+        ok &= IniSetStr(ini_path, sec, CS("ServerPubKey"), e.ServerPubKey);
     }
 
     //[Network]
-    ok &= WritePrivateProfileStringW(L"Network", L"VirtualIP", cfg.VirtualIP.c_str(), ini_path.c_str()) != 0;
-    ok &= WriteIniInt(L"Network", L"VirtualPrefix", cfg.VirtualPrefix, ini_path);
-    ok &= WritePrivateProfileStringW(L"Network", L"DNS", cfg.DNS.c_str(), ini_path.c_str()) != 0;
-    ok &= WriteIniInt(L"Network", L"MTU", static_cast<int>(cfg.MTU), ini_path);
-    ok &= WriteIniInt(L"Network", L"Metric", cfg.Metric, ini_path);
+    ok &= IniSetStr(ini_path, CS("Network"), CS("VirtualIP"), cfg.VirtualIP);
+    ok &= IniSetInt(ini_path, CS("Network"), CS("VirtualPrefix"), cfg.VirtualPrefix);
+    ok &= IniSetStr(ini_path, CS("Network"), CS("DNS"), cfg.DNS);
+    ok &= IniSetInt(ini_path, CS("Network"), CS("MTU"), static_cast<int>(cfg.MTU));
+    ok &= IniSetInt(ini_path, CS("Network"), CS("Metric"), cfg.Metric);
 
-    //多服务器模式下信息已由 [ServerN] 承载）
-    // WritePrivateProfileStringW 传 nullptr 值 = 删除该键
-    WritePrivateProfileStringW(L"Server", L"ServerIP", nullptr, ini_path.c_str());
-    WritePrivateProfileStringW(L"Server", L"DebugServerIP", nullptr, ini_path.c_str());
-    WritePrivateProfileStringW(L"Server", L"ServerPort", nullptr, ini_path.c_str());
-    WritePrivateProfileStringW(L"Identity", L"ClientID", nullptr, ini_path.c_str());
-    WritePrivateProfileStringW(L"Identity", L"RegisterToken", nullptr, ini_path.c_str());
+    // 多服务器模式下信息已由 [ServerN] 承载，主节/身份节的旧键清掉
+    IniDelKey(ini_path, CS("Server"), CS("ServerIP"));
+    IniDelKey(ini_path, CS("Server"), CS("DebugServerIP"));
+    IniDelKey(ini_path, CS("Server"), CS("ServerPort"));
+    IniDelKey(ini_path, CS("Identity"), CS("ClientID"));
+    IniDelKey(ini_path, CS("Identity"), CS("RegisterToken"));
 
     // 删除服务器后清理残留的旧 [ServerN] 节：
     // 例如从 3 台删到 2 台，[Server3] 仍留在 ini 里，下次 Count 会拿到脏数据。
-    // 这里枚举全部节名，把编号大于 servers.size() 的 [ServerN] 整体删除。
     {
-        wchar_t names[16384] = { 0 };   // 所有节名（双 NULL 结尾）
-        const UINT namesLen = GetPrivateProfileSectionNamesW(names, _countof(names), ini_path.c_str());
-        if (namesLen > 0)
+        const std::vector<cfgstr> sections = IniSections(ini_path);
+        const std::size_t maxOk = cfg.servers.size();
+        for (const auto& sec : sections)
         {
-            const size_t maxOk = cfg.servers.size();
-            for (wchar_t* p = names; *p; p += wcslen(p) + 1)
-            {
-                const std::wstring sec(p);
-                if (sec.rfind(L"Server", 0) != 0)
-                    continue;
-                // 仅处理形如 Server<数字> 的节；跳过 Server 主节本身
-                const std::wstring num = sec.substr(6);
-                if (num.empty() || num.find_first_not_of(L"0123456789") != std::wstring::npos)
-                    continue;
-                const int idx = _wtoi(num.c_str());
-                if (idx <= 0 || static_cast<size_t>(idx) <= maxOk)
-                    continue;
-                // 删除多余节（key 传 nullptr = 删整个节）
-                WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, ini_path.c_str());
-            }
+            if (sec.compare(0, 6, CS("Server")) != 0)
+                continue;
+            // 仅处理形如 Server<数字> 的节；跳过 Server 主节本身
+            const cfgstr num = sec.substr(6);
+            if (num.empty() || num.find_first_not_of(CS("0123456789")) != cfgstr::npos)
+                continue;
+            const int idx = CfgToInt(num, 0);
+            if (idx <= 0 || static_cast<std::size_t>(idx) <= maxOk)
+                continue;
+            IniDelSection(ini_path, sec);
         }
     }
     return ok;

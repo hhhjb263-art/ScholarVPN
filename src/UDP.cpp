@@ -74,7 +74,7 @@ bool generate_ephemeral_x25519(EVP_PKEY*& priv_out, std::vector<uint8_t>& pub_ou
 } // namespace
 
 UDP::UDP(const char* remoteip, uint16_t port, bool is_running, size_t queueMax) :
-	m_sock(INVALID_SOCKET), m_sendqueue(queueMax), m_recvqueue(queueMax)
+	m_sock(SOCK_INVALID), m_sendqueue(queueMax), m_recvqueue(queueMax)
 {
 	memset(&m_sockaddr, 0, sizeof(m_sockaddr));
 	m_sockaddr.sin_family = AF_INET;
@@ -96,11 +96,11 @@ UDP::~UDP()
 		EVP_PKEY_free(m_server_sig_pub);
 		m_server_sig_pub = nullptr;
 	}
-	if (m_sock != INVALID_SOCKET) {
-		closesocket(m_sock);
-		m_sock = INVALID_SOCKET;
+	if (m_sock != SOCK_INVALID) {
+		sock_close(m_sock);
+		m_sock = SOCK_INVALID;
 	}
-	WSACleanup();
+	sock_runtime_stop();
 }
 
 bool UDP::init()
@@ -108,16 +108,16 @@ bool UDP::init()
 	if (m_running.load() || send_thread.joinable() || recv_thread.joinable()) {
 		return false; // 已经初始化过了, 避免重复创建线程/泄漏 socket
 	}
-	WSADATA wsa;
-	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+	// socket 运行时（Windows 需要 WSAStartup，Linux 空实现；内部引用计数）
+	if (!sock_runtime_start()) {
 		return false;
 	}
 	// 传输差异全部走钩子：基类实现 = UDP；TCP 子类覆写 open_socket/establish
 	const char* tname = (proto_version() == static_cast<uint8_t>(v_tcp)) ? "TCP" : "UDP";
 	m_sock = open_socket();
-	if (m_sock == INVALID_SOCKET) {
-		LOG_ERR("[%s] socket() 创建失败: WSA=%d\n", tname, WSAGetLastError());
-		WSACleanup();
+	if (m_sock == SOCK_INVALID) {
+		LOG_ERR("[%s] socket() 创建失败: WSA=%d\n", tname, sock_last_error());
+		sock_runtime_stop();
 		return false;
 	}
 	// 放大收发缓冲：Windows 默认 8KB，突发流量下 UDP 直接丢包、
@@ -134,12 +134,12 @@ bool UDP::init()
 		// 具体原因已由 establish()（TCP 为 connect 失败分类）打印；
 		// 这里补上"哪个传输、连的哪个地址"，否则上层只能看到"UDP init 失败"
 		char ipbuf[INET_ADDRSTRLEN] = { 0 };
-		::InetNtopA(AF_INET, &m_sockaddr.sin_addr, ipbuf, sizeof(ipbuf));
+		sock_ntop(m_sockaddr.sin_addr, ipbuf, sizeof(ipbuf));
 		LOG_ERR("[%s] 建立隧道失败：%s:%u（详见上一行原因）\n",
 			tname, ipbuf, ntohs(m_sockaddr.sin_port));
-		closesocket(m_sock);
-		m_sock = INVALID_SOCKET;
-		WSACleanup();
+		sock_close(m_sock);
+		m_sock = SOCK_INVALID;
+		sock_runtime_stop();
 		return false;
 	}
 
@@ -189,9 +189,9 @@ bool UDP::init()
 	}
 	catch (const std::exception& e) {
 		LOG_ERR("[UDP] 无法解析服务器身份公钥 SIG_SRV_PUB: %s\n", e.what());
-		closesocket(m_sock);
-		m_sock = INVALID_SOCKET;
-		WSACleanup();
+		sock_close(m_sock);
+		m_sock = SOCK_INVALID;
+		sock_runtime_stop();
 		return false;
 	}
 
@@ -210,9 +210,9 @@ void UDP::stop()
 	m_sendqueue.shutdown();
 	m_recvqueue.shutdown();
 	// 先关闭 socket，让阻塞在 recvfrom 上的接收线程立即返回，再回收线程，避免 stop 卡死
-	if (m_sock != INVALID_SOCKET) {
-		closesocket(m_sock);
-		m_sock = INVALID_SOCKET;
+	if (m_sock != SOCK_INVALID) {
+		sock_close(m_sock);
+		m_sock = SOCK_INVALID;
 	}
 	if (send_thread.joinable())
 		send_thread.join();
@@ -374,7 +374,7 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 }
 
 // ---- 基类传输钩子的 UDP 实现 ----
-SOCKET UDP::open_socket()
+sock_t UDP::open_socket()
 {
 	return socket(AF_INET, SOCK_DGRAM, 0);
 }
@@ -389,9 +389,9 @@ bool UDP::raw_send(const uint8_t* data, size_t len)
 {
 	int ret = sendto(m_sock, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
 		reinterpret_cast<const sockaddr*>(&m_sockaddr), sizeof(m_sockaddr));
-	if (ret == SOCKET_ERROR) {
+	if (ret == SOCK_ERR) {
 		// 对端端口不可达，标记隧道需要重连
-		if (WSAGetLastError() == WSAECONNRESET)
+		if (sock_last_error() == kSockConnReset)
 			m_need_reconnect.store(true);
 		return false;
 	}
@@ -404,8 +404,8 @@ bool UDP::recv_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_le
 {
 	m_udpBuf.resize(KMax_packet_size);
 	sockaddr_in peer_addr{};
-	int peer_len = static_cast<int>(sizeof(peer_addr));
-	int ret = recvfrom(m_sock, reinterpret_cast<char*>(m_udpBuf.data()),
+	sock_len_t peer_len = static_cast<sock_len_t>(sizeof(peer_addr));
+	sock_ssize_t ret = recvfrom(m_sock, reinterpret_cast<char*>(m_udpBuf.data()),
 		static_cast<int>(m_udpBuf.size()), 0,
 		reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
 	if (ret <= 0) {
@@ -422,8 +422,8 @@ bool UDP::recv_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_le
 	{
 		char src_buf[INET_ADDRSTRLEN] = { 0 };
 		char dst_buf[INET_ADDRSTRLEN] = { 0 };
-		::InetNtopA(AF_INET, &peer_addr.sin_addr, src_buf, sizeof(src_buf));
-		::InetNtopA(AF_INET, &m_sockaddr.sin_addr, dst_buf, sizeof(dst_buf));
+		sock_ntop(peer_addr.sin_addr, src_buf, sizeof(src_buf));
+		sock_ntop(m_sockaddr.sin_addr, dst_buf, sizeof(dst_buf));
 		LOG_DBG("[UDP] 丢弃非目标服务器报文: %s:%u (期望 %s:%u)\n",
 			src_buf, ntohs(peer_addr.sin_port),
 			dst_buf, ntohs(m_sockaddr.sin_port));
@@ -727,7 +727,7 @@ void UDP::send_work()
 		if (!send_packet(static_cast<uint8_t>(m_data), buf.get_data(), paysize, sendbuf)) {
 			// 瞬时发送失败（本地缓冲满/瞬时错误）≠ 断线：丢当前包继续，
 			// 由上层 TCP/应用重传兜底。对端真正不可达（ICMP 端口不可达
-			// WSAECONNRESET / TCP 对端关闭）已由 raw_send 置 need_reconnect，
+			// kSockConnReset / TCP 对端关闭）已由 raw_send 置 need_reconnect，
 			// 下一轮循环自然退出——避免高速突发时误判断线导致反复重连降速。
 			buf.clear();
 			continue;

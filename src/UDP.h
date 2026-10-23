@@ -75,7 +75,7 @@ public:
     void recv_work();   // 收包循环：recv_frame 取一条消息 -> handle_frame 统一处理
 protected:
     // ---- 传输钩子（子类覆写；基类实现 = UDP）----
-    virtual SOCKET open_socket();      // UDP: SOCK_DGRAM；TCP: SOCK_STREAM
+    virtual sock_t open_socket();      // UDP: SOCK_DGRAM；TCP: SOCK_STREAM
     virtual bool establish();          // UDP: 无连接 no-op；TCP: connect + TCP_NODELAY
     virtual bool raw_send(const uint8_t* data, size_t len);   // UDP: sendto；TCP: send_all
     // 取一条完整消息（数据报天然一条；TCP 由子类分帧凑齐）
@@ -87,7 +87,7 @@ private:
     // 阶段3：组装并签名身份报文（不含内层 type 字节，send_packet 会补）
     bool build_identity_message(std::vector<uint8_t>& out);
 protected:
-    SOCKET m_sock;
+    sock_t m_sock;
     sockaddr_in m_sockaddr{};
     std::vector<uint8_t> m_udpBuf;                // UDP recvfrom 缓冲（成员保证 payload 指针有效）
     std::mutex m_send_mutex;                      // 串行化 send_packet 的 socket 写：

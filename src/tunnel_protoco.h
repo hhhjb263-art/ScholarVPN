@@ -1,8 +1,6 @@
 #pragma once
 #include <cstdint>
-#include <winsock2.h>
-#include <WS2tcpip.h>
-#pragma comment(lib,"ws2_32.lib")
+#include "platform/sock_compat.h"   // htons/htonl（Windows 走 winsock2，Linux 走 netinet）
 
 #pragma pack(push,1)
 struct tunnel_header

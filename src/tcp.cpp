@@ -18,31 +18,31 @@ namespace {
 void log_connect_error(const char* ip, unsigned port, int err)
 {
 	switch (err) {
-	case WSAECONNREFUSED:
+	case kSockConnRefused:
 		LOG_ERR("[TCP] connect %s:%u 被拒绝（RST）——服务端没有监听 TCP：\n"
 			"      ① 服务端是否以 --transport both 或 tcp 启动（默认 both）；\n"
 			"      ② 端口是否被其他进程占用；\n"
 			"      ③ 中间设备主动回 RST（部分企业网关/运营商对非 443 端口的 TCP 直接拒绝）\n",
 			ip, port);
 		break;
-	case WSAETIMEDOUT:
+	case kSockTimedOut:
 		LOG_ERR("[TCP] connect %s:%u 超时——SYN 无响应：\n"
 			"      防火墙/安全组只放行了 UDP，或该端口 TCP 被丢包（非 RST）\n",
 			ip, port);
 		break;
-	case WSAENETUNREACH:
-	case WSAEHOSTUNREACH:
-		LOG_ERR("[TCP] connect %s:%u 不可达（WSA=%d）：本机没有到该地址的路由，"
+	case kSockNetUnreach:
+	case kSockHostUnreach:
+		LOG_ERR("[TCP] connect %s:%u 不可达（err=%d）：本机没有到该地址的路由，"
 			"或服务器 bypass 路由缺失（隧道已建立时可能把 SYN 送进了隧道）\n", ip, port, err);
 		break;
-	case WSAEADDRNOTAVAIL:
-		LOG_ERR("[TCP] connect %s:%u 源地址不可用（WSA=%d）\n", ip, port, err);
+	case kSockAddrNotAvail:
+		LOG_ERR("[TCP] connect %s:%u 源地址不可用（err=%d）\n", ip, port, err);
 		break;
-	case WSAEHOSTDOWN:
-		LOG_ERR("[TCP] connect %s:%u 主机已关闭（WSA=%d）\n", ip, port, err);
+	case kSockHostDown:
+		LOG_ERR("[TCP] connect %s:%u 主机已关闭（err=%d）\n", ip, port, err);
 		break;
 	default:
-		LOG_ERR("[TCP] connect %s:%u 失败，WSA 错误码=%d\n", ip, port, err);
+		LOG_ERR("[TCP] connect %s:%u 失败，err=%d\n", ip, port, err);
 		break;
 	}
 }
@@ -51,7 +51,7 @@ void log_connect_error(const char* ip, unsigned port, int err)
 void format_peer(const sockaddr_in& addr, char* out, size_t cap, unsigned& port)
 {
 	char ip[INET_ADDRSTRLEN] = { 0 };
-	::InetNtopA(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+	sock_ntop(addr.sin_addr, ip, sizeof(ip));
 	port = ntohs(addr.sin_port);
 	snprintf(out, cap, "%s", ip);
 }
@@ -71,7 +71,7 @@ uint8_t TCP::proto_version() const
 }
 
 // TCP：流式 socket（具体连接在 establish 里做）
-SOCKET TCP::open_socket()
+sock_t TCP::open_socket()
 {
 	return socket(AF_INET, SOCK_STREAM, 0);
 }
@@ -89,38 +89,38 @@ bool TCP::establish()
 	unsigned port = 0;
 	format_peer(m_sockaddr, ip, sizeof(ip), port);
 
-	u_long nonblock = 1;
-	if (ioctlsocket(m_sock, FIONBIO, &nonblock) == SOCKET_ERROR) {
-		LOG_ERR("[TCP] ioctlsocket(FIONBIO) 失败: WSA=%d\n", WSAGetLastError());
+	if (!sock_set_nonblocking(m_sock)) {
+		LOG_ERR("[TCP] 设置非阻塞失败: err=%d\n", sock_last_error());
 		return false;
 	}
-	if (connect(m_sock, reinterpret_cast<sockaddr*>(&m_sockaddr), sizeof(m_sockaddr)) == SOCKET_ERROR) {
-		const int err = WSAGetLastError();
-		if (err != WSAEWOULDBLOCK) {
+	if (connect(m_sock, reinterpret_cast<sockaddr*>(&m_sockaddr), sizeof(m_sockaddr)) == SOCK_ERR) {
+		const int err = sock_last_error();
+		if (err != kSockInProgress) {
 			log_connect_error(ip, port, err);
 			return false;
 		}
-		fd_set wset;
-		FD_ZERO(&wset);
-		FD_SET(m_sock, &wset);
-		timeval tv{ 4, 0 };
-		const int sel = select(0, nullptr, &wset, nullptr, &tv);
-		if (sel == SOCKET_ERROR) {
-			LOG_ERR("[TCP] connect %s:%u 等待可写时 select 失败: WSA=%d\n",
-				ip, port, WSAGetLastError());
+		// 用 poll 而不是 select：Windows 的 select 首个参数必须为 0（忽略），
+		// fd_set 在两端布局也不同；poll 的语义两端一致
+		sock_pollfd pfd{};
+		pfd.fd = m_sock;
+		pfd.events = POLLOUT;
+		const int sel = sock_poll(&pfd, 1, 4000);   // 4s 连接超时
+		if (sel == SOCK_ERR) {
+			LOG_ERR("[TCP] connect %s:%u 等待可写时 poll 失败: err=%d\n",
+				ip, port, sock_last_error());
 			return false;
 		}
 		if (sel == 0) {
 			// 4s 内既没成功也没失败 = SYN 被静默丢弃：几乎总是放行规则/端口问题
-			log_connect_error(ip, port, WSAETIMEDOUT);
+			log_connect_error(ip, port, kSockTimedOut);
 			return false;
 		}
 		int soerr = 0;
-		int slen = sizeof(soerr);
+		sock_len_t slen = static_cast<sock_len_t>(sizeof(soerr));
 		if (getsockopt(m_sock, SOL_SOCKET, SO_ERROR,
-			reinterpret_cast<char*>(&soerr), &slen) == SOCKET_ERROR) {
-			LOG_ERR("[TCP] connect %s:%u 后 getsockopt(SO_ERROR) 失败: WSA=%d\n",
-				ip, port, WSAGetLastError());
+			reinterpret_cast<char*>(&soerr), &slen) == SOCK_ERR) {
+			LOG_ERR("[TCP] connect %s:%u 后 getsockopt(SO_ERROR) 失败: err=%d\n",
+				ip, port, sock_last_error());
 			return false;
 		}
 		if (soerr != 0) {
@@ -128,12 +128,12 @@ bool TCP::establish()
 			return false;
 		}
 	}
-	BOOL nodelay = TRUE;
+	int nodelay = 1;
 	if (setsockopt(m_sock, IPPROTO_TCP, TCP_NODELAY,
-		reinterpret_cast<const char*>(&nodelay), sizeof(nodelay)) == SOCKET_ERROR) {
+		reinterpret_cast<const char*>(&nodelay), sizeof(nodelay)) == SOCK_ERR) {
 		// 非致命：Nagle 未关只是延迟变差，不该因此判定连接失败
-		LOG_ERR("[TCP] 设置 TCP_NODELAY 失败: WSA=%d（继续，但小包延迟会变高）\n",
-			WSAGetLastError());
+		LOG_ERR("[TCP] 设置 TCP_NODELAY 失败: err=%d（继续，但小包延迟会变高）\n",
+			sock_last_error());
 	}
 	// 收发缓冲已在 UDP::init() 里统一放大（8MB）：这里不再重复设置，
 	// 否则后写的值会覆盖前面的，两个数字互相打脸
@@ -154,21 +154,21 @@ bool TCP::raw_send(const uint8_t* data, size_t len)
 	size_t off = 0;
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
 	while (off < len) {
-		int n = send(m_sock, reinterpret_cast<const char*>(data + off),
+		sock_ssize_t n = send(m_sock, reinterpret_cast<const char*>(data + off),
 			static_cast<int>(len - off), 0);
-		if (n == SOCKET_ERROR) {
-			int err = WSAGetLastError();
-			if (err == WSAEWOULDBLOCK) {
+		if (n == SOCK_ERR) {
+			int err = sock_last_error();
+			if (err == kSockWouldBlock) {
 				// 缓冲满：等 socket 可写后重试；总时长超限放弃本帧
 				if (std::chrono::steady_clock::now() >= deadline) {
 					LOG_ERR("[TCP] send 持续 1s 不可写（对端窗口关闭/消费不动），放弃本帧\n");
 					return false;
 				}
-				WSAPOLLFD pfd{};
+				sock_pollfd pfd{};
 				pfd.fd = m_sock;
 				pfd.events = POLLOUT;
-				const int pr = WSAPoll(&pfd, 1, 20);
-				if (pr == SOCKET_ERROR) {
+				const int pr = sock_poll(&pfd, 1, 20);
+				if (pr == SOCK_ERR) {
 					m_need_reconnect.store(true);
 					return false;
 				}
@@ -181,7 +181,7 @@ bool TCP::raw_send(const uint8_t* data, size_t len)
 			// 流式 socket 上 send 失败基本等于连接已死亡（对端关闭/重置/
 			// RST/连接被断开），统一标记重连——否则发送线程会一直空转，
 			// 数据面"只发不收"的场景要拖到心跳超时才发现断线
-			LOG_ERR("[TCP] send 失败: WSA=%d，标记重连\n", err);
+			LOG_ERR("[TCP] send 失败: err=%d，标记重连\n", err);
 			m_need_reconnect.store(true);
 			return false;
 		}
@@ -289,12 +289,12 @@ bool TCP::recv_frame(tunnel_header& hdr, const uint8_t*& payload,
 		if (!m_running.load()) {
 			return true;    // stop()：外层循环回到条件检查后退出
 		}
-		WSAPOLLFD pfd{};
+		sock_pollfd pfd{};
 		pfd.fd = m_sock;
 		pfd.events = POLLIN;
-		const int pr = WSAPoll(&pfd, 1, 200);
-		if (pr == SOCKET_ERROR) {
-			LOG_ERR("[TCP] poll 失败: %d，标记重连\n", WSAGetLastError());
+		const int pr = sock_poll(&pfd, 1, 200);
+		if (pr == SOCK_ERR) {
+			LOG_ERR("[TCP] poll 失败: %d，标记重连\n", sock_last_error());
 			m_need_reconnect.store(true);
 			return false;
 		}
@@ -318,15 +318,15 @@ bool TCP::recv_frame(tunnel_header& hdr, const uint8_t*& payload,
 
 	// ③ recv 一大块数据入缓冲
 	uint8_t tmp[16 * 1024];
-	int n = recv(m_sock, reinterpret_cast<char*>(tmp), static_cast<int>(sizeof(tmp)), 0);
+	sock_ssize_t n = recv(m_sock, reinterpret_cast<char*>(tmp), static_cast<int>(sizeof(tmp)), 0);
 	if (n == 0) {           // 对端优雅关闭（FIN）
 		LOG_INFO("[TCP] 对端已关闭连接（收到 FIN），标记重连");
 		m_need_reconnect.store(true);
 		return false;
 	}
 	if (n < 0) {
-		int err = WSAGetLastError();
-		if (err == WSAEWOULDBLOCK) {
+		int err = sock_last_error();
+		if (err == kSockWouldBlock) {
 			// 与 poll 结果的竞态窗口内数据被取走：直接回到外层循环，不 sleep
 			return true;
 		}

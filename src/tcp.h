@@ -27,7 +27,7 @@ public:
 
 protected:
     // ---- 传输钩子（基类声明，此处覆写）----
-    SOCKET open_socket() override;      // SOCK_STREAM（连接在 establish 里做）
+    sock_t open_socket() override;      // SOCK_STREAM（连接在 establish 里做）
     bool establish() override;          // 非阻塞 connect + 4s 超时 + TCP_NODELAY
     bool raw_send(const uint8_t* data, size_t len) override;   // send_all 循环写
     bool recv_frame(tunnel_header& hdr, const uint8_t*& payload,

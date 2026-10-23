@@ -2,8 +2,13 @@
 // main.cpp —— Qt 入口：创建 QApplication 并显示主窗口
 // ============================================================================
 
+#if defined(_WIN32)
 #include <winsock2.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#endif
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -16,9 +21,11 @@ int main(int argc, char* argv[])
 {
     QApplication a(argc, argv);
 
+#if defined(_WIN32)
     // 控制台输出统一为 UTF-8（Logger 输出的中文在 GBK 控制台会乱码）
     ::SetConsoleOutputCP(CP_UTF8);
     ::SetConsoleCP(CP_UTF8);
+#endif
 
     // 加载全局样式表（exe 同目录 style.qss；用 exe 目录而非工作目录，
     // 避免 VS 调试/管理员运行时 cwd 不同导致读不到文件）

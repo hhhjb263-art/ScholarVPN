@@ -13,10 +13,15 @@
 #include <memory>
 #include <functional>
 
+#if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
 #include <wincrypt.h>
+#endif
 
 #include "../UDP.h"
 #include "../tun.h"
@@ -28,8 +33,10 @@
 #include "../reconnect_manager.h"
 #include "../DnsLeakGuard.h"
 
+#if defined(_WIN32)
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Crypt32.lib")
+#endif
 
 // 客户端核心逻辑封装（纯 C++，无 Qt）：
 //   init()  → 一次性初始化（config / 身份密钥 / 网卡 / 路由）
@@ -79,8 +86,8 @@ private:
 	void udp_to_tun_loop();        
 
 	ClientConfig m_cfg;
-	std::wstring m_configPath;          // config.ini 完整路径
-	std::wstring m_configDir; 
+	cfgstr m_configPath;                // config.ini 完整路径（Windows=wstring / Linux=UTF-8）
+	cfgstr m_configDir;
 
 	std::shared_ptr<EVP_PKEY> m_ed25519Priv;
 	std::string m_serverSigPubPem;
@@ -90,7 +97,7 @@ private:
 	uint16_t m_port = 0;
 
 	// 以下的成员持有保证生命周期
-	std::unique_ptr<WintunTun> m_tun;
+	std::unique_ptr<ITunDevice> m_tun;   // Win: WintunTun / Linux: LinuxTun（create_tun_device）
 	std::unique_ptr<AdapterConfig> m_adapter;
 	std::unique_ptr<RouteManager> m_route;
 	std::unique_ptr<ReconnectManager> m_mgr;

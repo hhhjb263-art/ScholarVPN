@@ -1,3 +1,5 @@
+#if defined(_WIN32)
+
 #define NTDDI_VERSION NTDDI_WIN10
 #define _WIN32_WINNT _WIN32_WINNT_WIN10
 
@@ -6,10 +8,10 @@
 #include "AdapterConfig.h"
 #include <icmpapi.h>
 #pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "Iphlpapi.lib") 
+#pragma comment(lib, "Iphlpapi.lib")
 
 namespace {
-	bool parse(const std::wstring& text, IN_ADDR* output) {
+	bool parse(const cfgstr& text, IN_ADDR* output) {
 		*output = {};
 		 const int  result = ::InetPtonW(AF_INET,text.c_str(),output);
 		 // 1 = 转换成功
@@ -18,9 +20,11 @@ namespace {
 		 return result == 1;
 	}
 }
-AdapterConfig::AdapterConfig(NET_LUID interfaceLuid): m_interfaceLuid(interfaceLuid) {
+
+AdapterConfig::AdapterConfig(tun_id_t interfaceId) : m_id(interfaceId) {
 
 }
+
 /*
  * @brief       为Wintun虚拟网卡配置静态IPv4单播地址
  * @param ipAddress    宽字符串IPv4地址（如 L"10.0.10.2"）
@@ -31,33 +35,29 @@ AdapterConfig::AdapterConfig(NET_LUID interfaceLuid): m_interfaceLuid(interfaceL
  * 2. 将字符串IP转为系统内核识别的二进制网络序IP
  * 3. 填充网卡IP配置结构体，调用系统API写入静态IPv4地址
  */
-
-bool AdapterConfig::set_IPv4_address(const std::wstring& ipAddress, uint8_t prefixLength)
-{	
-	if (m_interfaceLuid.Value == 0 || ipAddress.empty() || prefixLength > 32) {
+bool AdapterConfig::set_IPv4_address(const cfgstr& ipAddress, uint8_t prefixLength)
+{
+	if (m_id.Value == 0 || ipAddress.empty() || prefixLength > 32) {
 		LOG_ERROR("set_IPv4_address failed");
 		return false;
 	}
     // https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_unicastipaddress_row
     MIB_UNICASTIPADDRESS_ROW row{};
-    // Initialize to safe defaults if available
     ::InitializeUnicastIpAddressEntry(&row);
 
-    // Fill required fields for IPv4
-    row.InterfaceLuid = m_interfaceLuid;
+    row.InterfaceLuid = m_id;
     row.OnLinkPrefixLength = prefixLength;
 
-    // Populate IPv4 socket address part
     row.Address.Ipv4.sin_family = AF_INET;;
     if (!parse(ipAddress, &(row.Address.Ipv4.sin_addr))) {
-        LOG_ERROR("set_IPv4_address: parse ip failed %ls", ipAddress.c_str());
+        LOG_ERROR("set_IPv4_address: parse ip failed %s", cfg_to_utf8(ipAddress).c_str());
         return false;
     }
     //手动配置ip
     row.PrefixOrigin = IpPrefixOriginManual;
     row.SuffixOrigin = IpSuffixOriginManual;
 
-    const NETIO_STATUS  status = CreateUnicastIpAddressEntry(&row); //指定网卡创建/写入静态IPv4单播地址
+    const NETIO_STATUS  status = CreateUnicastIpAddressEntry(&row);
     if (status == NO_ERROR) {
         LOG_INFO("CreateUnicastIpAddressEntry success err=%lu", status);
         return true;
@@ -72,15 +72,16 @@ bool AdapterConfig::set_IPv4_address(const std::wstring& ipAddress, uint8_t pref
     LOG_ERROR("CreateUnicastIpAddressEntry failed status=%lu", status);
     return false;
 }
-bool AdapterConfig::remove_IPv4_address(const std::wstring &ipAdress, uint8_t prefixLenth) {
+
+bool AdapterConfig::remove_IPv4_address(const cfgstr& ipAdress, uint8_t prefixLenth) {
     DWORD err = GetLastError();
-    if (m_interfaceLuid.Value == 0 || ipAdress.empty() || prefixLenth > 32) {
+    if (m_id.Value == 0 || ipAdress.empty() || prefixLenth > 32) {
         LOG_ERROR("remove_IPv4_address failed , err = %lu",err);
         return false;
     }
     MIB_UNICASTIPADDRESS_ROW row{};
     ::InitializeUnicastIpAddressEntry(&row);
-    row.InterfaceLuid = m_interfaceLuid;
+    row.InterfaceLuid = m_id;
     row.OnLinkPrefixLength = prefixLenth;
     row.Address.Ipv4.sin_family = AF_INET;
 
@@ -96,9 +97,6 @@ bool AdapterConfig::remove_IPv4_address(const std::wstring &ipAdress, uint8_t pr
         LOG_INFO("DeleteUnicastIpAddressEntry success err=%lu", status);
         return true;
     }
-    /*
-        成功返回true
-    */
     if (status == ERROR_OBJECT_ALREADY_EXISTS) {
         return true;
     }
@@ -117,12 +115,10 @@ bool AdapterConfig::remove_IPv4_address(const std::wstring &ipAdress, uint8_t pr
  *
  * keepIpv4 = 本次要用的地址：已在网卡上就不删（不退掉再重加，避免"删了加不回来"的
  * 窗口）；只清其它残留。传空串 = 全清。
- * 实现：GetUnicastIpAddressTable 枚举本机全部 IPv4 单播地址，按 InterfaceLuid
- * 过滤出本网卡的，逐个 DeleteUnicastIpAddressEntry（绝不碰物理网卡）。
  */
-int AdapterConfig::clear_IPv4_addresses(const std::wstring& keepIpv4)
+int AdapterConfig::clear_IPv4_addresses(const cfgstr& keepIpv4)
 {
-    if (m_interfaceLuid.Value == 0) {
+    if (m_id.Value == 0) {
         LOG_ERROR("clear_IPv4_addresses: invalid interface LUID");
         return 0;
     }
@@ -137,7 +133,7 @@ int AdapterConfig::clear_IPv4_addresses(const std::wstring& keepIpv4)
     int removed = 0;
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         MIB_UNICASTIPADDRESS_ROW& row = table->Table[i];
-        if (row.InterfaceLuid.Value != m_interfaceLuid.Value)
+        if (row.InterfaceLuid.Value != m_id.Value)
             continue;   // 只动本虚拟网卡
         if (has_keep && row.Address.Ipv4.sin_addr.S_un.S_addr == keep.S_un.S_addr)
             continue;   // 本次要用的地址：保留
@@ -157,14 +153,14 @@ int AdapterConfig::clear_IPv4_addresses(const std::wstring& keepIpv4)
 
 bool AdapterConfig::set_MTU(uint32_t mtu)
 {
-    if (m_interfaceLuid.Value == 0 || mtu < 576 || mtu > 1500)
+    if (m_id.Value == 0 || mtu < 576 || mtu > 1500)
     {
         LOG_ERROR("set_MTU invalid mtu=%u", mtu);
         return false;
     }
     ULONG ifIndex = 0;
     NETIO_STATUS status =
-        ConvertInterfaceLuidToIndex(&m_interfaceLuid, &ifIndex);
+        ConvertInterfaceLuidToIndex(&m_id, &ifIndex);
     if (status != NO_ERROR)
     {
         LOG_ERROR("ConvertInterfaceLuidToIndex failed %lu", status);
@@ -186,9 +182,10 @@ bool AdapterConfig::set_MTU(uint32_t mtu)
     LOG_INFO("Set MTU success ifIndex=%lu mtu=%u", ifIndex, mtu);
     return true;
 }
+
 bool AdapterConfig::set_metric(uint8_t metric)
 {
-    if (m_interfaceLuid.Value == 0)
+    if (m_id.Value == 0)
     {
         LOG_ERROR("set_metric invalid LUID");
         return false;
@@ -196,7 +193,7 @@ bool AdapterConfig::set_metric(uint8_t metric)
     ULONG ifIndex = 0;
     NETIO_STATUS status =
         ConvertInterfaceLuidToIndex(
-            &m_interfaceLuid,
+            &m_id,
             &ifIndex
         );
     if (status != NO_ERROR)
@@ -230,15 +227,16 @@ bool AdapterConfig::set_metric(uint8_t metric)
     );
     return true;
 }
-bool AdapterConfig::set_DNS_IPv4(const std::wstring& dnsServers)
+
+bool AdapterConfig::set_DNS_IPv4(const cfgstr& dnsServers)
 {
-    if (m_interfaceLuid.Value == 0) {
+    if (m_id.Value == 0) {
         ::SetLastError(ERROR_INVALID_PARAMETER);
-        LOG_ERROR("set_DNS_IPv4 : m_interfaceLuid not found  -> ERROR_INVALID_PARAMETER");
+        LOG_ERROR("set_DNS_IPv4 : m_id not found  -> ERROR_INVALID_PARAMETER");
         return false;
     }
     GUID interfaceGuid{};
-    NETIO_STATUS status = ::ConvertInterfaceLuidToGuid(&m_interfaceLuid,&interfaceGuid);
+    NETIO_STATUS status = ::ConvertInterfaceLuidToGuid(&m_id,&interfaceGuid);
     if (status != NO_ERROR) {
         ::SetLastError(status);
         return false;
@@ -261,3 +259,228 @@ bool AdapterConfig::set_DNS_IPv4(const std::wstring& dnsServers)
     }
     return true;
 }
+
+#else // ---------------------------- Linux ----------------------------
+
+#include "AdapterConfig.h"
+#include "platform/exec.h"
+
+#include <arpa/inet.h>
+#include <cctype>
+#include <cstring>
+#include <netinet/in.h>
+#include <string>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <linux/if.h>
+
+namespace {
+
+bool valid_ipv4(const std::string& ip)
+{
+    struct in_addr a{};
+    return ::inet_pton(AF_INET, ip.c_str(), &a) == 1;
+}
+
+// 接口名只允许 [A-Za-z0-9._-]：这些字符串会被拼进 shell 命令，
+// 不校验就等于把 config.ini 的写权限升级成 root 命令执行
+bool safe_ifname(const std::string& name)
+{
+    if (name.empty() || name.size() >= IFNAMSIZ)
+    {
+        return false;
+    }
+    for (char c : name)
+    {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!(std::isalnum(u) || c == '.' || c == '_' || c == '-'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string q(const std::string& s)
+{
+    return "'" + s + "'";   // 单引号包裹（配合上面的白名单，双保险）
+}
+
+// 网卡上是否已有该地址
+bool addr_exists(const std::string& ifname, const std::string& ip)
+{
+    const std::string out = [] (const std::string& cmd) {
+        std::string o;
+        run_cmd(cmd, &o);
+        return o;
+    }("ip -4 -o addr show dev " + q(ifname));
+    return out.find(" " + ip + "/") != std::string::npos;
+}
+
+} // namespace
+
+AdapterConfig::AdapterConfig(tun_id_t interfaceId) : m_id(std::move(interfaceId))
+{
+    if (!safe_ifname(m_id))
+    {
+        LOG_ERROR("AdapterConfig: 非法接口名（拒绝拼命令）");
+        return;
+    }
+    // Linux 的 tun 设备创建后默认是 down：必须先 up，之后设地址/路由才生效。
+    // 放在构造函数里，是因为 ClientApp 的初始化顺序固定为"建 tun -> 建 AdapterConfig"。
+    const std::string cmd = "ip link set dev " + q(m_id) + " up";
+    if (run_cmd(cmd) != 0)
+    {
+        LOG_WARN("AdapterConfig: `%s` 失败（缺 CAP_NET_ADMIN？）", cmd.c_str());
+    }
+}
+
+bool AdapterConfig::set_IPv4_address(const cfgstr& ipAddress, uint8_t prefixLength)
+{
+    if (!safe_ifname(m_id) || ipAddress.empty() || prefixLength > 32 || !valid_ipv4(ipAddress))
+    {
+        LOG_ERROR("set_IPv4_address: 参数非法 ip=%s prefix=%u",
+                  ipAddress.c_str(), static_cast<unsigned>(prefixLength));
+        return false;
+    }
+    const std::string cidr = ipAddress + "/" + std::to_string(static_cast<unsigned>(prefixLength));
+    const std::string cmd = "ip addr add " + q(cidr) + " dev " + q(m_id);
+    if (run_cmd(cmd) == 0)
+    {
+        LOG_INFO("set_IPv4_address: %s ok", cidr.c_str());
+        return true;
+    }
+    // 已存在时 ip 返回非 0（RTNETLINK answers: File exists）。
+    // 幂等：地址已经在网卡上就算成功，不要因此判定整次连接失败。
+    if (addr_exists(m_id, ipAddress))
+    {
+        LOG_INFO("set_IPv4_address: %s 已存在（幂等）", cidr.c_str());
+        return true;
+    }
+    LOG_ERROR("set_IPv4_address: `%s` 失败", cmd.c_str());
+    return false;
+}
+
+bool AdapterConfig::remove_IPv4_address(const cfgstr& ipAddress, uint8_t prefixLength)
+{
+    if (!safe_ifname(m_id) || ipAddress.empty() || prefixLength > 32 || !valid_ipv4(ipAddress))
+    {
+        return false;
+    }
+    const std::string cidr = ipAddress + "/" + std::to_string(static_cast<unsigned>(prefixLength));
+    return run_cmd("ip addr del " + q(cidr) + " dev " + q(m_id)) == 0;
+}
+
+int AdapterConfig::clear_IPv4_addresses(const cfgstr& keepIpv4)
+{
+    if (!safe_ifname(m_id))
+    {
+        LOG_ERROR("clear_IPv4_addresses: 非法接口名");
+        return 0;
+    }
+    // `ip -4 -o addr show dev vpn0` 输出形如：
+    //   2: vpn0    inet 10.8.0.7/24 brd 10.8.0.255 scope global vpn0
+    const std::vector<std::string> lines =
+        run_cmd_lines("ip -4 -o addr show dev " + q(m_id));
+
+    int removed = 0;
+    for (const auto& line : lines)
+    {
+        const std::string marker = " inet ";
+        const std::size_t pos = line.find(marker);
+        if (pos == std::string::npos)
+        {
+            continue;
+        }
+        const std::size_t begin = pos + marker.size();
+        const std::size_t end = line.find_first_of(" \t", begin);
+        const std::string cidr = line.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        const std::size_t slash = cidr.find('/');
+        const std::string ip = (slash == std::string::npos) ? cidr : cidr.substr(0, slash);
+        if (!keepIpv4.empty() && ip == keepIpv4)
+        {
+            continue;   // 本次要用的地址：保留
+        }
+        if (run_cmd("ip addr del " + q(cidr) + " dev " + q(m_id)) == 0)
+        {
+            ++removed;
+        }
+        else
+        {
+            LOG_ERROR("clear_IPv4_addresses: 删除 %s 失败", cidr.c_str());
+        }
+    }
+    if (removed > 0)
+    {
+        LOG_INFO("clear_IPv4_addresses: 清理了 %d 个残留地址", removed);
+    }
+    return removed;
+}
+
+bool AdapterConfig::set_MTU(uint32_t mtu)
+{
+    if (!safe_ifname(m_id) || mtu < 576 || mtu > 1500)
+    {
+        LOG_ERROR("set_MTU invalid mtu=%u", mtu);
+        return false;
+    }
+    const std::string cmd = "ip link set dev " + q(m_id) + " mtu " + std::to_string(mtu);
+    if (run_cmd(cmd) != 0)
+    {
+        LOG_ERROR("set_MTU: `%s` 失败", cmd.c_str());
+        return false;
+    }
+    LOG_INFO("Set MTU success dev=%s mtu=%u", m_id.c_str(), mtu);
+    return true;
+}
+
+bool AdapterConfig::set_metric(uint8_t metric)
+{
+    // Linux 没有"网卡跃点"这个概念：metric 是路由属性，
+    // 由 RouteManager 在添加 0.0.0.0/1、128.0.0.0/1 时通过 `ip route ... metric N` 指定。
+    // 这里保持接口一致（ClientApp 不必 ifdef），仅记录一条调试日志。
+    LOG_DEBUG("set_metric(%u): Linux 下由路由 metric 承担，跳过", static_cast<unsigned>(metric));
+    return true;
+}
+
+bool AdapterConfig::set_DNS_IPv4(const cfgstr& dnsServer)
+{
+    if (!safe_ifname(m_id) || dnsServer.empty())
+    {
+        return false;
+    }
+    // "8.8.8.8,1.1.1.1" -> "8.8.8.8 1.1.1.1"，并逐个校验是合法 IPv4
+    std::string servers = dnsServer;
+    for (char& c : servers)
+    {
+        if (c == ',') c = ' ';
+    }
+    std::size_t i = 0;
+    while (i < servers.size())
+    {
+        while (i < servers.size() && servers[i] == ' ') ++i;
+        const std::size_t j = servers.find(' ', i);
+        const std::string one = servers.substr(i, j == std::string::npos ? std::string::npos : j - i);
+        if (!one.empty() && !valid_ipv4(one))
+        {
+            LOG_ERROR("set_DNS_IPv4: 非法 DNS 地址 %s", one.c_str());
+            return false;
+        }
+        if (j == std::string::npos) break;
+        i = j;
+    }
+
+    // per-interface DNS 只有 systemd-resolved 提供（resolvectl）。
+    // 没有它也不致命：DnsLeakGuard 会在连接成功时按自己的策略处理（改写 resolv.conf）。
+    const std::string cmd = "resolvectl dns " + q(m_id) + " " + servers;
+    if (run_cmd(cmd) != 0)
+    {
+        LOG_WARN("set_DNS_IPv4: resolvectl 不可用（未启用 systemd-resolved），"
+                 "DNS 交由 DnsLeakGuard 处理");
+        return false;
+    }
+    return true;
+}
+
+#endif // _WIN32

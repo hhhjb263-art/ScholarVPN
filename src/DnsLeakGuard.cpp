@@ -1,5 +1,7 @@
 #include "DnsLeakGuard.h"
 
+#if defined(_WIN32)
+
 #include <iphlpapi.h>
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -38,7 +40,7 @@ void flush_dns_cache()
 } // namespace
 
 // 备份并清空非 TUN 接口的 DNS + 禁用多宿主解析（防回退到运营商/本地 DNS）
-bool DnsLeakGuard::protect(NET_LUID keepLuid)
+bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& /*dnsServers*/)
 {
     restore();   // 清理上一次的状态（防重复调用 / 崩溃残留）
 
@@ -97,7 +99,7 @@ bool DnsLeakGuard::protect(NET_LUID keepLuid)
             continue;
         if (a->OperStatus != IfOperStatusUp)
             continue;
-        if (a->Luid.Value == keepLuid.Value)
+        if (a->Luid.Value == keepId.Value)
             continue;   // 跳过 TUN 网卡（它的 DNS 由 set_DNS_IPv4 管理）
 
         GUID g{};
@@ -107,7 +109,7 @@ bool DnsLeakGuard::protect(NET_LUID keepLuid)
         // 读取该接口当前 DNS（SDK 10.0.26100+：传 GUID 值 + 调用方提供的结构体，先设 Version）
         DNS_INTERFACE_SETTINGS cur{};
         cur.Version = DNS_INTERFACE_SETTINGS_VERSION1;
-        std::wstring dns;
+        cfgstr dns;
         bool gotSettings = false;
         if (GetInterfaceDnsSettings(g, &cur) == NO_ERROR)
         {
@@ -163,15 +165,15 @@ void DnsLeakGuard::spawn_crash_watchdog()
     if (m_backup.empty())
         return;
 
-    auto trim = [](const std::wstring& s) {
+    auto trim = [](const cfgstr& s) {
         const size_t b = s.find_first_not_of(L" \t");
-        if (b == std::wstring::npos)
-            return std::wstring();
+        if (b == cfgstr::npos)
+            return cfgstr();
         const size_t e = s.find_last_not_of(L" \t");
         return s.substr(b, e - b + 1);
     };
 
-    std::wstring cmd =
+    cfgstr cmd =
         L"powershell.exe -NoProfile -WindowStyle Hidden -Command \""
         L"Wait-Process -Id " + std::to_wstring(::GetCurrentProcessId()) +
         L" -ErrorAction SilentlyContinue;";
@@ -189,15 +191,15 @@ void DnsLeakGuard::spawn_crash_watchdog()
             // 原静态 DNS：写回原串（可能是 "1.1.1.1,8.8.8.8" 逗号分隔，拆开逐个加引号）
             cmd += L" Set-DnsClientServerAddress -InterfaceIndex "
                  + std::to_wstring(bk.ifIndex) + L" -ServerAddresses";
-            const std::wstring dns = bk.ipv4Dns;
+            const cfgstr dns = bk.ipv4Dns;
             size_t pos = 0;
             bool first = true;
             while (pos < dns.size())
             {
                 size_t comma = dns.find(L',', pos);
-                if (comma == std::wstring::npos)
+                if (comma == cfgstr::npos)
                     comma = dns.size();
-                const std::wstring item = trim(dns.substr(pos, comma - pos));
+                const cfgstr item = trim(dns.substr(pos, comma - pos));
                 pos = comma + 1;
                 if (item.empty())
                     continue;
@@ -306,3 +308,310 @@ void DnsLeakGuard::restore()
 
     flush_dns_cache();
 }
+
+#else // ---------------------------- Linux ----------------------------
+
+#include "platform/exec.h"
+
+#include <cctype>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace {
+
+const char* kResolvConf = "/etc/resolv.conf";
+
+bool safe_ifname(const std::string& name)
+{
+    if (name.empty() || name.size() >= 16)   // IFNAMSIZ
+    {
+        return false;
+    }
+    for (char c : name)
+    {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!(std::isalnum(u) || c == '.' || c == '_' || c == '-'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string read_file(const char* path, bool* ok)
+{
+    std::string out;
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr)
+    {
+        if (ok) *ok = false;
+        return out;
+    }
+    char buf[1024];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+        out.append(buf, n);
+    }
+    std::fclose(f);
+    if (ok) *ok = true;
+    return out;
+}
+
+bool write_file_atomic(const char* path, const std::string& data)
+{
+    const std::string tmp = std::string(path) + ".scholarvpn.tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr)
+    {
+        return false;
+    }
+    const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    std::fclose(f);
+    if (!ok)
+    {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return std::rename(tmp.c_str(), path) == 0;
+}
+
+bool has_resolvectl()
+{
+    return run_cmd("command -v resolvectl >/dev/null 2>&1") == 0;
+}
+
+// "8.8.8.8,1.1.1.1" -> "8.8.8.8 1.1.1.1"
+std::string dns_list(const std::string& csv)
+{
+    std::string out;
+    std::string cur;
+    auto flush = [&]() {
+        const std::size_t b = cur.find_first_not_of(" \t");
+        const std::size_t e = cur.find_last_not_of(" \t");
+        if (b != std::string::npos)
+        {
+            if (!out.empty()) out += ' ';
+            out += cur.substr(b, e - b + 1);
+        }
+        cur.clear();
+    };
+    for (char c : csv)
+    {
+        if (c == ',') flush();
+        else cur.push_back(c);
+    }
+    flush();
+    return out;
+}
+
+// 单引号转义（拼进 sh -c 时防止命令注入/断行）
+std::string sh_quote(const std::string& s)
+{
+    std::string out = "'";
+    for (char c : s)
+    {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out += "'";
+    return out;
+}
+
+} // namespace
+
+// 看门狗要执行的恢复命令（fork 之前拼好，子进程只 execl）
+std::string DnsLeakGuard::build_restore_command() const
+{
+    if (m_useResolvectl)
+    {
+        return "resolvectl revert " + sh_quote(m_ifname) + " 2>/dev/null; "
+               "resolvectl flush-caches 2>/dev/null; true";
+    }
+    if (m_resolvWasSymlink)
+    {
+        return "ln -sfn " + sh_quote(m_resolvTarget) + " " + kResolvConf;
+    }
+    if (m_hadResolvConf)
+    {
+        return "printf '%s' " + sh_quote(m_origResolvConf) + " > " + kResolvConf;
+    }
+    return "rm -f " + std::string(kResolvConf);
+}
+
+bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& dnsServers)
+{
+    restore();   // 清掉上一次的状态（防重复调用 / 上次崩溃残留）
+
+    if (!safe_ifname(keepId))
+    {
+        LOG_ERROR("DnsLeakGuard: 非法接口名");
+        return false;
+    }
+    m_ifname = keepId;
+    const std::string servers = dns_list(dnsServers);
+
+    // ---- 方案 A：systemd-resolved（首选）----
+    // `resolvectl domain <if> '~.'` 把"所有域名"的解析都路由到该 link，
+    // 物理网卡上的 DNS 自然不再被使用；不碰 /etc/resolv.conf，
+    // 也不与 NetworkManager 抢文件，断开 revert 即可。
+    if (has_resolvectl())
+    {
+        if (!servers.empty())
+        {
+            run_cmd("resolvectl dns " + sh_quote(m_ifname) + " " + servers);
+        }
+        const int rc = run_cmd("resolvectl domain " + sh_quote(m_ifname) + " '~.'");
+        run_cmd("resolvectl flush-caches");
+        if (rc == 0)
+        {
+            m_useResolvectl = true;
+            m_active = true;
+            spawn_pipe_watchdog();
+            LOG_INFO("DNS 防泄漏: 默认域已绑定到 %s（systemd-resolved）", m_ifname.c_str());
+            return true;
+        }
+        LOG_WARN("DnsLeakGuard: resolvectl domain 失败，回退到改写 resolv.conf");
+    }
+
+    // ---- 方案 B：直接改写 /etc/resolv.conf ----
+    if (servers.empty())
+    {
+        LOG_ERROR("DnsLeakGuard: 未配置 DNS，拒绝改写 resolv.conf（会把系统 DNS 弄空）");
+        return false;
+    }
+    struct stat st{};
+    if (::lstat(kResolvConf, &st) == 0 && S_ISLNK(st.st_mode))
+    {
+        m_resolvWasSymlink = true;
+        char buf[4096]{};
+        const ssize_t n = ::readlink(kResolvConf, buf, sizeof(buf) - 1);
+        if (n > 0)
+        {
+            m_resolvTarget.assign(buf, static_cast<std::size_t>(n));
+        }
+    }
+    bool existed = false;
+    m_origResolvConf = read_file(kResolvConf, &existed);
+    m_hadResolvConf = existed;
+
+    std::string content;
+    {
+        std::string cur;
+        for (char c : servers + " ")
+        {
+            if (c == ' ')
+            {
+                if (!cur.empty())
+                {
+                    content += "nameserver " + cur + "\n";
+                    cur.clear();
+                }
+            }
+            else
+            {
+                cur.push_back(c);
+            }
+        }
+    }
+    content += "# generated by ScholarVPN while connected; restored on disconnect\n";
+
+    // 符号链接必须先删：直接写会穿透到 systemd 的 stub 文件，重启后失效
+    if (m_resolvWasSymlink && ::unlink(kResolvConf) != 0)
+    {
+        LOG_ERROR("DnsLeakGuard: 删除 resolv.conf 符号链接失败: %s", std::strerror(errno));
+        return false;
+    }
+    if (!write_file_atomic(kResolvConf, content))
+    {
+        LOG_ERROR("DnsLeakGuard: 写入 resolv.conf 失败（需要 root）");
+        return false;
+    }
+    m_useResolvectl = false;
+    m_active = true;
+    spawn_pipe_watchdog();
+    LOG_INFO("DNS 防泄漏: resolv.conf 已指向 %s", servers.c_str());
+    return true;
+}
+
+void DnsLeakGuard::restore()
+{
+    if (!m_active)
+    {
+        return;
+    }
+    if (m_useResolvectl)
+    {
+        run_cmd("resolvectl revert " + sh_quote(m_ifname));
+        run_cmd("resolvectl flush-caches");
+    }
+    else if (m_resolvWasSymlink)
+    {
+        ::unlink(kResolvConf);
+        if (!m_resolvTarget.empty())
+        {
+            ::symlink(m_resolvTarget.c_str(), kResolvConf);
+        }
+    }
+    else if (m_hadResolvConf)
+    {
+        write_file_atomic(kResolvConf, m_origResolvConf);
+    }
+    m_active = false;
+
+    // 关闭写端：看门狗读到 EOF 后会执行一次恢复（幂等）然后退出
+    if (m_pipeWriteFd >= 0)
+    {
+        ::close(m_pipeWriteFd);
+        m_pipeWriteFd = -1;
+    }
+    if (m_watchdogPid > 0)
+    {
+        int status = 0;
+        ::waitpid(m_watchdogPid, &status, WNOHANG);
+        m_watchdogPid = -1;
+    }
+}
+
+void DnsLeakGuard::spawn_pipe_watchdog()
+{
+    // fork 之后子进程只能调 async-signal-safe 函数：多线程程序里 malloc 可能
+    // 被其他线程持锁，子进程再 popen/拼接字符串会死锁。
+    // 所以恢复命令在这里就拼好，子进程只做 read + execl。
+    const std::string cmd = build_restore_command();
+
+    int fds[2];
+    if (::pipe(fds) != 0)
+    {
+        LOG_WARN("DnsLeakGuard: 创建看门狗管道失败: %s", std::strerror(errno));
+        return;
+    }
+    const pid_t pid = ::fork();
+    if (pid < 0)
+    {
+        ::close(fds[0]);
+        ::close(fds[1]);
+        LOG_WARN("DnsLeakGuard: fork 看门狗失败: %s", std::strerror(errno));
+        return;
+    }
+    if (pid == 0)
+    {
+        ::close(fds[1]);
+        char c = 0;
+        // 父进程活着时永远阻塞；父死/被 kill -9 → EOF
+        while (::read(fds[0], &c, 1) > 0) {}
+        ::close(fds[0]);
+        ::execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+    ::close(fds[0]);
+    m_watchdogPid = pid;
+    m_pipeWriteFd = fds[1];
+}
+
+#endif // _WIN32

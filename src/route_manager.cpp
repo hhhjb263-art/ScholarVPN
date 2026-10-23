@@ -1,12 +1,14 @@
+#if defined(_WIN32)
+
 #include "route_manager.h"
 
 namespace {
-	bool parse(const std::wstring& text, IN_ADDR &out) {
+	bool parse(const cfgstr& text, IN_ADDR &out) {
 		out = {};
 		const INT result = ::InetPtonW(AF_INET,text.c_str(),&out);
 		return result == 1;
 	}
-	bool make_ipv4_to_sockaddr(const std::wstring& ip, SOCKADDR_INET& out) {
+	bool make_ipv4_to_sockaddr(const cfgstr& ip, SOCKADDR_INET& out) {
 		out = {};
 		out.Ipv4.sin_family = AF_INET;
 		out.Ipv4.sin_port = 0;
@@ -15,9 +17,9 @@ namespace {
 }
 
 RouteManager::RouteManager(
-	NET_LUID tunnelLuid
+	tun_id_t tunnelId
 )
-	: m_tunnelLuid(tunnelLuid)
+	: m_tunnelId(tunnelId)
 {
 }
 
@@ -28,16 +30,16 @@ RouteManager::~RouteManager()
 
 bool RouteManager::add_ipv4_route(const Ipv4RouteParam& param)
 {
-	if (param.destination.empty() || 
+	if (param.destination.empty() ||
 		param.nexthop.empty() ||
-		param.prefixLength > 32 || 
-		param.interfaceLuid.Value == 0) {
+		param.prefixLength > 32 ||
+		param.interfaceId.Value == 0) {
 
 		return false;
 	}
 	MIB_IPFORWARD_ROW2 row2{};
 	InitializeIpForwardEntry(&row2);
-	row2.InterfaceLuid = m_tunnelLuid;
+	row2.InterfaceLuid = m_tunnelId;
 	row2.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
 	if (!parse(param.destination, row2.DestinationPrefix.Prefix.Ipv4.sin_addr)) {
 		::SetLastError(ERROR_INVALID_PARAMETER);
@@ -53,10 +55,10 @@ bool RouteManager::add_ipv4_route(const Ipv4RouteParam& param)
 	return create_route(row2);
 }
 
-bool RouteManager::add_tunnel_route(const std::wstring& destination,
+bool RouteManager::add_tunnel_route(const cfgstr& destination,
 	uint8_t prefixLength,uint32_t metric)
 {
-	if (m_tunnelLuid.Value == 0) {
+	if (m_tunnelId.Value == 0) {
 		::SetLastError(ERROR_INVALID_HANDLE);
 		return false;
 	}
@@ -64,14 +66,14 @@ bool RouteManager::add_tunnel_route(const std::wstring& destination,
 	param.destination = destination;
 	param.prefixLength = prefixLength;
 	param.metric = metric;
-	param.nexthop = L"0.0.0.0";
-	param.interfaceLuid = m_tunnelLuid;
+	param.nexthop = CS("0.0.0.0");
+	param.interfaceId = m_tunnelId;
 	return add_ipv4_route(param);
 }
 
 bool RouteManager::add_default_route(uint32_t metric)
 {
-	return add_tunnel_route(L"0.0.0.0",0,metric);
+	return add_tunnel_route(CS("0.0.0.0"),0,metric);
 }
 
 // IPv6 kill-switch：::/0 也指向 TUN（下一跳 ::，on-link）。
@@ -80,13 +82,13 @@ bool RouteManager::add_default_route(uint32_t metric)
 // 应用侧快速失败后回落 IPv4。目的：避免 V6 优先流量绕过隧道泄漏真实出口 IP。
 bool RouteManager::add_ipv6_default_route(uint32_t metric)
 {
-	if (m_tunnelLuid.Value == 0) {
+	if (m_tunnelId.Value == 0) {
 		::SetLastError(ERROR_INVALID_HANDLE);
 		return false;
 	}
 	MIB_IPFORWARD_ROW2 row{};
 	InitializeIpForwardEntry(&row);
-	row.InterfaceLuid = m_tunnelLuid;
+	row.InterfaceLuid = m_tunnelId;
 	row.DestinationPrefix.Prefix.si_family = AF_INET6;
 	row.DestinationPrefix.PrefixLength = 0;          // ::/0
 	row.NextHop.si_family = AF_INET6;                // 下一跳 ::（on-link）
@@ -94,7 +96,7 @@ bool RouteManager::add_ipv6_default_route(uint32_t metric)
 	return create_route(row);
 }
 
-bool RouteManager::add_server_bypass_route(const std::wstring& serverIp)
+bool RouteManager::add_server_bypass_route(const cfgstr& serverIp)
 {
 	SOCKADDR_INET destination{};
 	if (!make_ipv4_to_sockaddr(serverIp, destination)) {
@@ -133,7 +135,7 @@ void RouteManager::remove_default_route() noexcept
 			it->DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr == 0)
 		{
 			::DeleteIpForwardEntry2(&(*it));
-			m_createdRoutes.erase(std::next(it).base());  // rbegin -> erase 对应元素
+			m_createdRoutes.erase(std::next(it).base());
 			return;
 		}
 	}
@@ -160,3 +162,235 @@ bool RouteManager::create_route(const MIB_IPFORWARD_ROW2& route)
 	::SetLastError(status);
 	return false;
 }
+
+#else // ---------------------------- Linux ----------------------------
+
+#include "route_manager.h"
+#include "platform/exec.h"
+
+#include <arpa/inet.h>
+#include <cctype>
+#include <cstring>
+#include <string>
+#include <linux/if.h>
+
+namespace {
+
+bool valid_ipv4(const std::string& ip)
+{
+    struct in_addr a{};
+    return ::inet_pton(AF_INET, ip.c_str(), &a) == 1;
+}
+
+// 接口名会拼进 shell 命令，只允许 [A-Za-z0-9._-]
+bool safe_ifname(const std::string& name)
+{
+    if (name.empty() || name.size() >= IFNAMSIZ)
+    {
+        return false;
+    }
+    for (char c : name)
+    {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!(std::isalnum(u) || c == '.' || c == '_' || c == '-'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct BestRoute {
+    std::string dev;
+    std::string via;
+};
+
+// 对应 Windows 的 GetBestRoute2：查"到目标地址实际会走哪张网卡、哪个网关"
+BestRoute best_route_for(const std::string& ip)
+{
+    BestRoute r;
+    std::string out;
+    if (run_cmd("ip route get " + ip, &out) != 0 || out.empty())
+    {
+        return r;
+    }
+    // 输出首行形如：
+    //   1.2.3.4 via 192.168.1.1 dev eth0 src 192.168.1.5 uid 1000
+    //   1.2.3.4 dev eth0 src ...            （同网段直连，无 via）
+    const std::size_t nl = out.find('\n');
+    const std::string line = (nl == std::string::npos) ? out : out.substr(0, nl);
+
+    auto token_after = [&line](const char* key) -> std::string {
+        const std::string k = std::string(" ") + key + " ";
+        const std::size_t p = line.find(k);
+        if (p == std::string::npos)
+        {
+            return {};
+        }
+        const std::size_t b = p + k.size();
+        const std::size_t e = line.find(' ', b);
+        return line.substr(b, e == std::string::npos ? std::string::npos : e - b);
+    };
+    r.dev = token_after("dev");
+    r.via = token_after("via");
+    return r;
+}
+
+// 加一条路由；已存在视为成功（幂等），并把删除命令记进 added
+bool add_route_tracked(const std::string& route_spec, std::vector<std::string>& added)
+{
+    const std::string add = "ip route add " + route_spec;
+    if (run_cmd(add) == 0)
+    {
+        added.push_back("ip route del " + route_spec);
+        return true;
+    }
+    // 失败但系统里已有等价路由 → 视为成功（重复添加不该让连接失败）
+    std::string cur;
+    run_cmd("ip route show " + route_spec, &cur);
+    if (!cur.empty())
+    {
+        return true;
+    }
+    LOG_ERROR("路由添加失败: %s", add.c_str());
+    return false;
+}
+
+} // namespace
+
+RouteManager::RouteManager(tun_id_t tunnelId)
+    : m_tunnelId(std::move(tunnelId))
+{
+}
+
+RouteManager::~RouteManager()
+{
+    clear_routes();
+}
+
+bool RouteManager::add_ipv4_route(const Ipv4RouteParam& param)
+{
+    const std::string dest = cfg_to_utf8(param.destination);
+    const std::string next = cfg_to_utf8(param.nexthop);
+    if (!valid_ipv4(dest) || (!next.empty() && !valid_ipv4(next)) || !safe_ifname(m_tunnelId))
+    {
+        return false;
+    }
+    std::string spec = dest + "/" + std::to_string(static_cast<unsigned>(param.prefixLength));
+    if (!next.empty())
+    {
+        spec += " via " + next;
+    }
+    spec += " dev " + m_tunnelId;
+    if (param.metric != 0)
+    {
+        spec += " metric " + std::to_string(param.metric);
+    }
+    return add_route_tracked(spec, m_addedRoutes);
+}
+
+bool RouteManager::add_tunnel_route(const cfgstr& destination, uint8_t prefixLength, uint32_t metric)
+{
+    Ipv4RouteParam param;
+    param.destination = destination;
+    param.prefixLength = prefixLength;
+    param.metric = metric;
+    param.interfaceId = m_tunnelId;
+    return add_ipv4_route(param);
+}
+
+bool RouteManager::add_default_route(uint32_t metric)
+{
+    if (!safe_ifname(m_tunnelId))
+    {
+        LOG_ERROR("add_default_route: 非法接口名");
+        return false;
+    }
+    // 用两条半路由（0.0.0.0/1 + 128.0.0.0/1）而不是替换 0.0.0.0/0：
+    //   - 不碰系统原有 default，NetworkManager/DHCP 续租不会打架；
+    //   - 断开时只删这两条，绝不会误删物理网卡的默认路由；
+    //   - 前缀更长 → 优先于原 default，效果等价于"全流量进隧道"。
+    const std::string m = std::to_string(metric);
+    bool ok = true;
+    for (const char* prefix : { "0.0.0.0/1", "128.0.0.0/1" })
+    {
+        std::string spec = std::string(prefix) + " dev " + m_tunnelId;
+        if (metric != 0)
+        {
+            spec += " metric " + m;
+        }
+        if (add_route_tracked(spec, m_addedRoutes))
+        {
+            LOG_INFO("默认路由: %s", spec.c_str());
+        }
+        else
+        {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool RouteManager::add_ipv6_default_route(uint32_t /*metric*/)
+{
+    // 与 Windows 端保持一致：不接管 IPv6（接管后会静默丢包，应用要等超时才回落）
+    LOG_WARN("add_ipv6_default_route: Linux 端未启用（与 Windows 行为一致，避免 IPv6 黑洞）");
+    return false;
+}
+
+bool RouteManager::add_server_bypass_route(const cfgstr& serverIp)
+{
+    const std::string ip = cfg_to_utf8(serverIp);
+    if (!valid_ipv4(ip))
+    {
+        LOG_ERROR("add_server_bypass_route: 非法服务器 IP %s", ip.c_str());
+        return false;
+    }
+    const BestRoute br = best_route_for(ip);
+    if (br.dev.empty() || !safe_ifname(br.dev))
+    {
+        LOG_ERROR("add_server_bypass_route: 查不到到 %s 的物理路由（服务器地址不可达？）", ip.c_str());
+        return false;
+    }
+    std::string spec = ip + "/32";
+    if (!br.via.empty())
+    {
+        spec += " via " + br.via;
+    }
+    spec += " dev " + br.dev;
+    if (!add_route_tracked(spec, m_addedRoutes))
+    {
+        return false;
+    }
+    LOG_INFO("bypass 路由: %s（保证握手走物理网卡 %s）", spec.c_str(), br.dev.c_str());
+    return true;
+}
+
+void RouteManager::remove_default_route() noexcept
+{
+    // 只删 0.0.0.0/1 与 128.0.0.0/1，保留 bypass
+    for (auto it = m_addedRoutes.begin(); it != m_addedRoutes.end();)
+    {
+        const bool is_split_default =
+            it->find("0.0.0.0/1 ") != std::string::npos ||
+            it->find("128.0.0.0/1 ") != std::string::npos;
+        if (!is_split_default)
+        {
+            ++it;
+            continue;
+        }
+        run_cmd(*it);            // 已经是 "ip route del ..."
+        it = m_addedRoutes.erase(it);
+    }
+}
+
+void RouteManager::clear_routes() noexcept
+{
+    for (auto it = m_addedRoutes.rbegin(); it != m_addedRoutes.rend(); ++it)
+    {
+        run_cmd(*it);
+    }
+    m_addedRoutes.clear();
+}
+
+#endif // _WIN32

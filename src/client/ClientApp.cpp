@@ -3,10 +3,19 @@
 #include <cstdarg>
 #include <cstring>   // memcpy：上行报文的源地址终检
 #include "tun_macro.h"   // LOG_INFO 等分级日志宏（logger.h 只有 LOG_ERR/LOG_KEY/LOG_DBG）
-#include"../src/util/utf.h"   // narrow/to_wstring/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
+#include"../src/util/utf.h"   // narrow/to_cfgstr/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
+#if !defined(_WIN32)
+#include <poll.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
-//客户端身份私钥本地加密存储
+// 客户端身份私钥本地加密存储。
+// Windows：DPAPI（绑定当前用户，磁盘不落明文）
+// Linux  ：没有 DPAPI，私钥以 0600 权限落盘（与 WireGuard 的做法一致）。
+//          保护边界是"文件权限 + 用户账户"，root 可读属预期行为。
+#if defined(_WIN32)
 bool dpapi_protect(const std::vector<uint8_t>& plain, std::vector<uint8_t>& out)
 {
     DATA_BLOB in{ static_cast<DWORD>(plain.size()), const_cast<BYTE*>(plain.data()) };
@@ -35,6 +44,19 @@ bool dpapi_unprotect(const std::vector<uint8_t>& enc, std::vector<uint8_t>& plai
     ::LocalFree(dec.pbData);
     return true;
 }
+#else
+bool dpapi_protect(const std::vector<uint8_t>& plain, std::vector<uint8_t>& out)
+{
+    out = plain;      // 不加密；写入后由 cfg_restrict_file() 收紧到 0600
+    return true;
+}
+
+bool dpapi_unprotect(const std::vector<uint8_t>& enc, std::vector<uint8_t>& plain)
+{
+    plain = enc;
+    return true;
+}
+#endif
 
 // 服务器身份公钥 SIG_SRV_PUB（硬编码编译进客户端，作"服务器条目没填 ServerPubKey"
 // 时的兜底固定值）。按构建配置区分，目前 Debug/Release 都指向线上正式服务器。
@@ -110,10 +132,12 @@ void ClientApp::save_config()
     config.SaveClientConfig(m_cfg);
 }
 
-// 当前进程是否已提权（管理员）。用令牌 TokenElevation 判定：即使登录账户是管理员，
-// 只要未提权（UAC 未过），TokenIsElevated 仍为 0，此时同样无法创建网卡/改路由。
+// 当前进程是否已提权（管理员）。
+// Windows：TokenElevation（即使账户是管理员，UAC 未过也返回 false）
+// Linux  ：euid == 0（创建 tun / 改路由 / 改 DNS 都需要 root 或 CAP_NET_ADMIN）
 bool ClientApp::is_elevated()
 {
+#if defined(_WIN32)
     HANDLE token = nullptr;
     if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
     {
@@ -124,6 +148,9 @@ bool ClientApp::is_elevated()
     const BOOL ok = ::GetTokenInformation(token, TokenElevation, &elev, sizeof(elev), &ret);
     ::CloseHandle(token);
     return ok != FALSE && elev.TokenIsElevated != 0;
+#else
+    return ::geteuid() == 0;
+#endif
 }
 
 bool ClientApp::init()
@@ -146,17 +173,23 @@ bool ClientApp::init()
     // 可能残留。restore() 会把残留的 0.0.0.0 黑洞 DNS 清回 DHCP 自动并恢复注册表策略，
     m_dnsGuard.restore();
 
-    m_configDir = Config::GetAppDataRoaming() + L"\\ScholarVPN";
-    m_configPath = m_configDir + L"\\config.ini";
+    m_configDir = cfg_app_dir();
+    m_configPath = cfg_path_join(m_configDir, CS("config.ini"));
     Config::CreateDir(m_configDir);
-    const std::wstring keysDirW = m_configDir + L"\\keys";
+    const cfgstr keysDirW = cfg_path_join(m_configDir, CS("keys"));
     Config::CreateDir(keysDirW);
-    const std::string keysDir = narrow(keysDirW) + "\\";
+    // 后续按 "目录前缀 + 文件名" 拼路径（OpenSSL / ifstream 都要窄字符），
+    // 统一用 '/'：Windows 也接受正斜杠，省掉两端分隔符分叉
+    std::string keysDir = cfg_to_utf8(keysDirW);
+    if (keysDir.empty() || (keysDir.back() != '/' && keysDir.back() != '\\'))
+    {
+        keysDir += '/';
+    }
 
     // ---- Ed25519 身份密钥（SIG_CLI_PRI 本地加密存储 / SIG_CLI_PUB）----
     // 私钥经 Windows DPAPI 加密存为 client.id.enc；公钥明文存为 client.id.pub。
-    const std::wstring idPubPathW = keysDirW + L"\\client.id.pub";
-    const std::wstring idEncPathW = keysDirW + L"\\client.id.enc";
+    const cfgstr idPubPathW = cfg_path_join(keysDirW, CS("client.id.pub"));
+    const cfgstr idEncPathW = cfg_path_join(keysDirW, CS("client.id.enc"));
     if (!Config::FileExists(idPubPathW))
     {
         try
@@ -172,12 +205,19 @@ bool ClientApp::init()
             std::vector<uint8_t> privPem(
                 (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             in.close();
-            ::DeleteFileW(std::wstring(tmpPriv.begin(), tmpPriv.end()).c_str());
+            ::cfg_unlink(cfg_from_utf8(tmpPriv));
             std::vector<uint8_t> blob;
             if (!dpapi_protect(privPem, blob) ||
                 !Config::WriteTextFile(idEncPathW, std::string(blob.begin(), blob.end())))
             {
-                LOG_ERR("Failed to encrypt identity private key (DPAPI)");
+                LOG_ERR("Failed to store identity private key");
+                return false;
+            }
+            // Linux：没有 DPAPI，必须把私钥文件收紧到 0600（Windows 分支为空操作）
+            if (!cfg_restrict_file(idEncPathW))
+            {
+                LOG_ERR("[Identity] 无法把 %s 权限设为 0600，私钥可能被其他用户读取",
+                        cfg_to_utf8(idEncPathW).c_str());
                 return false;
             }
             LOG_KEY("[Identity] New Ed25519 identity key pair generated\n"
@@ -257,10 +297,10 @@ bool ClientApp::init()
             LOG_ERR("Failed to read config.ini: %s", narrow(m_configPath).c_str());
             return false;
         }
-        LOG_KEY("[Config] config.ini loaded: ClientID=%ls, RegisterToken=%s, DebugServerIP=%ls",
-                m_cfg.ClientID.c_str(),
+        LOG_KEY("[Config] config.ini loaded: ClientID=%s, RegisterToken=%s, DebugServerIP=%s",
+                cfg_to_utf8(m_cfg.ClientID).c_str(),
                 m_cfg.RegisterToken.empty() ? "(empty -> login mode)" : "(set -> register mode)",
-                m_cfg.DebugServerIP.c_str());
+                cfg_to_utf8(m_cfg.DebugServerIP).c_str());
     }
     else
     {
@@ -278,7 +318,7 @@ bool ClientApp::init()
         m_serverSigPubPem = "-----BEGIN PUBLIC KEY-----\n"
                           + narrow(m_cfg.ServerPubKey)
                           + "\n-----END PUBLIC KEY-----\n";
-        LOG_KEY("[Identity] 已应用服务器 %ls 配置的 ServerPubKey 验签", m_cfg.ServerIP.c_str());
+        LOG_KEY("[Identity] 已应用服务器 %s 配置的 ServerPubKey 验签", cfg_to_utf8(m_cfg.ServerIP).c_str());
     }
 
     // 传输方式：servers[0] 就是默认/活动服务器。不经过 set_server() 的启动路径
@@ -330,13 +370,22 @@ bool ClientApp::init()
         }
     }
 #endif
-    m_tun = std::make_unique<WintunTun>();
-    if (!m_tun->init_tun("MyTunAdapter", "MyTunnel"))
+    m_tun = create_tun_device();
+#if defined(_WIN32)
+    const char* kTunName = "MyTunAdapter";
+#else
+    const char* kTunName = "vpn0";   // Linux 惯例：短接口名（IFNAMSIZ=16）
+#endif
+    if (!m_tun->init_tun(kTunName, "MyTunnel"))
     {
+#if defined(_WIN32)
         LOG_ERR("Wintun initialization failed (is wintun.dll present next to the executable?)");
+#else
+        LOG_ERR("TUN 初始化失败（需要 root 或 CAP_NET_ADMIN；容器内需 --device /dev/net/tun）");
+#endif
         return false;
     }
-    m_adapter = std::make_unique<AdapterConfig>(m_tun->get_interface_luid());
+    m_adapter = std::make_unique<AdapterConfig>(m_tun->get_interface_id());
     // VirtualIP 可留空
     if (!m_cfg.VirtualIP.empty())
     {
@@ -358,7 +407,7 @@ bool ClientApp::init()
     {
         LOG_ERR("[Warn] Failed to set DNS, continuing without custom DNS");
     }
-    m_route = std::make_unique<RouteManager>(m_tun->get_interface_luid());
+    m_route = std::make_unique<RouteManager>(m_tun->get_interface_id());
     // 只加服务器 bypass 路由：保证握手包能走物理网卡到达服务器。
     // 注意：不能在 init 里切默认路由 / 做 DNS 防护——握手可能失败，
     // 隧道未建立时默认路由指向 TUN 就是"黑洞"，全部流量进 TUN 被丢，
@@ -369,7 +418,7 @@ bool ClientApp::init()
     // 否则 init() 整体失败，表现为"初始化失败"永远连不上）。
     if (!m_remote.empty())
     {
-        if (!m_route->add_server_bypass_route(to_wstring(m_remote)))
+        if (!m_route->add_server_bypass_route(cfg_from_utf8(m_remote)))
         {
             LOG_ERR("Failed to add server bypass route");
             return false;
@@ -398,7 +447,7 @@ bool ClientApp::start()
     // 保证握手包走物理网卡到达服务器（init() 时 m_remote 为空会跳过）。
     // create_route 对已存在的同前缀路由返回成功，重复添加无害。
     if (m_route && !m_remote.empty() &&
-        !m_route->add_server_bypass_route(to_wstring(m_remote)))
+        !m_route->add_server_bypass_route(cfg_from_utf8(m_remote)))
     {
         LOG_ERR("Failed to add server bypass route");
         m_running.store(false);
@@ -468,7 +517,7 @@ bool ClientApp::start()
             {
             if (m_route)
             {
-                m_route->add_server_bypass_route(to_wstring(m_remote));
+                m_route->add_server_bypass_route(cfg_from_utf8(m_remote));
                 m_route->add_default_route(m_cfg.Metric);
                 // 注意：**不要**在这里调用 add_ipv6_default_route()（::/0 kill-switch）。
                 // 2026-09-25 实测回归（Android 端同样现象）：把 ::/0 拉进 TUN 后，
@@ -481,7 +530,7 @@ bool ClientApp::start()
             }
             // 隧道已建立：此时才清物理网卡 DNS / 禁用多宿主解析（防泄漏），
             // 断线时由状态回调恢复，不会出现\"没连上却把系统 DNS/路由切走\"的黑洞。
-            m_dnsGuard.protect(m_tun->get_interface_luid());
+            m_dnsGuard.protect(m_tun->get_interface_id(), m_cfg.DNS);
             emit_log("[Reconnect] Connected, routes + DNS guard active");
 
             // 多用户服务端：identity_ok 通告的虚拟 IP 覆盖网卡地址
@@ -502,7 +551,7 @@ bool ClientApp::start()
                 std::snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
                               (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
                               (ip >> 8) & 0xFF, ip & 0xFF);
-                const std::wstring wip = to_wstring(std::string(ipstr));
+                const cfgstr wip = cfg_from_utf8(ipstr);
                 const uint8_t prefix = u->assigned_prefix();
                 // 采用服务端分配的虚拟 IP 之前，先清掉本网卡上的【其它】IPv4 地址：
                 // Wintun 适配器是持久设备、地址跨进程保留，历次运行被分到不同虚拟 IP 时
@@ -622,7 +671,7 @@ void ClientApp::tun_to_udp_loop()
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
-            DWORD len = 0;
+            tun_len_t len = 0;
             uint8_t* pkt = m_tun->read_packet(&len);
             if (pkt && len > 0)
             {
@@ -668,16 +717,34 @@ void ClientApp::tun_to_udp_loop()
                 m_tun->release_read_packet(pkt);
                 u->send_ip_packet(std::move(buf));
             }
-            else if (HANDLE ev = m_tun->read_wait_event())
-            {
-                // 环形缓冲空：等读事件（事件驱动，有包立即唤醒），
-                // 200ms 超时兜底检查 m_running/重连状态——替代固定 5ms sleep 轮询
-                ::WaitForSingleObject(ev, 200);
-            }
             else
             {
-                // 读事件不可用（API 缺失/会话未就绪）：退回短休眠
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                // 环形缓冲空：等"有包可读"事件（事件驱动，有包立即唤醒），
+                // 200ms 超时兜底检查 m_running/重连状态——替代固定 5ms sleep 轮询。
+                // Windows 等 Wintun 的 ring 事件句柄；Linux 直接 poll tun 的 fd。
+                const tun_event_t ev = m_tun->read_wait_event();
+#if defined(_WIN32)
+                if (ev != nullptr)
+                {
+                    ::WaitForSingleObject(ev, 200);
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+#else
+                if (ev >= 0)
+                {
+                    struct pollfd pfd{};
+                    pfd.fd = ev;
+                    pfd.events = POLLIN;
+                    ::poll(&pfd, 1, 200);
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+#endif
             }
         }
         catch (const std::exception& e)
@@ -715,7 +782,7 @@ void ClientApp::udp_to_tun_loop()
             {
                 m_rxPkts.fetch_add(1);
                 m_rxBytes.fetch_add(buf.data_size());
-                m_tun->write_packet(buf.get_data(), static_cast<DWORD>(buf.data_size()));
+                m_tun->write_packet(buf.get_data(), static_cast<tun_len_t>(buf.data_size()));
             }
         }
         catch (const std::exception& e)
@@ -831,7 +898,7 @@ void ClientApp::set_server(const ServerEntry& entry)
         // 注意别再打 m_remote（服务器 IP）——历史上这里打的是 IP，看着像"公钥"，
         // 排查时无法判断到底用的是哪把钥匙。实际指纹由 UDP::init 的
         // "[Identity] 客户端验签用的服务器公钥指纹" 打印，可与服务端启动日志比对
-        emit_log("已应用服务器条目 %ls 配置的 ServerPubKey 验签", m_cfg.ServerIP.c_str());
+        emit_log("已应用服务器条目 %s 配置的 ServerPubKey 验签", cfg_to_utf8(m_cfg.ServerIP).c_str());
     }
     else
     {

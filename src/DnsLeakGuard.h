@@ -1,41 +1,52 @@
 #pragma once
 
-#include <winsock2.h>
-#include <windows.h>
-#include <netioapi.h>
+#include "itun_device.h"        // tun_id_t
+#include "platform/cfgstr.h"
 
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// 不要在这里 include <netioapi.h>：
+// 它由 DnsLeakGuard.cpp 的 <iphlpapi.h> 引入（那一步已经在 windows.h 之后），
+// 本头文件只用 GUID/ULONG/DWORD，不直接依赖 NETIO_STATUS。
+#else
+#include <sys/types.h>
+#endif
+
 // ============================================================================
-// 防 DNS 泄漏：
-//   连接时：
-//     1. 禁用 Windows"智能多宿主名称解析"（默认会并行查询所有网卡的 DNS，
-//        即使 TUN 网卡配了 8.8.8.8，物理网卡的运营商 DNS 也会被查询 → 泄漏），
-//        写注册表 HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient
-//        DisableSmartNameResolution=1（备份原值，断开时恢复）；
-//     2. 备份并清空"非 TUN 网卡"（物理网卡等）的 DNS：
-//        - 原静态 DNS：备份原串，断开时写回；
-//        - 原 DHCP 自动（读出的 NameServer 为空）：也要入备份并标记 wasDhcp=true，
-//          断开时用 Flags=0（不设 NAMESERVER）切回 DHCP 自动获取——否则黑洞
-//          0.0.0.0 会把网卡切成静态模式，断开后永远恢复不了，电脑断 DNS（高危）；
-//     3. 刷新解析缓存（动态加载 dnsapi，找不到导出也不崩溃），让配置立即生效；
-//        **绝不重启 dnscache 系统服务**（全系统 DNS 闪断，属高风险）。
-//   断开时：
-//     恢复全部备份（DHCP 网卡切回自动、静态网卡写回原串），并额外清理
-//     残留黑洞（NameServer 仍为 0.0.0.0 的接口）——覆盖程序崩溃/被杀后的残留。
+// 防 DNS 泄漏
+//
+// Windows：
+//   连接时：禁用"智能多宿主名称解析"（注册表）+ 把非 TUN 网卡的 DNS 清成
+//   黑洞 0.0.0.0（备份原值）+ 刷新解析缓存；断线恢复全部备份，并额外清理
+//   崩溃残留的黑洞；派生 PowerShell 看门狗兜底。
+//
+// Linux：
+//   连接时：优先 `resolvectl domain <if> '~.'`（把默认域绑到隧道网卡，
+//   不碰 /etc/resolv.conf，也不与 NetworkManager 打架）；
+//   没有 systemd-resolved 才回退"备份并改写 /etc/resolv.conf"，
+//   并且要处理"resolv.conf 是符号链接"的情况（直接写会穿透到 stub 文件）。
+//   断线恢复；看门狗用"pipe EOF"：父进程崩溃/被杀 → 子进程读到 EOF →
+//   执行恢复命令（fork 前把命令拼好，子进程只 exec，避免多线程 fork 后
+//   调用非 async-signal-safe 函数）。
 // ============================================================================
 class DnsLeakGuard
 {
 public:
-    // 备份除 keepLuid（TUN 网卡）之外所有活跃接口的 DNS 并清空，同时禁用多宿主解析；
-    // 成功后派生"崩溃看门狗"进程：本进程退出（含崩溃）时自动复位所有被改的网卡 DNS
-    // 返回 false 表示至少一个关键步骤失败（注册表写不进去等），上层需记日志
-    bool protect(NET_LUID keepLuid);
-    // 恢复全部备份的 DNS + 恢复多宿主解析设置 + 清理残留黑洞（断开连接时调用）
+    // dnsServers：Linux 用来配 per-link DNS（"8.8.8.8,1.1.1.1"）；
+    // Windows 忽略（它的 DNS 由 AdapterConfig 设在 TUN 网卡上）
+    bool protect(tun_id_t keepId, const cfgstr& dnsServers = cfgstr());
+    // 恢复全部备份 + 清理崩溃残留（断开连接时调用，可重复调用）
     void restore();
 
 private:
+#if defined(_WIN32)
     // 派生分离的 PowerShell 看门狗：Wait-Process 盯住本进程，进程死后复位备份网卡的 DNS。
     // 覆盖崩溃/被任务管理器杀掉等 restore() 来不及执行的异常退出。
     void spawn_crash_watchdog();
@@ -44,7 +55,7 @@ private:
     {
         GUID guid{};           // 接口 GUID
         ULONG ifIndex = 0;     // 接口索引（看门狗 netsh/PowerShell 复位用，无编码问题）
-        std::wstring ipv4Dns;  // 原 DNS 服务器串（wasDhcp=true 时为空）
+        cfgstr ipv4Dns;        // 原 DNS 服务器串（wasDhcp=true 时为空）
         bool wasDhcp = false;  // true=原为 DHCP 自动获取 DNS，恢复时切回自动
     };
     std::vector<Backup> m_backup;
@@ -52,4 +63,18 @@ private:
     // 注册表备份：DisableSmartNameResolution 键是否存在及原值
     bool m_policyKeyExisted = false;
     DWORD m_policyOldValue = 0;
+#else
+    void spawn_pipe_watchdog();          // 父进程死亡后由子进程执行恢复
+    std::string build_restore_command() const;
+
+    std::string m_ifname;
+    bool m_active = false;
+    bool m_useResolvectl = false;        // true = resolvectl 模式，false = resolv.conf 模式
+    bool m_resolvWasSymlink = false;     // 原 /etc/resolv.conf 是否为符号链接
+    std::string m_resolvTarget;          // 原符号链接目标
+    bool m_hadResolvConf = false;        // 原本是否存在该文件
+    std::string m_origResolvConf;        // 原文件内容
+    pid_t m_watchdogPid = -1;
+    int m_pipeWriteFd = -1;              // 父进程持有的管道写端（关闭 = 通知子进程）
+#endif
 };

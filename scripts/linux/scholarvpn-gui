@@ -1,0 +1,52 @@
+#!/bin/sh
+# ============================================================================
+# ScholarVPN Linux GUI 启动器
+#
+# 为什么要这一层：
+#   程序要 root（建 tun / 改路由 / 改 DNS），但 pkexec 默认清空环境，
+#   root 进程拿不到 DISPLAY/XAUTHORITY 就连不上 X。
+#   而 GNOME 是 Wayland 会话时，Qt 直接走 wayland 会被 Mutter 拒绝（uid 不同），
+#   所以这里强制 QT_QPA_PLATFORM=xcb，走 XWayland（X11 只认 cookie，不认 uid）。
+# ============================================================================
+set -eu
+
+APP=/opt/scholarvpn/vpn_client
+if [ ! -x "$APP" ]; then
+    echo "未安装或不可执行：$APP（先运行 install-linux.sh）" >&2
+    exit 1
+fi
+
+# 1) XAUTHORITY：优先继承调用者环境；否则找 Mutter 给 XWayland 发的 cookie
+if [ -z "${XAUTHORITY:-}" ]; then
+    for f in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/.mutter-Xwaylandauth.* \
+             "$HOME"/.Xauthority; do
+        if [ -f "$f" ]; then
+            XAUTHORITY="$f"
+            break
+        fi
+    done
+fi
+
+# 2) DISPLAY：纯 Wayland 会话里通常没有，XWayland 固定是 :0
+if [ -z "${DISPLAY:-}" ]; then
+    if [ -S /tmp/.X11-unix/X0 ]; then
+        DISPLAY=:0
+    else
+        for s in /tmp/.X11-unix/X*; do
+            [ -S "$s" ] && { DISPLAY=":${s##*/X}"; break; }
+        done
+    fi
+fi
+
+# 3) 启动。
+#    注意不要用 set -- 去拼参数：那会把脚本自身的 "$@"（用户传的参数）覆盖掉，
+#    结果就是 env 变量被当成程序参数传进去。
+if [ -n "${XAUTHORITY:-}" ]; then
+    exec pkexec env DISPLAY="$DISPLAY" QT_QPA_PLATFORM=xcb \
+         XAUTHORITY="$XAUTHORITY" \
+         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+         "$APP" "$@"
+fi
+exec pkexec env DISPLAY="$DISPLAY" QT_QPA_PLATFORM=xcb \
+     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+     "$APP" "$@"

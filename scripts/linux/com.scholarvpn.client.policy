@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>ScholarVPN</vendor>
+  <action id="com.scholarvpn.client.run">
+    <description>运行 ScholarVPN 客户端</description>
+    <message>需要管理员权限来创建虚拟网卡、修改路由与 DNS</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!-- keep：认证一次后 5 分钟内再次启动不再弹窗 -->
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/opt/scholarvpn/vpn_client</annotate>
+    <!-- allow_gui：让 pkexec 保留 DISPLAY/XAUTHORITY，GUI 程序必须有这个 -->
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

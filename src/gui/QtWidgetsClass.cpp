@@ -1,4 +1,6 @@
 #include "QtWidgetsClass.h"
+#include "QtCfg.h"   // toQString / fromQString（cfgstr <-> QString 的唯一桥）
+#include "CenteredComboBox.h"   // 只重写绘制、不改行为的居中下拉框
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QScrollArea>
@@ -401,8 +403,8 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		if (m_selectedCard < 0 || m_selectedCard >= (int)m_cardServers.size())
 			return;
 		m_cardServers[m_selectedCard].RegisterToken.clear();
-		const QString inipath = QString::fromStdWString(
-			Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini");
+		const QString inipath = toQString(
+			cfg_path_join(cfg_app_dir(), CS("config.ini")));
 		QSettings settings(inipath, QSettings::IniFormat);
 		settings.setValue(QString("Server%1/RegisterToken").arg(m_selectedCard + 1), QString(""));
 		settings.sync();
@@ -442,6 +444,11 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 
 	Read_iniFile();   // 读 config，为每台服务器建卡
 	createtray();
+
+	show_version = new QLabel(this);
+	show_version->setText("v" + version);
+	show_version->setGeometry(390,730,50, 20);
+	show_version->raise();
 }
 
 QtWidgetsClass::~QtWidgetsClass()
@@ -468,17 +475,17 @@ void QtWidgetsClass::clear_cards()
 void QtWidgetsClass::Read_iniFile()
 {
 	delete m_cfg;
-	m_cfg = new Config(Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini",
-		Config::GetAppDataRoaming() + L"\\ScholarVPN");
+	m_cfg = new Config(cfg_path_join(cfg_app_dir(), CS("config.ini")),
+		cfg_app_dir());
 	ClientConfig cc;
 	clear_cards();   // 先清旧卡
 
 	if (m_cfg->LoadClientConfig(cc)) {
 		// 主服务器 IP（Debug 优先 DebugServerIP，用于兼容旧字段）
 #ifdef _DEBUG
-		m_serverIp = QString::fromStdWString(cc.DebugServerIP.empty() ? cc.ServerIP : cc.DebugServerIP);
+		m_serverIp = toQString(cc.DebugServerIP.empty() ? cc.ServerIP : cc.DebugServerIP);
 #else
-		m_serverIp = QString::fromStdWString(cc.ServerIP);
+		m_serverIp = toQString(cc.ServerIP);
 #endif
 		for (const auto& s : cc.servers)
 			create_card(s);
@@ -675,8 +682,8 @@ QPushButton:pressed{background-color:#d8d8d8;}
 		pubkeyB64.clear();
 
 	// 追加到 [ServerN] 节（真正多服务器，含各自身份）
-	const QString inipath = QString::fromStdWString(
-		Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini");
+	const QString inipath = toQString(
+		cfg_path_join(cfg_app_dir(), CS("config.ini")));
 	QSettings settings(inipath, QSettings::IniFormat);
 
 	const int count = settings.value("Server/Count", 0).toInt();
@@ -692,6 +699,7 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	settings.sync();   // 防止  QSettings  默认延迟到析构才保存
 
 	Read_iniFile();
+	
 }
 
 // dia 中的可选卡片：头像 + 名称 + IP，点击整卡选中（无连接/编辑按钮，操作都在主页面卡片上）
@@ -699,8 +707,8 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 {
 	const QString name = entry.Name.empty()
 		? QStringLiteral("computer%1").arg(m_cards.size() + 1)
-		: QString::fromStdWString(entry.Name);
-	const QString ip   = QString::fromStdWString(entry.ServerIP);
+		: toQString(entry.Name);
+	const QString ip   = toQString(entry.ServerIP);
 
 	QFrame* card = new QFrame;
 	card->setFixedHeight(96);
@@ -748,11 +756,17 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	lab_ip->setStyleSheet("background:transparent; font-family:Consolas,'Courier New',monospace; font-size:9pt; color:#6b7280;");
 
 	// 传输方式下拉框：UDP / TCP（userData = ServerEntry.transport，0=UDP 1=TCP）
-	QComboBox* box_sock = new QComboBox(card);
+	QComboBox* box_sock = new CenteredComboBox(card);
 	box_sock->setGeometry(296, 20, 92, 24);
 	box_sock->setCursor(Qt::PointingHandCursor);
 	box_sock->addItem(QStringLiteral("UDP"), 0);
 	box_sock->addItem(QStringLiteral("TCP"), 1);
+
+	for (int i = 0; i < box_sock->count(); ++i)
+	{
+		box_sock->setItemData(i, static_cast<int>(Qt::AlignCenter), Qt::TextAlignmentRole);
+	}
+
 	box_sock->setCurrentIndex(entry.transport ? 1 : 0);
 	box_sock->setStyleSheet(R"(
 	QComboBox{
@@ -770,6 +784,10 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 		selection-background-color:#eef5ff;
 		selection-color:#1f2937;
 	}
+	QComboBox QAbstractItemView::item{
+		min-height:22px;
+		text-align:center;
+	}
 	)");
 	const int sockIdx = static_cast<int>(m_cards.size());
 	// 选择即持久化：写入该服务器的 Transport 配置并同步内存（连接时生效）
@@ -777,8 +795,8 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 		if (sockIdx < 0 || sockIdx >= (int)m_cardServers.size())
 			return;
 		m_cardServers[sockIdx].transport = box_sock->itemData(index).toInt() ? 1 : 0;
-		const QString inipath = QString::fromStdWString(
-			Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini");
+		const QString inipath = toQString(
+			cfg_path_join(cfg_app_dir(), CS("config.ini")));
 		QSettings settings(inipath, QSettings::IniFormat);
 		settings.setValue(QString("Server%1/Transport").arg(sockIdx + 1),
 			m_cardServers[sockIdx].transport);
@@ -824,9 +842,9 @@ void QtWidgetsClass::update_glass_card()
 	const ServerEntry& e = m_cardServers[m_selectedCard];
 	const QString name = e.Name.empty()
 		? QStringLiteral("computer%1").arg(m_selectedCard + 1)
-		: QString::fromStdWString(e.Name);
+		: toQString(e.Name);
 	m_glassName->setText(name);
-	m_glassIp->setText("IP: " + QString::fromStdWString(e.ServerIP));
+	m_glassIp->setText("IP: " + toQString(e.ServerIP));
 
 	// 内网 IP：与主页面卡片一致（已连接时显示服务端分配的虚拟 IP）
 	const QString vip = m_homeVip->text();
@@ -859,9 +877,9 @@ void QtWidgetsClass::show_home_card(int index)
 	const ServerEntry& e = m_cardServers[index];
 	const QString name = e.Name.empty()
 		? QStringLiteral("computer%1").arg(index + 1)
-		: QString::fromStdWString(e.Name);
+		: toQString(e.Name);
 	m_homeName->setText(name);
-	m_homeIp->setText("IP: " + QString::fromStdWString(e.ServerIP));
+	m_homeIp->setText("IP: " + toQString(e.ServerIP));
 	m_homeVip->setText("内网IP: --");
 	update_home_btn();
 	m_homeCard->show();
@@ -973,7 +991,12 @@ void QtWidgetsClass::createtray()
 	m_trayicon->setToolTip("ScholarVPN");
 
 	m_menu = new QMenu(this);
-	m_actionShow = new QAction(QStringLiteral("显示主窗口"), this);
+	m_menu->setStyleSheet(QString(R"(
+		Qmenu{
+			border-radius:12px;
+		}
+		)"));
+	m_actionShow = new QAction(QStringLiteral("显示"), this);
 	m_actionQuit = new QAction(QStringLiteral("退出"), this);
 	m_menu->addAction(m_actionShow);
 	m_menu->addSeparator();
@@ -989,17 +1012,11 @@ void QtWidgetsClass::createtray()
 	connect(m_actionQuit, &QAction::triggered, qApp, &QApplication::quit);
 	connect(m_trayicon, &QSystemTrayIcon::activated, this,
 		[this](QSystemTrayIcon::ActivationReason reason) {
-			if (reason == QSystemTrayIcon::Trigger) //左键单击
+			if (reason == QSystemTrayIcon::DoubleClick) //左键单击
 			{
-				// 最小化的窗口 isVisible() 仍为 true，只判断 isVisible 会"点了没反应"
-				if (this->isVisible() && !this->isMinimized())
-					this->hide();
-				else
-				{
-					this->showNormal();
-					this->raise();
-					this->activateWindow();
-				}
+				this->showNormal();
+				this->raise();
+				this->activateWindow();
 			}
 		});
 	m_trayicon->show();
@@ -1071,14 +1088,14 @@ QLineEdit:focus{border:1px solid #0078d4;}
 
 	edit_name->setText(entry.Name.empty()
 		? QStringLiteral("computer%1").arg(idx + 1)
-		: QString::fromStdWString(entry.Name));
-	edit_ip->setText(QString::fromStdWString(entry.ServerIP));
+		: toQString(entry.Name));
+	edit_ip->setText(toQString(entry.ServerIP));
 	edit_port->setText(QString::number(entry.ServerPort));
-	edit_ID->setText(QString::fromStdWString(entry.ClientID));
-	edit_token->setText(QString::fromStdWString(entry.RegisterToken));
+	edit_ID->setText(toQString(entry.ClientID));
+	edit_token->setText(toQString(entry.RegisterToken));
 
 	if (!entry.ServerPubKey.empty()) {
-		QString b64 = QString::fromStdWString(entry.ServerPubKey);
+		QString b64 = toQString(entry.ServerPubKey);
 		b64.remove(QRegularExpression("\\s"));
 		QString body;
 		for (int i = 0; i < b64.size(); i += 64)
@@ -1211,7 +1228,7 @@ QPushButton:hover{background-color:#FF0000;}
 			QMessageBox::No
 			);
 		if (msg == QMessageBox::Yes) {
-			const QString inipath = QString::fromStdWString(Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini");
+			const QString inipath = toQString(cfg_path_join(cfg_app_dir(), CS("config.ini")));
 			QSettings setting(inipath, QSettings::IniFormat);
 			setting.remove(QString("Server%1").arg(m_selectedCard + 1));
 			// 显式维护 Count，不依赖 Read_iniFile 的重排兜底
@@ -1258,8 +1275,8 @@ QPushButton:hover{background-color:#FF0000;}
 		pubkeyB64.clear();
 	}
 
-	const QString inipath = QString::fromStdWString(
-		Config::GetAppDataRoaming() + L"\\ScholarVPN\\config.ini");
+	const QString inipath = toQString(
+		cfg_path_join(cfg_app_dir(), CS("config.ini")));
 	QSettings settings(inipath, QSettings::IniFormat);
 #if QT_VERSION < QT_VERSION_CHECK(6,0,0)
 	settings.setIniCodec("UTF-8");

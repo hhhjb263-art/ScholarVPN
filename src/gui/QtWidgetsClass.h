@@ -196,6 +196,8 @@ private:
 	QAction* m_actionShow = nullptr;
 	QAction* m_actionQuit = nullptr;
 
+	QString version = "1.0.6";
+	QLabel *show_version = nullptr;
 };
 
 class Setting : public QDialog {

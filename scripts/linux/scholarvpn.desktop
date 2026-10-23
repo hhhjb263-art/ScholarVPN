@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ScholarVPN
+GenericName=VPN Client
+Comment=Secure UDP/TCP tunnel client
+Exec=/usr/local/bin/scholarvpn
+Icon=scholarvpn
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;tunnel;proxy;scholarvpn;
+StartupNotify=true
+StartupWMClass=ScholarVPN

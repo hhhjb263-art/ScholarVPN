@@ -459,3 +459,6 @@ tools/webadmin/data/
 # Linux 客户端本地构建目录与助手会话数据
 build-client/
 .workbuddy/
+
+# ServerAdmin 子工程的 qmake/Qt Creator 构建目录（Makefile、.qmake.stash、ui_*.h 等）
+ServerAdmin/**/build/

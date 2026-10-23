@@ -27,12 +27,23 @@
 
 ### 架构
 
-客户端与服务端通过 **UDP/TCP 双传输**建立隧道：客户端创建 Wintun 虚拟网卡，把本机流量封装进自定义报文发往服务器；服务器从 TUN 网卡转发到真实网络，回程流量再反向封装回客户端。默认走 UDP；运营商丢 UDP 时可在客户端切换 TCP（服务端同端口双栈同时监听，`--transport` 可控制开/关）。两端使用同一套自研隧道协议（自定义报文头 + 三阶段身份认证 + 心跳保活），加密层基于 OpenSSL 标准算法，**加密与传输方式无关**。
+客户端与服务端通过 **UDP/TCP 双传输**建立隧道：客户端创建虚拟网卡（**Windows 用 Wintun，Linux 用 `/dev/net/tun`**），把本机流量封装进自定义报文发往服务器；服务器从 TUN 网卡转发到真实网络，回程流量再反向封装回客户端。默认走 UDP；运营商丢 UDP 时可在客户端切换 TCP（服务端同端口双栈同时监听，`--transport` 可控制开/关）。两端使用同一套自研隧道协议（自定义报文头 + 三阶段身份认证 + 心跳保活），加密层基于 OpenSSL 标准算法，**加密与传输方式无关**。
 
 - **客户端传输层**：`UDP` 为基类（三阶段认证 / AES-256-GCM / 心跳 / 收发队列全部在基类实现），`TCP` 子类只覆写 4 个传输钩子（建连 / 发送 / 分帧接收）+ 协议版本字节（UDP 帧标 `v_udp=1`，TCP 帧标 `v_tcp=2`，错传报文在版本校验处丢弃）。TCP 侧 socket 非阻塞：读侧「先吃接收缓冲、不够再 poll+recv」连续处理粘包帧，写侧 poll 等可写（总上限 5s，对端持续不收则丢帧交上层重传），无 sleep 轮询。
 - **服务端传输层**：UDP 会话表 / 认证 / 加密 / 心跳与 TCP 完全共用；TCP 监听为 **epoll 事件驱动**（单线程管理全部连接，替代每连接一线程），读事件排空内核缓冲一次处理所有完整帧。发送队列满或对端持续不收（>5s）即主动断开该连接，避免半死连接无限堆积拖慢其他会话。
 
 客户端为 **Qt 图形界面程序**：主界面显示当前服务器卡片（连接/断开/编辑）与实时上下行速率曲线；通过「Switch Server」覆盖层管理多台服务器，点击卡片即切换。断开/崩溃均自动恢复网卡 DNS（防泄漏守卫 + 崩溃看门狗）。
+
+**Windows 与 Linux 共用同一套 Qt 界面**（`src/gui/`），平台差异全部收敛在 `src/platform/` 与各文件的 `#if defined(_WIN32)` 分支里，不存在两份分叉代码：
+
+| 关注点 | Windows | Linux |
+|---|---|---|
+| 虚拟网卡 | Wintun（持久适配器） | `/dev/net/tun` + `IFF_TUN\|IFF_NO_PI`（随 fd 关闭消失） |
+| 地址 / MTU | IP Helper + `netsh` | `ip addr` / `ip link`（ioctl 同源） |
+| 路由 | `CreateIpForwardEntry2` | `ip route`；默认路由用 `0.0.0.0/1` + `128.0.0.0/1` 拆分，不覆盖系统 default |
+| DNS 防泄漏 | 备份/黑洞非 TUN 网卡 DNS + 注册表 | 优先 `resolvectl`（systemd-resolved），否则备份并改写 `/etc/resolv.conf` |
+| 身份私钥 | DPAPI 加密（`client.id.enc`） | 明文 + `0600` 权限（无 DPAPI，等同 WireGuard 做法） |
+| 崩溃看门狗 | PowerShell 子进程 | `fork` + pipe EOF（父进程死亡触发恢复） |
 
 ### 隧道协议与加密（概述）
 
@@ -40,7 +51,7 @@
 - **三阶段身份认证**：包含防中间人校验（服务器身份签名验证）与客户端身份准入（注册/登录），**身份未验证通过前服务端禁止转发任何流量**；
 - **加密**：基于 OpenSSL 标准算法，会话密钥支持前向安全，数据面使用认证加密（AES-256-GCM）；
 - **心跳保活**：认证通过后周期发送心跳，对端失联时自动重连；
-- **密钥体系**：持久身份密钥为 Ed25519（服务器公钥内置于客户端；客户端私钥经 Windows DPAPI 加密存储，磁盘不落明文）。
+- **密钥体系**：持久身份密钥为 Ed25519（服务器公钥内置于客户端；Windows 侧客户端私钥经 DPAPI 加密存储，磁盘不落明文；Linux 侧以 `0600` 权限存放）。
 
 ### 多用户支持（服务端）
 
@@ -70,7 +81,9 @@
 
 客户端参数通过 INI 文件配置，**推荐全部在 GUI 内操作**（添加/编辑/删除/切换服务器自动维护该文件），首次运行自动生成：
 
-- 路径：`%APPDATA%\ScholarVPN\config.ini`
+- 路径：
+  - Windows：`%APPDATA%\ScholarVPN\config.ini`
+  - Linux：`~/.config/scholarvpn/config.ini`（遵循 `$XDG_CONFIG_HOME`；以 `sudo` 运行时自动还原到调用者家目录，避免身份密钥落到 `/root` 导致"每次都要重新注册"）
 - 多服务器：`[Server] Count=N` + 每台一个 `[ServerN]` 节（编号连续，程序自动重排）
 
 ```ini
@@ -116,6 +129,18 @@ Metric=5
 | Wintun 0.14.1 | 已内置 `third_party/wintun-0.14.1`；运行需要 `wintun.dll` |
 | Windows API | WinSock2（ws2_32）、IP Helper（iphlpapi）、DNS API（dnsapi）等 |
 
+### 客户端（Linux）
+
+| 依赖 | 说明 |
+|------|------|
+| CMake >= 3.16 + C++17 编译器 | GCC 9+ / Clang 10+ |
+| Qt 6（Widgets） | 构建用 `qt6-base-dev`；运行需要 `libqt6widgets6` |
+| OpenSSL 3.x | 构建用 `libssl-dev`；运行需要 `libssl3` |
+| 内核 TUN 支持 | `/dev/net/tun`（容器内需 `--device /dev/net/tun`；内核需 `tun` 模块） |
+| iproute2 + polkit | 路由/地址操作用 `ip`；桌面提权启动用 `pkexec` |
+
+> Linux 客户端**不使用** `third_party/` 下的 Wintun 与 OpenSSL 预编译产物，全部链接系统库。
+
 ### 服务端（Linux）
 
 | 依赖 | 说明 |
@@ -141,6 +166,40 @@ msbuild VPN_.sln /p:Configuration=Debug /p:Platform=x64
 ```
 
 > 构建配置区分服务器身份公钥：**Debug** 用本地测试服务器公钥，**Release** 用正式服务器公钥（见 `src/client/ClientApp.cpp` 的 `kServerSigPubPem` 常量，请自行更换）。每台服务器也可在 GUI 中单独填写公钥（`ServerPubKey`），留空则用内置公钥。
+
+### 客户端（Linux）
+
+```bash
+sudo apt install build-essential cmake qt6-base-dev libssl-dev
+cmake -S . -B build-client
+cmake --build build-client -j
+```
+
+产物为 `build-client/vpn_client`。运行需要 root（创建 tun、改路由、改 DNS）：
+
+```bash
+sudo ./build-client/vpn_client
+```
+
+**装成桌面应用（应用菜单 + 图标 + 双击启动）**：
+
+```bash
+sudo ./scripts/linux/install-linux.sh build-client/vpn_client
+```
+
+安装到 `/opt/scholarvpn/`，并注册：
+
+- 应用菜单项 `/usr/share/applications/scholarvpn.desktop`
+- 图标 `/usr/share/icons/hicolor/256x256/apps/scholarvpn.png`
+- polkit 策略 `com.scholarvpn.client.run`（认证一次记 5 分钟）
+- 启动器 `/usr/local/bin/scholarvpn`、桌面快捷方式
+
+之后按 **Super 搜索 ScholarVPN** 或双击桌面图标启动，首次会弹一次系统认证框。
+
+> 提权细节：GNOME Wayland 会话下，root 进程连不上 wayland compositor，必须走 XWayland
+> （`QT_QPA_PLATFORM=xcb` + `XAUTHORITY` 指向 Mutter 的 XWayland cookie）。启动器
+> `scripts/linux/scholarvpn-gui` 会自动查找这两者并调用 `pkexec`，不需要手工传环境。
+> 没有 polkit 的发行版可直接 `sudo ./build-client/vpn_client`。
 
 ### 服务端（Linux）
 
@@ -194,11 +253,23 @@ sudo ./build/vpn_server --gen-token 5
 
 ### 首次运行
 
+**Windows**
+
 1. 可直接双击运行 `ScholarVPN.exe`（**免 UAC**，普通用户即可启动，界面与托盘可用）；但**建立连接需要管理员权限**（创建 Wintun 虚拟网卡、改路由、改 DNS 均需要），连接前请右键选择「以管理员身份运行」；
-2. 首次运行自动生成 Ed25519 身份密钥（位于 `%APPDATA%\ScholarVPN\`）：
+2. 首次运行自动生成 Ed25519 身份密钥（位于 `%APPDATA%\ScholarVPN\keys\`）：
    - `client.id.pub`：明文公钥（交给服务器管理员登记）
    - `client.id.enc`：私钥（Windows DPAPI 加密，绑定当前 Windows 用户，磁盘不落明文）
 3. 把 `client.id.pub` 交给服务器管理员，管理员执行 `./build/vpn_server --gen-token` 生成一次性注册令牌发给你。
+
+**Linux**
+
+1. 从应用菜单/桌面图标启动（首次会弹一次 `pkexec` 认证），或直接 `sudo ./build-client/vpn_client`；
+2. 首次运行自动生成身份密钥（位于 `~/.config/scholarvpn/keys/`）：
+   - `client.id.pub`：明文公钥
+   - `client.id.enc`：私钥（权限 `0600`，Linux 无 DPAPI，靠文件权限兜底）
+3. 公钥交给服务器管理员换令牌，步骤与 Windows 相同。
+
+> Linux 与 Windows 的 `keys/` 目录相互独立：同一台机器的双系统会被服务端视为**两台不同设备**，需要各自注册（服务端按 Ed25519 公钥判定身份）。
 
 ### 添加服务器
 
@@ -247,6 +318,9 @@ sudo ./build/vpn_server --gen-token 5
 - **智能分流**：按规则分流流量，如国内直连、国外走隧道，避免全局代理
 - **日志窗口与流量统计**：GUI 内查看连接日志；累计流量统计与限速（实时速率曲线已完成）
 - **开机自启**：开机自动启动、启动时自动连接等（系统托盘 / 最小化到托盘已实现）
+- **Linux 权限模型**：目前以 root（`pkexec`）运行整个 GUI；更规范的做法是普通用户 GUI + 特权 helper（polkit 服务）只负责 tun/路由/DNS，避免界面进程持有 root
+- **Linux 桌面集成**：应用菜单与图标已完成；GNOME 默认不显示桌面图标，需要 `gnome-shell-extension-desktop-icons-ng`；托盘依赖 `libappindicator`
+- **Linux 服务端升级**：服务端仍为人工升级（`docs/更新系统设计.md` 第 6 章），未做自动化
 
 ## 许可证
 

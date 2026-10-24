@@ -1,0 +1,46 @@
+<svg width="100%" viewBox="0 0 680 390" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>ScholarVPN 主界面示意</title>
+  <desc>主界面包含当前服务器卡片（名称、IP、内网 IP、传输方式、连接按钮、连接状态）与下方 60 秒实时速率曲线，底部为切换服务器入口。</desc>
+  <style>
+    .t{font:400 13px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;fill:#1f2937}
+    .ts{font:400 12px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;fill:#6b7280}
+    .th{font:500 14px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;fill:#1f2937}
+    .btn{font:400 12px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;fill:#ffffff}
+  </style>
+
+  <rect x="40" y="40" width="600" height="330" rx="12" fill="#ffffff" stroke="#e2e6ee" stroke-width="0.5"/>
+
+  <rect x="60" y="60" width="560" height="140" rx="10" fill="#f8fafc" stroke="#e2e6ee" stroke-width="0.5"/>
+  <circle cx="88" cy="96" r="18" fill="#e6f1fb" stroke="#85b7eb" stroke-width="0.5"/>
+  <text class="th" x="88" y="96" text-anchor="middle" dominant-baseline="central">S</text>
+  <text class="th" x="116" y="84">公司服务器</text>
+  <circle cx="452" cy="84" r="4" fill="#16a34a"/>
+  <text class="ts" x="464" y="84" dominant-baseline="central">已连接</text>
+  <text class="ts" x="116" y="110">IP: 1.2.3.4</text>
+  <text class="ts" x="116" y="132">内网 IP: 10.8.0.7</text>
+  <text class="ts" x="116" y="154">UDP · 51820</text>
+
+  <rect x="330" y="94" width="80" height="26" rx="6" fill="#f1f3f7" stroke="#e2e6ee" stroke-width="0.5"/>
+  <text class="t" x="370" y="107" text-anchor="middle" dominant-baseline="central">UDP</text>
+  <rect x="440" y="94" width="90" height="26" rx="6" fill="#ef4444"/>
+  <text class="btn" x="485" y="107" text-anchor="middle" dominant-baseline="central">断开</text>
+  <text class="ts" x="330" y="140">传输方式</text>
+  <text class="ts" x="330" y="160">连接后按钮变红</text>
+
+  <rect x="60" y="216" width="560" height="84" rx="10" fill="#f8fafc" stroke="#e2e6ee" stroke-width="0.5"/>
+  <text class="ts" x="76" y="236">实时速率 · 60s 窗口</text>
+  <circle cx="492" cy="232" r="3" fill="#378add"/>
+  <text class="ts" x="500" y="236">下载</text>
+  <circle cx="544" cy="232" r="3" fill="#1d9e75"/>
+  <text class="ts" x="552" y="236">上传</text>
+  <path d="M76 252 L604 252" stroke="#eef1f5" stroke-width="0.5" fill="none"/>
+  <path d="M76 272 L604 272" stroke="#eef1f5" stroke-width="0.5" fill="none"/>
+  <path d="M76 292 L604 292" stroke="#eef1f5" stroke-width="0.5" fill="none"/>
+  <polyline points="76,286 130,282 180,270 230,276 280,262 330,254 380,266 430,250 480,258 530,244 580,252 604,246"
+            fill="none" stroke="#378add" stroke-width="1.5"/>
+  <polyline points="76,292 130,290 180,286 230,288 280,282 330,284 380,280 430,282 480,276 530,280 580,274 604,278"
+            fill="none" stroke="#1d9e75" stroke-width="1.5"/>
+
+  <rect x="250" y="326" width="180" height="28" rx="8" fill="#e6f1fb" stroke="#85b7eb" stroke-width="0.5"/>
+  <text class="t" x="340" y="340" text-anchor="middle" dominant-baseline="central">⇄ Switch Server</text>
+</svg>

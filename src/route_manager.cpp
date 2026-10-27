@@ -143,6 +143,7 @@ void RouteManager::remove_default_route() noexcept
 
 void RouteManager::clear_routes() noexcept
 {
+	remove_split_routes();   // 分流条目数量大，单独走一条路径撤销
 	for (auto it = m_createdRoutes.rbegin(); it != m_createdRoutes.rend(); it++) {
 		::DeleteIpForwardEntry2(&(*it));
 	}
@@ -163,6 +164,103 @@ bool RouteManager::create_route(const MIB_IPFORWARD_ROW2& route)
 	return false;
 }
 
+// 分流：把一批 CIDR 指向"通往 probeIp 的物理出口"。
+// 一次 GetBestRoute2 拿到出口网卡与网关，复用到全部条目，避免每条查一遍路由表。
+int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const cfgstr& probeIp)
+{
+	if (cidrs.empty()) {
+		return 0;
+	}
+	SOCKADDR_INET probe{};
+	if (!make_ipv4_to_sockaddr(probeIp, probe)) {
+		LOG_ERROR("add_bypass_routes: 探测地址非法");
+		return 0;
+	}
+
+	MIB_IPFORWARD_ROW2 best{};
+	SOCKADDR_INET bestSource{};
+	const NETIO_STATUS gst = ::GetBestRoute2(nullptr, 0, nullptr, &probe, 0, &best, &bestSource);
+	if (gst != NO_ERROR) {
+		LOG_ERROR("add_bypass_routes: GetBestRoute2(%s) 失败 err=%lu",
+			cfg_to_utf8(probeIp).c_str(), gst);
+		return 0;
+	}
+
+	int ok = 0;
+	m_splitRoutes.reserve(m_splitRoutes.size() + cidrs.size());
+	for (const auto& c : cidrs) {
+		const uint64_t key = (static_cast<uint64_t>(c.addr) << 8) | c.prefix;
+		if (!m_splitKeys.insert(key).second) {
+			continue;   // 已注入过
+		}
+		MIB_IPFORWARD_ROW2 row{};
+		InitializeIpForwardEntry(&row);
+		row.InterfaceLuid = best.InterfaceLuid;
+		row.DestinationPrefix.Prefix.si_family = AF_INET;
+		row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = ::htonl(c.addr);
+		row.DestinationPrefix.PrefixLength = c.prefix;
+		row.NextHop = best.NextHop;
+		// metric 必须低于隧道默认路由（0.0.0.0/1），否则同前缀长度下会被隧道抢走，
+		// 表现为"分流看似生效、国内流量仍然绕了一圈"
+		row.Metric = 1;
+
+		const NETIO_STATUS st = ::CreateIpForwardEntry2(&row);
+		if (st == NO_ERROR || st == ERROR_OBJECT_ALREADY_EXISTS) {
+			m_splitRoutes.push_back(row);
+			++ok;
+		}
+		else {
+			m_splitKeys.erase(key);   // 失败不占位
+		}
+	}
+	LOG_INFO("分流路由: 注入 %d / %zu 条（出口 LUID=%llu）",
+		ok, cidrs.size(), static_cast<unsigned long long>(best.InterfaceLuid.Value));
+	return ok;
+}
+
+void RouteManager::remove_split_routes() noexcept
+{
+	for (auto it = m_splitRoutes.rbegin(); it != m_splitRoutes.rend(); ++it) {
+		::DeleteIpForwardEntry2(&(*it));
+	}
+	m_splitRoutes.clear();
+	m_splitKeys.clear();
+}
+
+std::size_t RouteManager::split_route_count() const noexcept
+{
+	return m_splitRoutes.size();
+}
+
+// 自校验：把 m_splitKeys 里的条目拿到系统路由表里对一遍。
+// 这是唯一能证明"注入真的生效"的办法——API 返回值不可信。
+int RouteManager::count_active_split_routes() const
+{
+	if (m_splitKeys.empty()) {
+		return 0;
+	}
+	PMIB_IPFORWARD_TABLE2 table = nullptr;
+	const NETIO_STATUS st = ::GetIpForwardTable2(AF_INET, &table);
+	if (st != NO_ERROR || table == nullptr) {
+		return -1;
+	}
+	int found = 0;
+	for (ULONG i = 0; i < table->NumEntries; ++i) {
+		const MIB_IPFORWARD_ROW2& r = table->Table[i];
+		if (r.DestinationPrefix.Prefix.si_family != AF_INET) {
+			continue;
+		}
+		const uint32_t addr = ::ntohl(r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr);
+		const uint64_t key = (static_cast<uint64_t>(addr) << 8)
+			| static_cast<uint8_t>(r.DestinationPrefix.PrefixLength);
+		if (m_splitKeys.count(key) != 0) {
+			++found;
+		}
+	}
+	::FreeMibTable(table);
+	return found;
+}
+
 #else // ---------------------------- Linux ----------------------------
 
 #include "route_manager.h"
@@ -170,6 +268,7 @@ bool RouteManager::create_route(const MIB_IPFORWARD_ROW2& route)
 
 #include <arpa/inet.h>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <linux/if.h>
@@ -362,8 +461,119 @@ bool RouteManager::add_server_bypass_route(const cfgstr& serverIp)
     {
         return false;
     }
-    LOG_INFO("bypass 路由: %s（保证握手走物理网卡 %s）", spec.c_str(), br.dev.c_str());
-    return true;
+	LOG_INFO("bypass 路由: %s（保证握手走物理网卡 %s）", spec.c_str(), br.dev.c_str());
+	return true;
+}
+
+// 分流：批量把国内 CIDR 指到物理出口。
+// 逐条 fork `ip` 进程的话 4000 条要几十秒，必须用 `ip -batch` 一次性喂进去。
+int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const cfgstr& probeIp)
+{
+	if (cidrs.empty()) {
+		return 0;
+	}
+	const BestRoute br = best_route_for(cfg_to_utf8(probeIp));
+	if (br.dev.empty() || !safe_ifname(br.dev)) {
+		LOG_ERROR("add_bypass_routes: 查不到到 %s 的物理出口", cfg_to_utf8(probeIp).c_str());
+		return 0;
+	}
+
+	const std::string batchPath = "/tmp/scholarvpn-routes-add.batch";
+	FILE* f = std::fopen(batchPath.c_str(), "w");
+	if (f == nullptr) {
+		LOG_ERROR("add_bypass_routes: 无法创建 batch 文件 %s", batchPath.c_str());
+		return 0;
+	}
+	// batch 里每行是"ip 之后的参数"，且必须带 route 对象：
+	// 只写 "replace ..." 会被 ip 当成无效对象，整批静默失败。
+	std::vector<cidr::Cidr> fresh;
+	fresh.reserve(cidrs.size());
+	for (const auto& c : cidrs) {
+		const uint64_t key = (static_cast<uint64_t>(c.addr) << 8) | c.prefix;
+		if (!m_splitKeys.insert(key).second) {
+			continue;   // 已注入过
+		}
+		fresh.push_back(c);
+		std::fprintf(f, "route replace %s", cidr::to_string(c).c_str());
+		if (!br.via.empty()) {
+			std::fprintf(f, " via %s", br.via.c_str());
+		}
+		std::fprintf(f, " dev %s metric 1\n", br.dev.c_str());
+	}
+	std::fclose(f);
+
+	const int rc = run_cmd("ip -batch " + batchPath);
+	std::remove(batchPath.c_str());
+	if (rc != 0) {
+		LOG_ERROR("add_bypass_routes: ip -batch 失败 rc=%d", rc);
+		for (const auto& c : fresh) {
+			m_splitKeys.erase((static_cast<uint64_t>(c.addr) << 8) | c.prefix);
+		}
+		return 0;
+	}
+
+	// 记录删除命令（同样是 batch 行，撤销时一次执行）
+	m_splitRoutes.reserve(m_splitRoutes.size() + fresh.size());
+	for (const auto& c : fresh) {
+		std::string del = "route del " + cidr::to_string(c);
+		if (!br.via.empty()) {
+			del += " via " + br.via;
+		}
+		del += " dev " + br.dev;
+		m_splitRoutes.push_back(std::move(del));
+	}
+	LOG_INFO("分流路由: 注入 %zu 条（出口 %s%s%s）",
+		fresh.size(), br.dev.c_str(),
+		br.via.empty() ? "" : " via ", br.via.c_str());
+	return static_cast<int>(fresh.size());
+}
+
+void RouteManager::remove_split_routes() noexcept
+{
+	if (m_splitRoutes.empty()) {
+		return;
+	}
+	const std::string batchPath = "/tmp/scholarvpn-routes-del.batch";
+	FILE* f = std::fopen(batchPath.c_str(), "w");
+	if (f != nullptr) {
+		for (const auto& line : m_splitRoutes) {
+			std::fprintf(f, "%s\n", line.c_str());
+		}
+		std::fclose(f);
+		run_cmd("ip -batch " + batchPath);
+		std::remove(batchPath.c_str());
+	}
+	m_splitRoutes.clear();
+	m_splitKeys.clear();
+}
+
+std::size_t RouteManager::split_route_count() const noexcept
+{
+	return m_splitRoutes.size();
+}
+
+// 自校验：解析 `ip -4 route show` 的第一列目标前缀，与 m_splitKeys 比对。
+// 每行形如：117.128.0.0/10 via 192.168.1.1 dev eth0 metric 1
+int RouteManager::count_active_split_routes() const
+{
+	if (m_splitKeys.empty()) {
+		return 0;
+	}
+	const std::vector<std::string> lines = run_cmd_lines("ip -4 route show table main");
+	int found = 0;
+	for (const auto& line : lines) {
+		const std::size_t sp = line.find(' ');
+		const std::string tok = (sp == std::string::npos) ? line : line.substr(0, sp);
+		cidr::Cidr c{};
+		if (!cidr::parse(tok, c)) {
+			continue;
+		}
+		const uint64_t key = (static_cast<uint64_t>(c.addr) << 8) | c.prefix;
+		if (m_splitKeys.count(key) != 0) {
+			++found;
+		}
+	}
+	return found;
 }
 
 void RouteManager::remove_default_route() noexcept
@@ -386,6 +596,7 @@ void RouteManager::remove_default_route() noexcept
 
 void RouteManager::clear_routes() noexcept
 {
+    remove_split_routes();   // 分流条目走 batch，先撤
     for (auto it = m_addedRoutes.rbegin(); it != m_addedRoutes.rend(); ++it)
     {
         run_cmd(*it);

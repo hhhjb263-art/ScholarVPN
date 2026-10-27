@@ -462,3 +462,6 @@ build-client/
 
 # ServerAdmin 子工程的 qmake/Qt Creator 构建目录（Makefile、.qmake.stash、ui_*.h 等）
 ServerAdmin/**/build/
+
+# 本地测试产物与发布工具的输出（dist 目录整体不入库，含发布私钥！）
+dist/

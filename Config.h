@@ -67,6 +67,23 @@ struct ClientConfig
     cfgstr RegisterToken = CS("");       // one-time register token (empty = login mode)
     // 默认/活动服务器的身份公钥（与 servers[0].ServerPubKey 同步，空=用内置公钥）
     cfgstr ServerPubKey;
+
+    // ---- 流量分流（[Routing]）----
+    // Mode: full = 全流量走隧道（默认，保持旧行为）；split = 国内 IP 直连
+    cfgstr RoutingMode = CS("full");
+    // 国内列表来源：builtin = 程序目录的 chnroute.txt；也可填 http(s) URL（P2）
+    cfgstr ChinaIPList = CS("builtin");
+    // 额外直连网段（逗号分隔），用于"连上后仍要访问本地局域网"的场景
+    cfgstr BypassSubnets = CS("");
+    // 查物理出口用的探测地址，空 = 8.8.8.8
+    cfgstr ProbeIP = CS("");
+
+    // ---- 客户端更新（[Update]）----
+    // 全部留空 = 不启用更新检查（默认值，升级后老用户行为不变）。
+    // 一旦 PolicyURL 与 ReleasePubKey 都有值，启动时就会校验；验签失败即拒绝使用。
+    cfgstr UpdatePolicyURL = CS("");   // 策略文件地址
+    cfgstr UpdateSigURL = CS("");      // 签名地址；留空 = PolicyURL + ".sig"
+    cfgstr ReleasePubKey = CS("");     // 发布公钥 PEM；留空 = 内置（无内置则视为未启用）
 };
 
 class Config

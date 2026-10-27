@@ -29,6 +29,7 @@
 #include <windows.h>
 #else
 #include <arpa/inet.h>
+#include <netdb.h>   // getaddrinfo / freeaddrinfo
 #include <unistd.h>
 #endif
 
@@ -104,6 +105,65 @@ inline bool is_valid_ipv4(const std::string& ip) {
     struct in_addr addr{};
     return ::inet_pton(AF_INET, ip.c_str(), &addr) == 1;
 #endif
+}
+
+// 服务器地址可以是 IPv4，也可以是域名：IP 被封时只需改 DNS 解析，用户不用动配置。
+inline bool is_valid_host(const std::string& host)
+{
+    if (host.empty() || host.size() > 253)
+    {
+        return false;
+    }
+    if (is_valid_ipv4(host))
+    {
+        return true;
+    }
+    for (char c : host)
+    {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '.';
+        if (!ok)
+        {
+            return false;
+        }
+    }
+    if (host.front() == '.' || host.back() == '.' || host.front() == '-')
+    {
+        return false;
+    }
+    return host.find("..") == std::string::npos;
+}
+
+// 把 host（IPv4 字面量或域名）解析成一个 IPv4 点分字符串。
+// 只取第一个 A 记录（多 IP 轮询留待后续）。
+// ⚠️ 走系统 DNS：必须在默认路由指向 TUN **之前**调用，
+//    否则查询会被送进隧道，解析结果可能是服务端出口视角的，甚至直接失败。
+inline bool resolve_host(const std::string& host, std::string& outIP)
+{
+    if (is_valid_ipv4(host))
+    {
+        outIP = host;   // 已经是 IP，零开销
+        return true;
+    }
+    addrinfo hints{};
+    hints.ai_family = AF_INET;          // 只取 IPv4：隧道只承载 IPv4
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr)
+    {
+        return false;
+    }
+    char buf[INET_ADDRSTRLEN]{};
+    const sockaddr_in* sa = reinterpret_cast<const sockaddr_in*>(res->ai_addr);
+#if defined(_WIN32)
+    // InetNtopA 的入参不是 const，这里只做格式化不会修改内容
+    ::InetNtopA(AF_INET, const_cast<IN_ADDR*>(&sa->sin_addr), buf, sizeof(buf));
+#else
+    ::inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
+#endif
+    ::freeaddrinfo(res);
+    outIP = buf;
+    return !outIP.empty();
 }
 
 // 解析端口字符串 "1"~"65535"；合法返回 true 并写出 out

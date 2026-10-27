@@ -2,6 +2,8 @@
 #include "ClientApp.h"
 #include <cstdarg>
 #include <cstring>   // memcpy：上行报文的源地址终检
+#include <chrono>    // 分流注入耗时统计
+#include "platform/iplist.h"   // 国内网段列表（Mode=split）
 #include "tun_macro.h"   // LOG_INFO 等分级日志宏（logger.h 只有 LOG_ERR/LOG_KEY/LOG_DBG）
 #include"../src/util/utf.h"   // narrow/to_cfgstr/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
 #if !defined(_WIN32)
@@ -156,6 +158,12 @@ bool ClientApp::is_elevated()
 bool ClientApp::init()
 {
     Logger::Init();
+
+    // 进程级 Winsock 初始化（幂等，Linux 空实现）。
+    // 必须早于任何 getaddrinfo 调用：start() 里解析服务器域名时，
+    // UDP::init() 还没跑（它要到 start() 后段才创建），此时 WSACleanup 状态下的
+    // getaddrinfo 会直接返回 WSANOTINITIALISED —— 表现为"域名永远解析失败"。
+    sock_runtime_start();
 
     // 免 UAC 启动：普通用户也能运行本程序（界面/托盘可用），但创建 Wintun 网卡、
     // 改路由、改 DNS 都需要管理员权限，连接功能因此不可用。这里提前拦截并给出明确
@@ -338,11 +346,14 @@ bool ClientApp::init()
             static_cast<int>(m_transport));
 
 #ifndef _DEBUG
-    m_remote = narrow(m_cfg.ServerIP);
+    // 配置里允许填域名：这里只保留原文，解析放到 start()。
+    // 每次连接都解析一次 —— IP 被封后改 DNS 解析即可生效，不需要重启客户端。
+    m_serverHost = narrow(m_cfg.ServerIP);
+    m_remote = m_serverHost;
     // 空 = 多服务器模式：init 只建网卡/路由，目标服务器稍后由 set_server() 指定
-    if (!m_remote.empty() && !is_valid_ipv4(m_remote))
+    if (!m_remote.empty() && !is_valid_host(m_remote))
     {
-        LOG_ERR("Invalid ServerIP in config.ini: %s", m_remote.c_str());
+        LOG_ERR("Invalid ServerIP in config.ini (既不是 IPv4 也不是域名): %s", m_remote.c_str());
         return false;
     }
     if (m_cfg.ServerPort < 1 || m_cfg.ServerPort > 65535)
@@ -354,19 +365,26 @@ bool ClientApp::init()
 #else
     // Debug：默认192.168.1.12
     m_remote = "192.168.1.12";
+    m_serverHost = m_remote;
     m_port = 51820;
     if (Config::FileExists(m_configPath))
     {
         if (m_cfg.ServerPort >= 1 && m_cfg.ServerPort <= 65535)
             m_port = static_cast<uint16_t>(m_cfg.ServerPort);
         const std::string d = narrow(m_cfg.DebugServerIP);
-        if (is_valid_ipv4(d))
+        if (is_valid_host(d))
+        {
+            m_serverHost = d;
             m_remote = d;
+        }
         else
         {
             const std::string r = narrow(m_cfg.ServerIP);
-            if (is_valid_ipv4(r))
+            if (is_valid_host(r))
+            {
+                m_serverHost = r;
                 m_remote = r;
+            }
         }
     }
 #endif
@@ -403,7 +421,7 @@ bool ClientApp::init()
     {
         LOG_ERR("[Warn] Failed to set adapter metric");
     }
-    if (!m_adapter->set_DNS_IPv4(m_cfg.DNS))
+    if (!m_adapter->set_DNS_IPv4(effective_dns()))
     {
         LOG_ERR("[Warn] Failed to set DNS, continuing without custom DNS");
     }
@@ -439,9 +457,40 @@ bool ClientApp::start()
         return false;
     }
 
+    // 强制更新闸门：界面已禁用「连接」，但托盘菜单/命令行仍可能调到这里。
+    // 用户要求强制更新时不允许离线使用，所以这里也必须挡一道。
+    if (m_updateBlocked.load())
+    {
+        LOG_ERR("[Update] 当前版本被要求强制更新，拒绝连接");
+        emit_log("当前版本已被要求强制更新，请先更新后再连接");
+        m_running.store(false);
+        return false;
+    }
+
     // 注意：不能在这里做启动兜底 restore()——start() 每次连接都会调用，
     // 白遍历一遍网卡；且 m_running 已置 true，若 restore 内部异常会卡死状态机。
     // 启动兜底已移到 init()（只在程序启动/首次连接时执行一次）。
+
+    // 解析服务器地址（配置里可能是域名）。
+    // 必须在这里做：add_server_bypass_route 与 ReconnectManager 都只认 IPv4 字面量。
+    // 此刻默认路由还没指向 TUN，DNS 查询走物理网卡，结果才是可信的。
+    if (!m_serverHost.empty())
+    {
+        std::string ip;
+        if (!resolve_host(m_serverHost, ip))
+        {
+            LOG_ERR("[DNS] 解析服务器地址失败: %s", m_serverHost.c_str());
+            emit_log("无法解析服务器地址 %s（检查域名拼写 / 本机 DNS）", m_serverHost.c_str());
+            m_running.store(false);
+            return false;
+        }
+        if (ip != m_serverHost)
+        {
+            LOG_KEY("[DNS] %s -> %s", m_serverHost.c_str(), ip.c_str());
+            emit_log("[DNS] %s -> %s", m_serverHost.c_str(), ip.c_str());
+        }
+        m_remote = ip;
+    }
 
     // set_server() 可能已切换/首次指定目标服务器：这里补加 bypass 路由，
     // 保证握手包走物理网卡到达服务器（init() 时 m_remote 为空会跳过）。
@@ -518,6 +567,10 @@ bool ClientApp::start()
             if (m_route)
             {
                 m_route->add_server_bypass_route(cfg_from_utf8(m_remote));
+                // 分流：把国内网段先指回物理出口，再加默认路由。
+                // 顺序不能反——先加默认路由会有一个短暂窗口，
+                // 期间国内流量被送进隧道（不致命，但触发无谓重连）。
+                apply_split_routing();
                 m_route->add_default_route(m_cfg.Metric);
                 // 注意：**不要**在这里调用 add_ipv6_default_route()（::/0 kill-switch）。
                 // 2026-09-25 实测回归（Android 端同样现象）：把 ::/0 拉进 TUN 后，
@@ -530,7 +583,7 @@ bool ClientApp::start()
             }
             // 隧道已建立：此时才清物理网卡 DNS / 禁用多宿主解析（防泄漏），
             // 断线时由状态回调恢复，不会出现\"没连上却把系统 DNS/路由切走\"的黑洞。
-            m_dnsGuard.protect(m_tun->get_interface_id(), m_cfg.DNS);
+            m_dnsGuard.protect(m_tun->get_interface_id(), effective_dns());
             emit_log("[Reconnect] Connected, routes + DNS guard active");
 
             // 多用户服务端：identity_ok 通告的虚拟 IP 覆盖网卡地址
@@ -798,6 +851,130 @@ void ClientApp::udp_to_tun_loop()
     }
 }
 
+namespace {
+
+// 大小写不敏感比较（配置里写 Split / SPLIT 都认）
+bool equals_ci(const std::string& a, const char* b)
+{
+    const std::size_t n = std::strlen(b);
+    if (a.size() != n)
+    {
+        return false;
+    }
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(a[i]);
+        const char lower = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a')
+                                                  : static_cast<char>(c);
+        if (lower != b[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 从程序目录加载内置的国内网段列表（exeDirUtf8 为 UTF-8 路径）
+bool load_china_ip_list(const std::string& exeDirUtf8, std::vector<cidr::Cidr>& out)
+{
+    const cfgstr path = cfg_path_join(cfg_from_utf8(exeDirUtf8), CS("chnroute.txt"));
+    iplist::Stats st;
+    if (!iplist::load_file(path, out, &st))
+    {
+        LOG_WARN("[Split] 找不到国内网段文件：%s", cfg_to_utf8(path).c_str());
+        return false;
+    }
+    LOG_INFO("[Split] 加载国内网段 %zu 条（坏行 %zu）", st.valid, st.malformed);
+    return !out.empty();
+}
+
+} // namespace
+
+bool ClientApp::routing_split() const
+{
+    return equals_ci(cfg_to_utf8(m_cfg.RoutingMode), "split");
+}
+
+void ClientApp::set_routing_split(bool split)
+{
+    m_cfg.RoutingMode = split ? CS("split") : CS("full");
+}
+
+// 实际使用的 DNS。
+// 分流模式下刻意改用国内 DNS：隧道只承载国外流量，DNS 却全走隧道是反直觉的——
+// 一旦隧道出口异常，连国内域名都解析不了，表现就是"完全没网"。
+// 国内 DNS 的地址落在 chnroute 里，会走直连，隧道挂了也不影响国内访问。
+cfgstr ClientApp::effective_dns() const
+{
+    if (!routing_split())
+    {
+        return m_cfg.DNS;
+    }
+    return CS("223.5.5.5,119.29.29.29");
+}
+
+// 流量分流：Mode=split 时把国内网段指回物理出口。
+// 调用点固定在 add_default_route() 之前——先让国内段绕开隧道，再接管默认路由。
+void ClientApp::apply_split_routing()
+{
+    if (!equals_ci(cfg_to_utf8(m_cfg.RoutingMode), "split"))
+    {
+        LOG_INFO("[Split] Mode=full：全流量走隧道");
+        return;
+    }
+    if (m_route->split_route_count() > 0)
+    {
+        // 断线重连：路由已存在，重复注入只会让路由表膨胀
+        LOG_INFO("[Split] 已注入 %zu 条，跳过重复注入", m_route->split_route_count());
+        return;
+    }
+
+    std::vector<cidr::Cidr> list;
+    if (!load_china_ip_list(get_exe_dir(), list))
+    {
+        LOG_WARN("[Split] 无可用列表，降级为 full（全流量走隧道）");
+        return;
+    }
+
+    const cfgstr probe = m_cfg.ProbeIP.empty() ? CS("8.8.8.8") : m_cfg.ProbeIP;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int ok = m_route->add_bypass_routes(list, probe);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+
+    const std::size_t total = list.size();
+    if (ok == 0)
+    {
+        LOG_WARN("[Split] 一条都未注入成功，降级为 full");
+        return;
+    }
+    if (static_cast<std::size_t>(ok) * 10 < total)
+    {
+        // 只成功一小部分比完全不分流更危险：用户无法判断哪些走了隧道
+        LOG_WARN("[Split] 仅成功 %d/%zu（不足 10%%），回滚避免半个分流", ok, total);
+        m_route->remove_split_routes();
+        return;
+    }
+    LOG_INFO("[Split] 注入 %d/%zu 条国内网段，耗时 %lld ms", ok, total,
+             static_cast<long long>(ms));
+
+    // 自校验：CreateIpForwardEntry2 返回成功不代表真的写进去了。
+    // 把记录过的条目拿到系统路由表里对一遍，日志才能自证分流是否生效。
+    const int actual = m_route->count_active_split_routes();
+    if (actual >= 0)
+    {
+        if (actual < ok)
+        {
+            LOG_WARN("[Split] 自校验不通过：API 返回 %d 条，路由表里只有 %d 条"
+                     "（注入未真正生效，检查是否以管理员运行）", ok, actual);
+        }
+        else
+        {
+            LOG_INFO("[Split] 自校验通过：路由表内确认 %d 条分流路由", actual);
+        }
+    }
+}
+
 void ClientApp::stop()
 {
     const bool wasRunning = m_running.exchange(false);
@@ -867,7 +1044,8 @@ std::string ClientApp::client_id() const
 // 多服务器：切换目标服务器及其各自认证身份（init 之后、start 之前调用）
 void ClientApp::set_server(const ServerEntry& entry)
 {
-    m_remote = narrow(entry.ServerIP);
+    m_serverHost = narrow(entry.ServerIP);
+    m_remote = m_serverHost;
     m_port = static_cast<uint16_t>(entry.ServerPort);
     m_transport = entry.transport ? Transport::TCP : Transport::UDP;
     m_cfg.ClientID = entry.ClientID;

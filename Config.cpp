@@ -465,6 +465,17 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     outCfg.Metric = static_cast<uint8_t>(
         IniGetInt(ini_path, CS("Network"), CS("Metric"), outCfg.Metric));
 
+    // [Routing] 分流配置（缺失时保持默认 full，旧配置文件无需迁移）
+    outCfg.RoutingMode = IniGetStr(ini_path, CS("Routing"), CS("Mode"), outCfg.RoutingMode);
+    outCfg.ChinaIPList = IniGetStr(ini_path, CS("Routing"), CS("ChinaIPList"), outCfg.ChinaIPList);
+    outCfg.BypassSubnets = IniGetStr(ini_path, CS("Routing"), CS("BypassSubnets"), outCfg.BypassSubnets);
+    outCfg.ProbeIP = IniGetStr(ini_path, CS("Routing"), CS("ProbeIP"), outCfg.ProbeIP);
+
+    // [Update]
+    outCfg.UpdatePolicyURL = IniGetStr(ini_path, CS("Update"), CS("PolicyURL"), outCfg.UpdatePolicyURL);
+    outCfg.UpdateSigURL = IniGetStr(ini_path, CS("Update"), CS("SigURL"), outCfg.UpdateSigURL);
+    outCfg.ReleasePubKey = IniGetStr(ini_path, CS("Update"), CS("PublicKey"), outCfg.ReleasePubKey);
+
     outCfg.ClientID = IniGetStr(ini_path, CS("Identity"), CS("ClientID"), outCfg.ClientID);
     outCfg.RegisterToken = IniGetStr(ini_path, CS("Identity"), CS("RegisterToken"), outCfg.RegisterToken);
 
@@ -506,6 +517,17 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
     ok &= IniSetStr(ini_path, CS("Network"), CS("DNS"), cfg.DNS);
     ok &= IniSetInt(ini_path, CS("Network"), CS("MTU"), static_cast<int>(cfg.MTU));
     ok &= IniSetInt(ini_path, CS("Network"), CS("Metric"), cfg.Metric);
+
+    // [Routing]
+    ok &= IniSetStr(ini_path, CS("Routing"), CS("Mode"), cfg.RoutingMode);
+    ok &= IniSetStr(ini_path, CS("Routing"), CS("ChinaIPList"), cfg.ChinaIPList);
+    ok &= IniSetStr(ini_path, CS("Routing"), CS("BypassSubnets"), cfg.BypassSubnets);
+    ok &= IniSetStr(ini_path, CS("Routing"), CS("ProbeIP"), cfg.ProbeIP);
+
+    // [Update]
+    ok &= IniSetStr(ini_path, CS("Update"), CS("PolicyURL"), cfg.UpdatePolicyURL);
+    ok &= IniSetStr(ini_path, CS("Update"), CS("SigURL"), cfg.UpdateSigURL);
+    ok &= IniSetStr(ini_path, CS("Update"), CS("PublicKey"), cfg.ReleasePubKey);
 
     // 多服务器模式下信息已由 [ServerN] 承载，主节/身份节的旧键清掉
     IniDelKey(ini_path, CS("Server"), CS("ServerIP"));

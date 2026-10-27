@@ -49,7 +49,7 @@ bool cfg_unlink(const cfgstr& path);
 bool cfg_restrict_file(const cfgstr& path);
 
 // 程序配置目录（含尾部路径分隔符）：
-//   Windows：%APPDATA%\ScholarVPN\
+//   Windows：%APPDATA%\ScholarVPN\  （末尾为路径分隔符）
 //   Linux  ：$XDG_CONFIG_HOME/scholarvpn/（未设置则 ~/.config/scholarvpn/）
 //   ⚠️ Linux 下若以 sudo 运行，会还原到 sudo 调用者的家目录——否则身份密钥
 //      落在 /root 下，下次普通用户运行会生成新身份、服务端当新设备，必须重新注册。

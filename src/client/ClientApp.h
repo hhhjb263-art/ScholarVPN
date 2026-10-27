@@ -57,6 +57,17 @@ public:
 	bool start();           // 启动 ReconnectManager + 桥接线程
 	void stop();            
 
+	// 分流模式（全局设置）。
+	// 约定：持久化由 GUI 负责（写 config.ini 的 [Routing] Mode 单键），
+	// 这里只维护运行时状态——避免 GUI 保存整份配置时把卡片刚改的 Transport 覆盖回去。
+	bool routing_split() const;
+	void set_routing_split(bool split);
+
+	// 服务端策略判定为强制更新时置位：start() 会直接拒绝连接。
+	// 放在这里而不是只靠界面禁用，是为了堵住托盘/命令行等绕过路径。
+	void set_update_blocked(bool blocked) { m_updateBlocked.store(blocked); }
+	bool update_blocked() const { return m_updateBlocked.load(); }
+
 	// 当前进程是否已提权（管理员）。创建 Wintun 网卡 / 改路由 / 改 DNS 都需要，
 	// 因此普通用户（免 UAC）启动时返回 false，init() 会失败、连接功能不可用。
 	static bool is_elevated();
@@ -85,6 +96,13 @@ private:
 	void tun_to_udp_loop();             
 	void udp_to_tun_loop();        
 
+	// 流量分流：Mode=split 时把国内网段指向物理出口。
+	// 必须在 add_default_route() 之前调用（否则国内流量会先被隧道抢走一次）。
+	void apply_split_routing();
+
+	// 实际使用的 DNS 列表：分流模式用国内 DNS（走直连），全局模式用配置值
+	cfgstr effective_dns() const;
+
 	ClientConfig m_cfg;
 	cfgstr m_configPath;                // config.ini 完整路径（Windows=wstring / Linux=UTF-8）
 	cfgstr m_configDir;
@@ -93,7 +111,9 @@ private:
 	std::string m_serverSigPubPem;
 	std::string m_builtinServerSigPubPem;   // 内置硬编码公钥备份（切换未配公钥的服务器时恢复，防公钥串台）
 	Transport m_transport{ Transport::UDP };   // 当前服务器条目的传输方式（UDP 默认 / TCP）
-	std::string m_remote;
+	std::string m_remote;       // 解析后的服务器 IP（UDP / 路由只用 IP）
+	std::string m_serverHost;   // 配置原文，可能是域名；每次 start() 重新解析
+	std::atomic<bool> m_updateBlocked{ false };   // 强制更新时禁止连接
 	uint16_t m_port = 0;
 
 	// 以下的成员持有保证生命周期

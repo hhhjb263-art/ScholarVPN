@@ -43,6 +43,11 @@ add_executable(vpn_client
     src/client/ClientApp.cpp
 
     src/platform/cfgstr.cpp
+    src/platform/iplist.cpp
+    src/update/update_policy.cpp
+    src/update/update_fetcher.cpp
+    src/update/update_checker.cpp
+    src/update/update_install.cpp
 
     src/tun.cpp
     src/AdapterConfig.cpp
@@ -63,6 +68,7 @@ target_include_directories(vpn_client PRIVATE
 target_link_libraries(vpn_client PRIVATE
     Threads::Threads
     OpenSSL::Crypto
+    OpenSSL::SSL
     Qt6::Widgets
 )
 
@@ -72,3 +78,4 @@ target_compile_options(vpn_client PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 install(TARGETS vpn_client RUNTIME DESTINATION bin)
 install(FILES src/gui/style.qss DESTINATION bin)
+install(FILES docs/routing/chnroute.txt DESTINATION bin)

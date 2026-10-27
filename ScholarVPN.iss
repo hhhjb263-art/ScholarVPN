@@ -1,73 +1,73 @@
-; ============================================================
-; ScholarVPN 客户端安装脚本（Inno Setup 6）
-; 用法（三步，或直接运行 scripts\package.bat 一键完成）：
+﻿; ============================================================
+; ScholarVPN 瀹㈡埛绔畨瑁呰剼鏈紙Inno Setup 6锛?
+; 鐢ㄦ硶锛堜笁姝ワ紝鎴栫洿鎺ヨ繍琛?scripts\package.bat 涓€閿畬鎴愶級锛?
 ;   1) MSBuild VPN_.sln /p:Configuration=Release /p:Platform=x64
-;   2) windeployqt x64\Release\ScholarVPN.exe        （收集全部 Qt 依赖）
-;   3) ISCC.exe ScholarVPN.iss                       （生成 x64\Release\ScholarVPNsetup.exe）
-; 目标机器无需安装任何运行环境：Qt/OpenSSL/Wintun 及插件全部随包安装。
+;   2) windeployqt x64\Release\ScholarVPN.exe        锛堟敹闆嗗叏閮?Qt 渚濊禆锛?
+;   3) ISCC.exe ScholarVPN.iss                       锛堢敓鎴?x64\Release\ScholarVPNsetup.exe锛?
+; 鐩爣鏈哄櫒鏃犻渶瀹夎浠讳綍杩愯鐜锛歈t/OpenSSL/Wintun 鍙婃彃浠跺叏閮ㄩ殢鍖呭畨瑁呫€?
 ; ============================================================
 
 #define MyAppName "ScholarVPN"
-#define MyAppVersion "1.5"
+#define MyAppVersion "1.7.0"
 #define MyAppPublisher "ScholarVPN"
 #define MyAppExeName "ScholarVPN.exe"
 
 [Setup]
-; AppId 单独标识本应用，勿与其他安装程序共用
+; AppId 鍗曠嫭鏍囪瘑鏈簲鐢紝鍕夸笌鍏朵粬瀹夎绋嬪簭鍏辩敤
 AppId={{CECB2BA2-256E-4200-802E-FA3D2AEBB0F7}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-; 程序要建 TUN 网卡/改路由/改 DNS/写注册表，必须管理员
+; 绋嬪簭瑕佸缓 TUN 缃戝崱/鏀硅矾鐢?鏀?DNS/鍐欐敞鍐岃〃锛屽繀椤荤鐞嗗憳
 PrivilegesRequired=admin
-; 仅 64 位
+; 浠?64 浣?
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 UsedUserAreasWarning=no
 UninstallDisplayIcon={app}\{#MyAppExeName}
-; 输出目录与文件名
+; 杈撳嚭鐩綍涓庢枃浠跺悕
 OutputDir=x64\Release
 OutputBaseFilename=ScholarVPNsetup
-; 安装包图标
+; 瀹夎鍖呭浘鏍?
 SetupIconFile=source\icon.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 
 [Languages]
-; 中文版 Inno Setup：Default.isl 即简体中文
+; 涓枃鐗?Inno Setup锛欴efault.isl 鍗崇畝浣撲腑鏂?
 Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 主程序
+; 涓荤▼搴?
 Source: "x64\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-; Qt 运行库（windeployqt 收集）
+; Qt 杩愯搴擄紙windeployqt 鏀堕泦锛?
 Source: "x64\Release\Qt6Core.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\Qt6Gui.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\Qt6Widgets.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\Qt6Network.dll"; DestDir: "{app}"; Flags: ignoreversion
-; OpenGL 软渲染回退（无显卡驱动的机器也能显示界面）
+; OpenGL 杞覆鏌撳洖閫€锛堟棤鏄惧崱椹卞姩鐨勬満鍣ㄤ篃鑳芥樉绀虹晫闈級
 Source: "x64\Release\D3Dcompiler_47.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\opengl32sw.dll"; DestDir: "{app}"; Flags: ignoreversion
-; OpenSSL 加密库 + Wintun 驱动
+; OpenSSL 鍔犲瘑搴?+ Wintun 椹卞姩
 Source: "x64\Release\libcrypto-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "x64\Release\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
-; Qt 平台插件（缺了程序无法启动）
+; Qt 骞冲彴鎻掍欢锛堢己浜嗙▼搴忔棤娉曞惎鍔級
 Source: "x64\Release\platforms\*"; DestDir: "{app}\platforms"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Qt 其余插件（样式/图像格式/图标引擎/TLS/网络信息）
+; Qt 鍏朵綑鎻掍欢锛堟牱寮?鍥惧儚鏍煎紡/鍥炬爣寮曟搸/TLS/缃戠粶淇℃伅锛?
 Source: "x64\Release\styles\*"; DestDir: "{app}\styles"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\imageformats\*"; DestDir: "{app}\imageformats"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\iconengines\*"; DestDir: "{app}\iconengines"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\tls\*"; DestDir: "{app}\tls"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "x64\Release\networkinformation\*"; DestDir: "{app}\networkinformation"; Flags: ignoreversion recursesubdirs createallsubdirs
-; 全局样式表
+; 鍏ㄥ眬鏍峰紡琛?
 Source: "x64\Release\style.qss"; DestDir: "{app}"; Flags: ignoreversion
-; 托盘图标（程序从 exe 同目录读取 icon.ico，缺了会退回系统默认图标）
+; 鎵樼洏鍥炬爣锛堢▼搴忎粠 exe 鍚岀洰褰曡鍙?icon.ico锛岀己浜嗕細閫€鍥炵郴缁熼粯璁ゅ浘鏍囷級
 Source: "x64\Release\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -78,5 +78,5 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; 卸载默认保留 %APPDATA%\ScholarVPN（用户配置与身份密钥）；要彻底清除可去掉下一行注释：
+; 鍗歌浇榛樿淇濈暀 %APPDATA%\ScholarVPN锛堢敤鎴烽厤缃笌韬唤瀵嗛挜锛夛紱瑕佸交搴曟竻闄ゅ彲鍘绘帀涓嬩竴琛屾敞閲婏細
 ; Type: filesandordirs; Name: "{userappdata}\ScholarVPN"

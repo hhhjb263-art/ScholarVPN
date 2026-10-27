@@ -43,6 +43,27 @@
     <ClInclude Include="src\platform\sock_compat.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="src\platform\cidr.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\platform\iplist.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\version.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\update\update_policy.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\update\update_fetcher.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\update\update_checker.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\update\update_install.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="src\platform\exec.h">
       <Filter>头文件</Filter>
     </ClInclude>
@@ -117,6 +138,21 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\platform\cfgstr.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\platform\iplist.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\update\update_policy.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\update\update_fetcher.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\update\update_checker.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\update\update_install.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\packet_buffer.cpp">

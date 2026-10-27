@@ -18,6 +18,9 @@
 #include <QMenu>
 #include <QCloseEvent>
 
+class Setting;
+class QMessageBox;
+
 class SpeedChart : public QWidget
 {
 public:
@@ -191,20 +194,47 @@ private:
 	QThread* m_thread_start = nullptr;
 
 	QPushButton* m_btnSwitch = nullptr;   // Switch Server 按钮（主界面，控制弹窗显隐）
+	QPushButton* m_btnGlobal = nullptr;   // 分流模式：全局（全流量走隧道）
+	QPushButton* m_btnSplit = nullptr;    // 分流模式：智能（国内直连）
+	// 设置对话框【关于】页（弹出期间有效，QPointer 自动置空）
+	QPointer<Setting> m_setting;
+	// 强制更新弹窗（下载进度直接显示在弹窗按钮上）
+	QPointer<QMessageBox> m_updateBox;
+	QPointer<QPushButton> m_boxBtn;
+
+	// 最近一次检查到的更新信息（「立即更新」时直接用）
+	QString  m_updateUrl;
+	QString  m_updateSha256;
+	QString  m_updateLatest;
+	quint64  m_updateSize = 0;
+	bool m_lastDownloadOk = false;   // 最近一次下载结果（强制弹窗循环据此退出）
 	QSystemTrayIcon* m_trayicon = nullptr;
 	QMenu* m_menu = nullptr;
 	QAction* m_actionShow = nullptr;
 	QAction* m_actionQuit = nullptr;
 
-	QString version = "1.0.6";
-	QLabel *show_version = nullptr;
 };
 
 class Setting : public QDialog {
 public:
-	explicit Setting(QWidget* parent = nullptr);
+	explicit Setting(QWidget* parent, AppBridge* bridge);
 	~Setting();
+	// 更新状态同步（由主界面转发 AppBridge 信号；本类无 Q_OBJECT，用普通方法）
+	void applyUpdateInfo(int status, int action, const QString& latest,
+	                     const QString& notes, const QString& err,
+	                     const QString& url, const QString& sha256, quint64 size);
+	void applyDownloadProgress(int pct);
+	void applyDownloadFinished(bool ok, const QString& err);
 private:
 	void create_setting();
+	void build_about_page(class QStackedWidget* stack, class QListWidget* nav);
 	QCheckBox* m_chkAutoStart = nullptr;
+	AppBridge* m_bridge = nullptr;
+	// 关于页控件
+	QLabel* m_aboutVer = nullptr;
+	QLabel* m_aboutStatus = nullptr;
+	QPushButton* m_btnCheck = nullptr;
+	QPushButton* m_btnUpdateNow = nullptr;
+	QString m_url, m_sha256, m_latest, m_notes;
+	quint64 m_size = 0;
 };

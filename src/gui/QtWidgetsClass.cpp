@@ -1,6 +1,7 @@
 #include "QtWidgetsClass.h"
 #include "QtCfg.h"   // toQString / fromQString（cfgstr <-> QString 的唯一桥）
-#include "CenteredComboBox.h"   // 只重写绘制、不改行为的居中下拉框
+#include "CenteredComboBox.h"
+#include "version.h"   // SCHOLARVPN_VER_STRING   // 只重写绘制、不改行为的居中下拉框
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QScrollArea>
@@ -10,6 +11,7 @@
 #include <QDialog>
 #include <QCheckBox>
 #include <QMessageBox>
+#include <QTimer>
 #include <QDir>
 #include <QListWidget>
 #include <QStackedWidget>
@@ -114,8 +116,10 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	}
 	)");
 	connect(btn_setting, &QPushButton::clicked, this, [this]() {
-		Setting dlg(this);
+		Setting dlg(this, m_bridge);
+		m_setting = &dlg;
 		dlg.exec();
+		m_setting = nullptr;
 	});
 
 	topBar->addWidget(btn_setting);
@@ -381,6 +385,11 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		if (s == ConnState::Stopped || s == ConnState::Reconnecting)
 			m_homeVip->setText("内网IP: --");
 		m_btnSwitch->setEnabled(s == ConnState::Stopped);
+		// 分流模式是"下次连接生效"的全局设置：连接中禁用，
+		// 避免 GUI 线程与 worker 线程同时改路由表
+		const bool stopped = (s == ConnState::Stopped);
+		if (m_btnGlobal) m_btnGlobal->setEnabled(stopped);
+		if (m_btnSplit) m_btnSplit->setEnabled(stopped);
 		update_home_btn();
 		update_glass_card();
 
@@ -435,6 +444,190 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		qDebug() << "show switch";
 		show_switch_dialog();
 	});
+
+	// ---- 分流模式切换：全局 / 智能 ----
+	// 全局：所有流量走隧道（原有行为，默认）
+	// 智能：国内 IP 段走物理网卡，其余走隧道（依赖 exe 目录下的 chnroute.txt）
+	//
+	// 持久化只写 [Routing] Mode 这一个键，不调 ClientApp::save_config()——
+	// 那会把整份配置写回，可能覆盖用户在卡片上刚改的 Transport。
+	// 两个选项合成一个分段控件（胶囊）：与 Switch Server 同宽居中，
+	// 选中项白底蓝字，视觉上是一个整体而不是两个悬空小按钮
+	QFrame* seg = new QFrame(this);
+	seg->setGeometry(105, 680, 220, 34);
+	seg->setStyleSheet(QStringLiteral(
+	    "QFrame{background-color:#eef1f6;border:1px solid #e4e8f0;border-radius:10px;}"));
+	auto* segLay = new QHBoxLayout(seg);
+	segLay->setContentsMargins(3, 3, 3, 3);
+	segLay->setSpacing(0);
+
+	const QString segBtnStyle = QStringLiteral(
+	    "QPushButton{background:transparent;border:none;border-radius:8px;"
+	    "color:#5b6472;font-size:10pt;}"
+	    "QPushButton:checked{background-color:#ffffff;color:#2563eb;font-weight:bold;}"
+	    "QPushButton:disabled{color:#c3c8d2;background:transparent;}");
+
+	m_btnGlobal = new QPushButton(QStringLiteral("全局"), seg);
+	m_btnGlobal->setCursor(Qt::PointingHandCursor);
+	m_btnGlobal->setCheckable(true);
+	m_btnGlobal->setAutoExclusive(true);
+	m_btnGlobal->setStyleSheet(segBtnStyle);
+	m_btnGlobal->setToolTip(QStringLiteral("所有流量都走隧道（包括国内网站）"));
+
+	m_btnSplit = new QPushButton(QStringLiteral("智能分流"), seg);
+	m_btnSplit->setCursor(Qt::PointingHandCursor);
+	m_btnSplit->setCheckable(true);
+	m_btnSplit->setAutoExclusive(true);
+	m_btnSplit->setStyleSheet(segBtnStyle);
+	m_btnSplit->setToolTip(QStringLiteral("国内 IP 直连，其余走隧道"));
+
+	segLay->addWidget(m_btnGlobal);
+	segLay->addWidget(m_btnSplit);
+
+	// 初始状态以 config.ini 为准：ClientApp 在首次连接时才加载配置，
+	// 这里如果读内存会拿到默认值，导致重启后按钮显示与实际不符。
+	{
+		const QString modeIni = toQString(cfg_path_join(cfg_app_dir(), CS("config.ini")));
+		QSettings settings(modeIni, QSettings::IniFormat);
+		const QString mode = settings.value(QStringLiteral("Routing/Mode"),
+		                                    QStringLiteral("full")).toString();
+		const bool split = (mode.compare(QStringLiteral("split"), Qt::CaseInsensitive) == 0);
+		m_btnSplit->setChecked(split);
+		m_btnGlobal->setChecked(!split);
+		m_bridge->set_routing_split(split);   // 同步给运行时，避免第一次连接用旧值
+	}
+
+	auto apply_mode = [this](bool split) {
+		const QString modeIni = toQString(cfg_path_join(cfg_app_dir(), CS("config.ini")));
+		QSettings settings(modeIni, QSettings::IniFormat);
+		settings.setValue(QStringLiteral("Routing/Mode"),
+		                  split ? QStringLiteral("split") : QStringLiteral("full"));
+		settings.sync();
+		m_bridge->set_routing_split(split);   // 只改内存，下次连接生效
+		qDebug() << "routing mode ->" << (split ? "split" : "full");
+	};
+	connect(m_btnGlobal, &QPushButton::clicked, this, [apply_mode]() { apply_mode(false); });
+	connect(m_btnSplit, &QPushButton::clicked, this, [apply_mode]() { apply_mode(true); });
+
+	// 启动时后台查一次：由服务端策略决定强制 / 可选 / 无需更新。
+	// 结果的界面表现在全部在设置【关于】页。
+	QTimer::singleShot(0, this, [this]() { m_bridge->check_update(); });
+
+	connect(m_bridge, &AppBridge::updateChecked, this,
+		[this](int status, int action, const QString& latest, const QString& notes, const QString& err,
+		       const QString& url, const QString& sha256, quint64 size) {
+			m_updateUrl = url;
+			m_updateSha256 = sha256;
+			m_updateLatest = latest;
+			m_updateSize = size;
+			// 界面表现在全部在设置【关于】页（开着才同步）
+			if (m_setting)
+			{
+				m_setting->applyUpdateInfo(status, action, latest, notes, err, url, sha256, size);
+			}
+			// 全局约束：验签失败 / 强制 → 禁连接 + 阻塞弹窗
+			//（Setting 无 Q_OBJECT 不能自己弹阻塞框，且它可能根本没开）
+			const bool sigBad = (status == 1);
+			const bool forced = (status == 0 && action == 2);
+			if (!sigBad && !forced)
+			{
+				return;
+			}
+
+			m_bridge->set_update_blocked(true);
+			m_homeBtn->setEnabled(false);
+
+			const QString title = sigBad ? QStringLiteral("更新信息校验失败")
+			                             : QStringLiteral("需要更新");
+			const QString body = sigBad
+				? QStringLiteral("无法验证更新信息的来源，为避免安全风险，程序已停止使用。\n\n%1").arg(err)
+				: QStringLiteral("当前版本 v%1 已不被支持，必须更新后才能继续使用。\n\n新版本：v%2\n%3")
+				      .arg(QStringLiteral(SCHOLARVPN_VER_STRING), latest, notes);
+
+			QMessageBox box(QMessageBox::Warning, title, body, QMessageBox::NoButton, this);
+			box.setWindowFlags(box.windowFlags() & ~Qt::WindowCloseButtonHint);
+			box.setEscapeButton(nullptr);
+			QPushButton* primary = box.addButton(
+				sigBad ? QStringLiteral("重试") : QStringLiteral("立即更新"),
+				QMessageBox::AcceptRole);
+			QPushButton* quitBtn = box.addButton(QStringLiteral("退出"), QMessageBox::RejectRole);
+			m_updateBox = &box;
+			m_boxBtn = primary;
+
+			// 循环 exec：点「立即更新」后弹窗不关闭，进度直接显示在按钮上；
+			// 下载失败回到弹窗（按钮变「下载失败，点此重试」），用户可反复重试；
+			// 成功或点「退出」才离开。
+			for (;;)
+			{
+				box.exec();
+				if (box.clickedButton() == quitBtn)
+				{
+					qApp->quit();
+					return;
+				}
+				if (m_lastDownloadOk)
+				{
+					qApp->quit();
+					return;
+				}
+				if (box.clickedButton() == primary && !sigBad &&
+				    !m_updateUrl.isEmpty() && !m_updateSha256.isEmpty())
+				{
+					primary->setEnabled(false);
+					m_bridge->download_and_install(m_updateUrl, m_updateSha256,
+					                               m_updateSize, m_updateLatest);
+				}
+				// 下载中再次 exec：进度经 downloadProgress 显示在 primary 上
+			}
+		});
+
+	// 下载进度：强制弹窗开着时显示在弹窗按钮上，否则显示在设置【关于】页
+	connect(m_bridge, &AppBridge::downloadProgress, this, [this](int pct) {
+		const QString t = pct >= 0 ? QStringLiteral("下载中 %1%").arg(pct)
+		                           : QStringLiteral("下载中...");
+		if (m_boxBtn)
+		{
+			m_boxBtn->setText(t);
+			return;
+		}
+		if (m_setting)
+		{
+			m_setting->applyDownloadProgress(pct);
+		}
+	});
+
+	connect(m_bridge, &AppBridge::downloadFinished, this, [this](bool ok, const QString& err) {
+		m_lastDownloadOk = ok;
+		if (ok)
+		{
+#if defined(_WIN32)
+			// Windows：Inno 已派发，/CLOSEAPPLICATIONS 会关掉本进程——主动退出让出文件锁
+			qApp->quit();
+#else
+			// Linux：pkexec 已把新版装到 /opt（文件替换不需要退出），
+			// 提示用户手动重启即用上新版
+			if (m_boxBtn)
+			{
+				m_boxBtn->setText(QStringLiteral("安装完成，请重新启动 ScholarVPN"));
+				m_boxBtn->setEnabled(true);
+			}
+			if (m_setting)
+			{
+				m_setting->applyDownloadFinished(true, QString());
+			}
+#endif
+			return;
+		}
+		if (m_boxBtn)
+		{
+			m_boxBtn->setText(QStringLiteral("下载失败，点此重试"));
+			m_boxBtn->setEnabled(true);
+		}
+		if (m_setting)
+		{
+			m_setting->applyDownloadFinished(false, err);
+		}
+	});
 	connect(btn_add, &QPushButton::clicked, this, &QtWidgetsClass::write_edit);
 
 	// 每秒采样一次流量 → update_speed() 计算速率推入折线图
@@ -445,10 +638,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	Read_iniFile();   // 读 config，为每台服务器建卡
 	createtray();
 
-	show_version = new QLabel(this);
-	show_version->setText("v" + version);
-	show_version->setGeometry(390,730,50, 20);
-	show_version->raise();
 }
 
 QtWidgetsClass::~QtWidgetsClass()
@@ -1351,8 +1540,8 @@ bool autostart_set(bool enable)
 
 } // namespace
 
-Setting::Setting(QWidget* parent)
-	: QDialog(parent)
+Setting::Setting(QWidget* parent, AppBridge* bridge)
+	: QDialog(parent), m_bridge(bridge)
 {
 	create_setting();
 }
@@ -1398,11 +1587,12 @@ void Setting::create_setting()
 	nav->setFrameShape(QFrame::NoFrame);
 	nav->setStyleSheet(R"(
     QListWidget{ background:transparent; border:none; outline:none; }
-    QListWidget::item{ height:36px; border-radius:10px; padding-left:12px; color:#5b6472; font-size:10pt; }
+    QListWidget::item{ height:32px; border-radius:10px; padding-left:12px; color:#5b6472; font-size:9pt; }
     QListWidget::item:selected{ background-color:#e8f0fe; color:#2563eb; font-weight:bold; }
     QListWidget::item:hover{ background-color:#eef2fa; }
     )");
 	nav->addItem(QStringLiteral("通用"));
+	nav->addItem(QStringLiteral("关于"));
 	nav->setCurrentRow(0);
 
 	QStackedWidget* stack = new QStackedWidget(this);
@@ -1436,6 +1626,8 @@ void Setting::create_setting()
 	genLay->addWidget(card);
 	genLay->addStretch();
 	stack->addWidget(generalPage);
+
+	build_about_page(stack, nav);
 
 	connect(nav, &QListWidget::currentRowChanged, stack, &QStackedWidget::setCurrentIndex);
 	body->addWidget(nav);
@@ -1493,3 +1685,169 @@ void Setting::create_setting()
 	root->addLayout(btnRow);
 }
 
+// ---------------- 设置【关于】页 ----------------
+
+void Setting::build_about_page(QStackedWidget* stack, QListWidget* nav)
+{
+	// 注意：导航项「关于」由 create_setting 统一添加（这里只建页面），
+	// 在这里再加一次会导致左栏出现两个「关于」。
+	QWidget* page = new QWidget;
+	auto* lay = new QVBoxLayout(page);
+	lay->setContentsMargins(0, 0, 0, 0);
+	lay->setSpacing(8);
+
+	QFrame* card = new QFrame(page);
+	card->setObjectName("setCard");
+	card->setStyleSheet(
+	    "QFrame#setCard{ background-color:#ffffff; border:1px solid #e8ecf3; border-radius:12px; }");
+	auto* cl = new QVBoxLayout(card);
+	cl->setContentsMargins(14, 12, 14, 12);
+	cl->setSpacing(6);
+
+	QLabel* name = new QLabel(QStringLiteral("ScholarVPN"), card);
+	name->setStyleSheet(
+	    "font-size:13pt; font-weight:bold; color:#1f2937; background:transparent;");
+	cl->addWidget(name);
+
+	m_aboutVer = new QLabel(QStringLiteral("版本 v") + QStringLiteral(SCHOLARVPN_VER_STRING), card);
+	m_aboutVer->setStyleSheet("font-size:10pt; color:#5b6472; background:transparent;");
+	cl->addWidget(m_aboutVer);
+
+	m_btnCheck = new QPushButton(QStringLiteral("检查更新"), card);
+	m_btnCheck->setCursor(Qt::PointingHandCursor);
+	m_btnCheck->setFixedHeight(30);
+	m_btnCheck->setStyleSheet(
+	    "QPushButton{background-color:#e8f0fe;border:1px solid #b9d3f0;border-radius:8px;"
+	    "color:#2563eb;font-size:10pt;}"
+	    "QPushButton:disabled{color:#9aa3b8;background:#f1f3f7;}");
+	connect(m_btnCheck, &QPushButton::clicked, this, [this]() {
+		if (m_bridge == nullptr)
+		{
+			return;
+		}
+		m_aboutStatus->setText(QStringLiteral("检查中..."));
+		m_bridge->check_update();   // 结果经主界面转发 applyUpdateInfo
+	});
+	cl->addWidget(m_btnCheck);
+
+	m_aboutStatus = new QLabel(
+	    QStringLiteral("是否需要更新由服务端策略决定"), card);
+	m_aboutStatus->setStyleSheet("font-size:9pt; color:#6b7280; background:transparent;");
+	m_aboutStatus->setWordWrap(true);
+	cl->addWidget(m_aboutStatus);
+
+	m_btnUpdateNow = new QPushButton(QStringLiteral("立即更新"), card);
+	m_btnUpdateNow->setCursor(Qt::PointingHandCursor);
+	m_btnUpdateNow->setFixedHeight(30);
+	m_btnUpdateNow->hide();   // 有更新时才显示
+	m_btnUpdateNow->setStyleSheet(
+	    "QPushButton{background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+	    "stop:0 #4f8ef7,stop:1 #2563eb);border:none;border-radius:8px;"
+	    "color:white;font-size:10pt;font-weight:bold;}"
+	    "QPushButton:disabled{background:#c9d4e5;}");
+	connect(m_btnUpdateNow, &QPushButton::clicked, this, [this]() {
+		if (m_bridge == nullptr || m_url.isEmpty() || m_sha256.isEmpty())
+		{
+			return;
+		}
+		m_btnCheck->setEnabled(false);
+		m_btnUpdateNow->setEnabled(false);
+		m_btnUpdateNow->setText(QStringLiteral("下载中..."));
+		m_bridge->download_and_install(m_url, m_sha256, m_size, m_latest);
+	});
+	cl->addWidget(m_btnUpdateNow);
+
+	lay->addWidget(card);
+	lay->addStretch();
+	stack->addWidget(page);
+}
+
+void Setting::applyUpdateInfo(int status, int action, const QString& latest,
+                              const QString& notes, const QString& err,
+                              const QString& url, const QString& sha256, quint64 size)
+{
+	m_url = url;
+	m_sha256 = sha256;
+	m_latest = latest;
+	m_notes = notes;
+	m_size = size;
+	// 阻塞判定与主界面一致（双保险，主界面也会做同样的事）
+	if (m_bridge != nullptr)
+	{
+		m_bridge->set_update_blocked(status == 1 || (status == 0 && action == 2));
+	}
+
+	if (status == 1)
+	{
+		m_aboutStatus->setText(QStringLiteral("更新信息校验失败：%1").arg(err));
+		m_btnUpdateNow->hide();
+		return;
+	}
+	if (status == 0 && action == 2)
+	{
+		m_aboutStatus->setText(
+		    QStringLiteral("当前版本已不被支持，必须更新到 v%1。").arg(latest));
+		m_btnUpdateNow->show();
+		m_btnUpdateNow->setText(QStringLiteral("立即更新"));
+		m_btnUpdateNow->setEnabled(true);
+		m_btnCheck->setEnabled(true);
+		return;
+	}
+	if (status == 0 && action == 1)
+	{
+		m_aboutStatus->setText(
+		    notes.isEmpty() ? QStringLiteral("发现新版本 v%1").arg(latest)
+		                    : QStringLiteral("发现新版本 v%1：").arg(latest) + notes);
+		m_btnUpdateNow->show();
+		m_btnUpdateNow->setText(QStringLiteral("立即更新"));
+		m_btnUpdateNow->setEnabled(true);
+		m_btnCheck->setEnabled(true);
+		return;
+	}
+	if (status == 0)
+	{
+		m_aboutStatus->setText(QStringLiteral("已是最新版本"));
+		m_btnUpdateNow->hide();
+		return;
+	}
+	// 网络失败：不打扰（未启用时 err 会说明原因）
+	if (!err.contains(QStringLiteral("未启用")))
+	{
+		m_aboutStatus->setText(QStringLiteral("检查失败：%1").arg(err));
+	}
+}
+
+void Setting::applyDownloadProgress(int pct)
+{
+	if (m_btnUpdateNow != nullptr)
+	{
+		m_btnUpdateNow->setText(pct >= 0 ? QStringLiteral("下载中 %1%").arg(pct)
+		                                 : QStringLiteral("下载中..."));
+	}
+}
+
+void Setting::applyDownloadFinished(bool ok, const QString& err)
+{
+	if (ok)
+	{
+		// 退出由主界面统一执行（强制弹窗也在等这个信号）
+		if (m_aboutStatus != nullptr)
+		{
+			m_aboutStatus->setText(QStringLiteral("安装器已启动，程序即将退出…"));
+		}
+		return;
+	}
+	if (m_btnCheck != nullptr)
+	{
+		m_btnCheck->setEnabled(true);
+	}
+	if (m_btnUpdateNow != nullptr)
+	{
+		m_btnUpdateNow->setEnabled(true);
+		m_btnUpdateNow->setText(QStringLiteral("立即更新"));
+	}
+	if (m_aboutStatus != nullptr)
+	{
+		m_aboutStatus->setText(QStringLiteral("更新失败：%1").arg(err));
+	}
+}

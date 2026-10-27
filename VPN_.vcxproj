@@ -71,6 +71,7 @@
       <Command>xcopy /Y /D "$(ProjectDir)third_party\openssl\bin\libcrypto-3-x64.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)third_party\wintun-0.14.1\wintun\bin\amd64\wintun.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)src\gui\style.qss" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)docs\routing\chnroute.txt" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)source\icon.ico" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Widgetsd.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Guid.dll" "$(OutDir)"
@@ -109,6 +110,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qicod.dll" "$(OutDir)i
       <Command>xcopy /Y /D "$(ProjectDir)third_party\openssl\bin\libcrypto-3-x64.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)third_party\wintun-0.14.1\wintun\bin\amd64\wintun.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)src\gui\style.qss" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)docs\routing\chnroute.txt" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)source\icon.ico" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Widgets.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Gui.dll" "$(OutDir)"
@@ -134,6 +136,13 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)im
     <ClInclude Include="src\logger.h" />
     <ClInclude Include="src\PacketQueue.h" />
     <ClInclude Include="src\platform\cfgstr.h" />
+    <ClInclude Include="src\platform\cidr.h" />
+    <ClInclude Include="src\platform\iplist.h" />
+    <ClInclude Include="src\version.h" />
+    <ClInclude Include="src\update\update_policy.h" />
+    <ClInclude Include="src\update\update_fetcher.h" />
+    <ClInclude Include="src\update\update_checker.h" />
+    <ClInclude Include="src\update\update_install.h" />
     <ClInclude Include="src\platform\sock_compat.h" />
     <ClInclude Include="src\platform\ini_doc.h" />
     <ClInclude Include="src\platform\exec.h" />
@@ -162,6 +171,11 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)im
     <ClCompile Include="src\logger.cpp" />
     <ClCompile Include="src\PacketQueue.cpp" />
     <ClCompile Include="src\platform\cfgstr.cpp" />
+    <ClCompile Include="src\platform\iplist.cpp" />
+    <ClCompile Include="src\update\update_policy.cpp" />
+    <ClCompile Include="src\update\update_fetcher.cpp" />
+    <ClCompile Include="src\update\update_checker.cpp" />
+    <ClCompile Include="src\update\update_install.cpp" />
     <ClCompile Include="src\packet_buffer.cpp" />
     <ClCompile Include="src\route_manager.cpp" />
     <ClCompile Include="src\reconnect_manager.cpp" />

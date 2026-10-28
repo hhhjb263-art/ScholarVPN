@@ -83,11 +83,17 @@ import android.widget.Toast
 import androidx.core.content.FileProvider
 import com.scholarvpn.client.BuildConfig
 import com.scholarvpn.client.update.UpdateChecker
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberDrawerState
 import com.scholarvpn.client.vpn.VpnStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
 import java.io.File
 
 /**
@@ -113,6 +119,48 @@ class MainActivity : ComponentActivity() {
         reloadServers()
         setContent {
             ScholarVpnTheme {
+                val drawerState = rememberDrawerState(DrawerValue.Closed)
+                val drawerScope = rememberCoroutineScope()
+                ModalNavigationDrawer(
+                    drawerState = drawerState,
+                    gesturesEnabled = true,
+                    drawerContent = {
+                        ModalDrawerSheet {
+                            Spacer(Modifier.height(12.dp))
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(MaterialTheme.shapes.small)
+                                        .background(brandBrush()),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text("S", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                }
+                                Spacer(Modifier.width(12.dp))
+                                Column {
+                                    Text("设置", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                    Text("ScholarVPN v" + BuildConfig.VERSION_NAME,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                            HorizontalDivider()
+                            Spacer(Modifier.height(8.dp))
+
+                            // 应用更新（对应桌面端设置/关于页）
+                            UpdateSection(
+                                state = updateState,
+                                hasUpdate = pendingUpdate != null,
+                                onCheck = { checkUpdate() },
+                                onUpdate = { pendingUpdate?.let { doUpdate(it) } },
+                            )
+                        }
+                    },
+                ) {
                 // Service 清令牌（注册成功消费/令牌失效作废）后自动刷新卡片，
                 // 防止界面内存里的废令牌被编辑保存回存储（"连接后秒拒"的根因）
                 LaunchedEffect(Unit) {
@@ -132,7 +180,9 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Spacer(Modifier.height(8.dp))
 
-                        BrandHeader()
+                        BrandHeader(onLogoClick = {
+                            drawerScope.launch { drawerState.open() }
+                        })
 
                         Spacer(Modifier.height(16.dp))
 
@@ -176,16 +226,6 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
-
-                    // 应用内更新入口（对应桌面端设置/关于页）
-                    UpdateFooter(
-                        state = updateState,
-                        hasUpdate = pendingUpdate != null,
-                        onCheck = { checkUpdate() },
-                        onUpdate = { pendingUpdate?.let { doUpdate(it) } },
-                    )
-
-                    Spacer(Modifier.height(8.dp))
 
                     // 右下角 +：添加服务器
                     FloatingActionButton(
@@ -234,6 +274,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        } // ModalNavigationDrawer
     }
 
     override fun onResume() {
@@ -358,8 +399,13 @@ private fun brandBrush(): Brush {
 
 /** 顶部品牌栏：渐变 logo 块 + 应用名 */
 @Composable
-private fun BrandHeader() {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+private fun BrandHeader(onLogoClick: () -> Unit = {}) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(MaterialTheme.shapes.small)
+            .clickable { onLogoClick() },
+    ) {
         Box(
             modifier = Modifier
                 .size(44.dp)
@@ -785,23 +831,24 @@ private fun ServerEditor(
  * 更新入口与状态行：无状态时显示「检查更新」，发现新版本后变「立即更新」
  */
 @Composable
-private fun UpdateFooter(
+private fun UpdateSection(
     state: String,
     hasUpdate: Boolean,
     onCheck: () -> Unit,
     onUpdate: () -> Unit,
 ) {
-    Column(Modifier.padding(top = 8.dp)) {
-        if (state.isNotEmpty()) {
-            Text(
-                state,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(4.dp))
-        }
+    Column(Modifier.padding(horizontal = 16.dp)) {
+        Text("应用更新", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            state.ifEmpty { "点击检查获取最新版本" },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(8.dp))
         Button(onClick = if (hasUpdate) onUpdate else onCheck) {
             Text(if (hasUpdate) "立即更新" else "检查更新")
         }
+        Spacer(Modifier.height(8.dp))
     }
 }

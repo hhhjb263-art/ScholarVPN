@@ -79,7 +79,16 @@ import androidx.compose.ui.unit.sp
 import com.scholarvpn.client.ui.ScholarVpnTheme
 import com.scholarvpn.client.vpn.ServerEntry
 import com.scholarvpn.client.vpn.VpnSettings
+import android.widget.Toast
+import androidx.core.content.FileProvider
+import com.scholarvpn.client.BuildConfig
+import com.scholarvpn.client.update.UpdateChecker
 import com.scholarvpn.client.vpn.VpnStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import java.io.File
 
 /**
  * 主界面：品牌栏 + 渐变状态英雄卡 + 服务器卡片列表（点卡片连接）+ 添加/编辑/删除 + FAB。
@@ -89,6 +98,11 @@ class MainActivity : ComponentActivity() {
 
     private var granted by mutableStateOf(false)
     private val servers = mutableStateListOf<ServerEntry>()
+
+    // 应用内更新（对应桌面端设置/关于页的检查更新）
+    private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var updateState by mutableStateOf("")
+    private var pendingUpdate by mutableStateOf<UpdateChecker.Policy?>(null)
     private var editingIndex by mutableStateOf<Int?>(null)   // null=关闭编辑器；-1=新增
     private var activeIndex by mutableStateOf(0)
 
@@ -163,6 +177,16 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // 应用内更新入口（对应桌面端设置/关于页）
+                    UpdateFooter(
+                        state = updateState,
+                        hasUpdate = pendingUpdate != null,
+                        onCheck = { checkUpdate() },
+                        onUpdate = { pendingUpdate?.let { doUpdate(it) } },
+                    )
+
+                    Spacer(Modifier.height(8.dp))
+
                     // 右下角 +：添加服务器
                     FloatingActionButton(
                         onClick = { editingIndex = -1 },
@@ -229,6 +253,56 @@ class MainActivity : ComponentActivity() {
         val store = VpnSettings(this)
         store.saveServers(servers.toList())
         store.setActiveIndex(activeIndex)
+    }
+
+    /** 拉取策略并比较版本（对应桌面端 AppBridge::check_update） */
+    private fun checkUpdate() {
+        updateState = "检查中..."
+        mainScope.launch {
+            try {
+                val p = UpdateChecker.fetchPolicy()
+                if (UpdateChecker.isNewer(p.latest, BuildConfig.VERSION_NAME)) {
+                    pendingUpdate = p
+                    updateState = "发现新版本 v${p.latest}，点击立即更新"
+                } else {
+                    pendingUpdate = null
+                    updateState = "已是最新版本 v" + BuildConfig.VERSION_NAME
+                }
+            } catch (e: Exception) {
+                pendingUpdate = null
+                updateState = "检查失败：${e.message}"
+            }
+        }
+    }
+
+    /** 下载 + 触发系统安装（对应桌面端 download_and_install） */
+    private fun doUpdate(p: UpdateChecker.Policy) {
+        updateState = "准备下载..."
+        mainScope.launch {
+            try {
+                val dir = File(cacheDir, "apk").apply { mkdirs() }
+                val apk = File(dir, "ScholarVPN-${p.latest}.apk")
+                UpdateChecker.downloadApk(p.url, p.sha256, p.size, apk) { pct ->
+                    updateState = "下载中 $pct%"
+                }
+                updateState = "等待安装确认..."
+                installApk(apk)
+            } catch (e: Exception) {
+                updateState = "更新失败：${e.message}"
+            }
+        }
+    }
+
+    private fun installApk(apk: File) {
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
+        val intent = Intent(Intent.ACTION_INSTALL_PACKAGE)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "无法打开安装器：${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun connectActive() {
@@ -705,4 +779,28 @@ private fun ServerEditor(
             }
         },
     )
+}
+
+/**
+ * 更新入口与状态行：无状态时显示「检查更新」，发现新版本后变「立即更新」
+ */
+@Composable
+private fun UpdateFooter(
+    state: String,
+    hasUpdate: Boolean,
+    onCheck: () -> Unit,
+    onUpdate: () -> Unit,
+) {
+    if (state.isEmpty()) return
+    Column(Modifier.padding(top = 8.dp)) {
+        Text(
+            state,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        Button(onClick = if (hasUpdate) onUpdate else onCheck) {
+            Text(if (hasUpdate) "立即更新" else "检查更新")
+        }
+    }
 }

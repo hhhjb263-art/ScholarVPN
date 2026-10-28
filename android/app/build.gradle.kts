@@ -33,8 +33,8 @@ android {
         applicationId = "com.scholarvpn.client"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.7.0"
     }
 
     buildTypes {
@@ -61,6 +61,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

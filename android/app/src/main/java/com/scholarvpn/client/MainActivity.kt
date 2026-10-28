@@ -791,14 +791,15 @@ private fun UpdateFooter(
     onCheck: () -> Unit,
     onUpdate: () -> Unit,
 ) {
-    if (state.isEmpty()) return
     Column(Modifier.padding(top = 8.dp)) {
-        Text(
-            state,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(4.dp))
+        if (state.isNotEmpty()) {
+            Text(
+                state,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(4.dp))
+        }
         Button(onClick = if (hasUpdate) onUpdate else onCheck) {
             Text(if (hasUpdate) "立即更新" else "检查更新")
         }

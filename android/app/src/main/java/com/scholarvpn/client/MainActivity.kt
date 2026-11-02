@@ -76,6 +76,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.scholarvpn.client.ui.AgreementGate
 import com.scholarvpn.client.ui.ScholarVpnTheme
 import com.scholarvpn.client.vpn.ServerEntry
 import com.scholarvpn.client.vpn.VpnSettings
@@ -195,6 +196,7 @@ class MainActivity : ComponentActivity() {
                     VpnStatus.tokenClearTick.collect { reloadServers() }
                 }
 
+                AgreementGate {
                 Box(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
                     val phase by VpnStatus.phase.collectAsState()
                     val status by VpnStatus.message.collectAsState()
@@ -302,6 +304,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        } // AgreementGate
         } // ModalNavigationDrawer
     }
 

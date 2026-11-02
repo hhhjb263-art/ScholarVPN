@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <string>
 
 namespace update {
@@ -23,6 +24,8 @@ struct FetchResult {
     int status = 0;          // HTTP 状态码（0 = 没拿到响应）
     std::string body;        // 响应体（原文，未解析）
     std::string error;       // 失败原因（给日志与界面）
+    // 响应头（名字统一小写）。受管服务用 X-Service-Signature 验签个人凭据。
+    std::map<std::string, std::string> headers;
 };
 
 // timeoutMs 同时作用于连接、发送、接收三个阶段的单次超时

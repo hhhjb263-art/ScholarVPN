@@ -82,6 +82,8 @@ import com.scholarvpn.client.vpn.VpnSettings
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import com.scholarvpn.client.BuildConfig
+import com.scholarvpn.client.service.MachineId
+import com.scholarvpn.client.service.ServiceClient
 import com.scholarvpn.client.update.UpdateChecker
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.HorizontalDivider
@@ -112,11 +114,28 @@ class MainActivity : ComponentActivity() {
     private var editingIndex by mutableStateOf<Int?>(null)   // null=关闭编辑器；-1=新增
     private var activeIndex by mutableStateOf(0)
 
+    // 受管服务（服务方服务器）：申请试用 / 状态同步 / 服务器列表下发
+    private var svcState by mutableStateOf<VpnSettings.ServiceState?>(null)
+    private var svcBusy by mutableStateOf(false)
+    private var svcMsg by mutableStateOf("")
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         granted = VpnService.prepare(this) == null
         reloadServers()
+
+        // 受管状态心跳（2026-11-02 需求 3）：启动打开即与授权服务器建立通信，
+        // 之后每 5 分钟同步一次状态（轮询而非长连接：低频小请求在 Doze 下也可靠）。
+        val svcHeartbeat = android.os.Handler(android.os.Looper.getMainLooper())
+        val svcTick = object : Runnable {
+            override fun run() {
+                if (granted && !svcBusy) provisionManaged(refreshOnly = true)
+                svcHeartbeat.postDelayed(this, 300_000L)
+            }
+        }
+        svcHeartbeat.postDelayed(svcTick, 30_000L)
+        svcState = VpnSettings(this).loadServiceState()
         setContent {
             ScholarVpnTheme {
                 val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -157,6 +176,15 @@ class MainActivity : ComponentActivity() {
                                 hasUpdate = pendingUpdate != null,
                                 onCheck = { checkUpdate() },
                                 onUpdate = { pendingUpdate?.let { doUpdate(it) } },
+                            )
+
+                            // 受管服务（服务方服务器）：申请试用 / 同步 / 下发列表
+                            ServiceSection(
+                                state = svcState,
+                                busy = svcBusy,
+                                msg = svcMsg,
+                                onProvision = { provisionManaged(refreshOnly = false) },
+                                onRefresh = { provisionManaged(refreshOnly = true) },
                             )
                         }
                     },
@@ -296,15 +324,87 @@ class MainActivity : ComponentActivity() {
         store.setActiveIndex(activeIndex)
     }
 
+    /**
+     * 受管服务接入（对应桌面端 AppBridge::check_service / apply_managed_servers）。
+     * refreshOnly=true = 已有凭据，只做状态同步 + 拉服务器列表。
+     */
+    private fun provisionManaged(refreshOnly: Boolean) {
+        if (svcBusy) return
+        svcBusy = true
+        svcMsg = if (refreshOnly) "同步中..." else "申请中..."
+        mainScope.launch(Dispatchers.IO) {
+            try {
+                val store = VpnSettings(this@MainActivity)
+                val info = MachineId.collect(this@MainActivity)
+                val st = store.loadServiceState()
+                val creds = if (refreshOnly && !info.fp.isBlank()) {
+                    ServiceClient.fetchStatus(info.fp)
+                } else {
+                    ServiceClient.registerTrial(info)
+                }
+
+                store.saveServiceState(VpnSettings.ServiceState(
+                    fp = creds.fp.ifBlank { info.fp },
+                    clientId = creds.clientId,
+                    token = creds.token.ifBlank { st?.token ?: "" },
+                    status = creds.status,
+                    expireAt = creds.expireAt,
+                    quotaBytes = creds.quotaBytes,
+                    usedBytes = creds.usedBytes,
+                    limitKind = creds.limitKind,
+                    remaining = creds.remaining,
+                ))
+
+                // 闸门判定：拒绝/到期/配额耗尽 → 只提示，不下发卡片
+                val verdict = ServiceClient.evaluate(
+                    creds, System.currentTimeMillis() / 1000)
+                if (verdict.blocked) {
+                    svcMsg = verdict.reason
+                    svcState = store.loadServiceState()
+                    return@launch
+                }
+
+                // 拉服务器列表并整体替换受管卡片。
+                // 拉取失败不致命：凭据已就绪，用户仍可手填（老部署没有 /svc/ 也该能用）。
+                val list = try {
+                    ServiceClient.fetchServerList(creds.fp.ifBlank { info.fp })
+                } catch (e: Exception) {
+                    reloadServers()
+                    svcMsg = "凭据已就绪，但拉取服务器列表失败：${e.message}"
+                    svcState = store.loadServiceState()
+                    return@launch
+                }
+                val n = store.applyManagedServers(
+                    list.map { it.addr to it.pubkeyB64 },
+                    creds.clientId,
+                    creds.token.ifBlank { st?.token ?: "" },
+                )
+                reloadServers()
+                svcMsg = "已就绪：$n 台服务器（${creds.clientId}）"
+                svcState = store.loadServiceState()
+            } catch (e: Exception) {
+                svcMsg = "失败：${e.message}"
+            } finally {
+                svcBusy = false
+            }
+        }
+    }
+
     /** 拉取策略并比较版本（对应桌面端 AppBridge::check_update） */
     private fun checkUpdate() {
         updateState = "检查中..."
         mainScope.launch {
             try {
                 val p = UpdateChecker.fetchPolicy()
-                if (UpdateChecker.isNewer(p.latest, BuildConfig.VERSION_NAME)) {
+                // 更新判定（需求 5）：包哈希不同即提示（版本号只管大更新/强制），
+                // 状态行展示变更说明（notes）由用户自行决定是否更新。
+                val prefs = getSharedPreferences("scholarvpn_update", MODE_PRIVATE)
+                val installedSha = prefs.getString("installed_sha", "") ?: ""
+                if (UpdateChecker.isNewer(p.latest, BuildConfig.VERSION_NAME) ||
+                    UpdateChecker.hasNewPackage(installedSha, p.sha256)) {
                     pendingUpdate = p
-                    updateState = "发现新版本 v${p.latest}，点击立即更新"
+                    updateState = "发现新版本 v${p.latest}，点击立即更新" +
+                        (if (p.notes.isNotBlank()) "（${p.notes}）" else "")
                 } else {
                     pendingUpdate = null
                     updateState = "已是最新版本 v" + BuildConfig.VERSION_NAME
@@ -327,6 +427,8 @@ class MainActivity : ComponentActivity() {
                     updateState = "下载中 $pct%"
                 }
                 updateState = "等待安装确认..."
+                getSharedPreferences("scholarvpn_update", MODE_PRIVATE)
+                    .edit().putString("installed_sha", p.sha256).apply()
                 installApk(apk)
             } catch (e: Exception) {
                 updateState = "更新失败：${e.message}"
@@ -388,9 +490,71 @@ class MainActivity : ComponentActivity() {
 }
 
 /** 品牌 logo 渐变（状态英雄卡与 logo 底共用） */
+/**
+ * 受管服务面板（抽屉内）：申请试用 / 查看状态 / 拉取服务器列表。
+ * 未申请时给"使用服务方服务器"主按钮；已申请显示 client_id、剩余时长与用量。
+ */
 @Composable
-private fun brandBrush(): Brush {
-    return if (isSystemInDarkTheme()) {
+private fun ServiceSection(
+    state: VpnSettings.ServiceState?,
+    busy: Boolean,
+    msg: String,
+    onProvision: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    HorizontalDivider()
+    Spacer(Modifier.height(12.dp))
+    Column(Modifier.padding(horizontal = 16.dp)) {
+        Text("受管服务",
+             style = MaterialTheme.typography.titleSmall,
+             fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(6.dp))
+        when {
+            busy -> Text("处理中…",
+                         style = MaterialTheme.typography.bodySmall,
+                         color = MaterialTheme.colorScheme.onSurfaceVariant)
+            state == null -> {
+                Text("使用服务方提供的服务器（自动申请试用并下发列表）",
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = onProvision, modifier = Modifier.fillMaxWidth()) {
+                    Text("使用服务方服务器")
+                }
+            }
+            else -> {
+                Text(state.clientId,
+                     style = MaterialTheme.typography.bodyMedium,
+                     fontWeight = FontWeight.Medium)
+                if (state.expireAt > 0) {
+                    val remain = state.expireAt - System.currentTimeMillis() / 1000
+                    val usedPct = if (state.quotaBytes > 0)
+                        ((state.usedBytes * 100) / state.quotaBytes).coerceIn(0, 100) else 0
+                    Text(
+                        if (remain > 0)
+                            "剩余 ${remain / 86400} 天 ${(remain % 86400) / 3600} 小时 · 已用 ${usedPct}%"
+                        else "已到期",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (msg.isNotBlank()) {
+                    Text(msg,
+                         style = MaterialTheme.typography.bodySmall,
+                         color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onRefresh, enabled = !busy) { Text("刷新") }
+                    TextButton(onClick = onProvision, enabled = !busy) { Text("重新申请") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun brandBrush(): Brush {    return if (isSystemInDarkTheme()) {
         Brush.linearGradient(listOf(Color(0xFF3B47B0), Color(0xFF6B3FB8)))
     } else {
         Brush.linearGradient(listOf(Color(0xFF4C5BD4), Color(0xFF925BD4)))

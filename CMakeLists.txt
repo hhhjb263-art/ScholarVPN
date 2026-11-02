@@ -33,6 +33,7 @@ add_executable(vpn_client
     Config.cpp
     Crypt.cpp
 
+    src/DnsProxy.cpp
     src/UDP.cpp
     src/tcp.cpp
     src/packet_buffer.cpp
@@ -41,6 +42,9 @@ add_executable(vpn_client
     src/reconnect_manager.cpp
 
     src/client/ClientApp.cpp
+
+    src/service/machine_id.cpp
+    src/service/service_client.cpp
 
     src/platform/cfgstr.cpp
     src/platform/iplist.cpp

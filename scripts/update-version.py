@@ -35,12 +35,16 @@ def read_version_h():
 def sync_iss(ver, parts):
     """ScholarVPN.iss 的 MyAppVersion 同步（Inno 安装包元数据）"""
     path = os.path.join(ROOT, "ScholarVPN.iss")
-    s = io.open(path, encoding="utf-8-sig").read()
+    # 读写都用 newline=""：iss 是 CRLF 文件，universal newline 转换会把
+    # \r\n 写成 \n 再混入孤立 \r，Inno 会报"文本不在区段中"（踩过）
+    with io.open(path, encoding="utf-8-sig", newline="") as f:
+        s = f.read()
     new, n = re.subn(r'(#define\s+MyAppVersion\s+)"[^"]*"', rf'\g<1>"{ver}"', s)
     if n == 0:
         print("警告：ScholarVPN.iss 里没找到 MyAppVersion", file=sys.stderr)
         return
-    io.open(path, "w", encoding="utf-8-sig", newline="").write(new)
+    with io.open(path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(new)
     print(f"ScholarVPN.iss  MyAppVersion -> {ver}（{n} 处）")
 
 

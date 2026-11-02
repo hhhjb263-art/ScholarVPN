@@ -296,6 +296,14 @@ bool ReconnectManager::connect_once()
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    if (!m_running.load())
+    {
+        // 不是超时：stop()/切换服务器把循环打断了。这里以前也打印
+        // "握手等待超时（12s）"，实际可能只过了 2 秒——排查时会被这条
+        // 假超时带偏（已踩过：日志显示超时 12s，其实只等了 2.2s）。
+        LOG_INFO("[Reconnect] 握手等待被取消（停止/切换服务器）");
+        return u->is_handshaked();
+    }
     LOG_WARN("[Reconnect] 握手等待超时（%llds）",
              static_cast<long long>(kHandshakeWait.count()));
     return u->is_handshaked();

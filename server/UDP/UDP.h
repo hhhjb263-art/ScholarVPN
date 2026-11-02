@@ -19,6 +19,8 @@
 
 // UDP 隧道（服务端，多用户版）：监听一个端口，按 (源IP,端口) 分发到独立 Session，
 // 每个会话各自维护认证 / 密钥 / 发送队列 / 心跳；TUN 下行按目的虚拟 IP 查表转发。
+#include "../ServiceDB.h"   // 完整类型：m_svc 的 unique_ptr 析构在多处内联展开
+
 class UDP
 {
 public:
@@ -41,6 +43,9 @@ public:
 
     // sig_priv：服务器持久身份私钥 SIG_SRV_PRI；keys_dir：注册/登录数据库目录
     void set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir = "keys");
+    // 受管服务（可选）：传入 broker 的 service.db 后启用 trials 校验/
+    // 配额切断/域名审计与黑名单；不传或文件不存在 = 功能关闭，普通部署零影响
+    void set_service_db(const std::string& db_path);
 
     // TUN 读到的 IP 包按目的 IP 转发到对应会话；无匹配会话返回 false。
     // 目标会话发送队列满 = 客户端持续消费不动：按既定策略断开该会话
@@ -122,6 +127,7 @@ private:
 
     std::shared_ptr<EVP_PKEY> m_sig_priv;
     std::string m_keys_dir;
+    std::unique_ptr<service::ServiceDB> m_svc;   // 受管服务（SVC_DB 未配置时为空）
 
     // TCP 发送唤醒钩子（TCPServer::start 注册；互斥保护，
     // 注册/注销与发送线程并发安全）

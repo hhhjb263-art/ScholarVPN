@@ -15,10 +15,12 @@
 | `tunnel/TunnelCrypto.kt` | ✅ 完成 | AES-256-GCM（平台 Conscrypt 硬件加速）、HKDF-SHA256（手写 RFC 5869）、Ed25519/X25519（BouncyCastle 轻量 API） |
 | `tunnel/Framing.kt` | ✅ 完成 | TCP 分帧状态机（先吃缓冲语义，对齐 C++ 端优化后实现） |
 | `tunnel/TunnelClient.kt` | ✅ 完成 | 三阶段认证状态机（5s 超时/500ms 重传/10 次上限，对齐 C++ 端）、心跳保活（1s/5s）、收发循环、心跳超时死亡回调 |
-| `vpn/ScholarVpnService.kt` | ✅ 完成 | 三阶段认证 → establish 建 tun（MTU 1400 + 全路由 + DNS）→ fd↔隧道双向桥接 → 前台通知 |
+| `vpn/ScholarVpnService.kt` | ✅ 完成 | 三阶段认证 → establish 建 tun（MTU 1400 + 全路由 + DNS）→ fd↔隧道双向桥接 → 前台通知；**M4 指数退避重连已实现** |
 | `vpn/IdentityStore.kt` | ✅ 完成 | Ed25519 身份密钥：EncryptedSharedPreferences（Keystore 硬件后备）加密存储，首次运行自动生成 |
-| `vpn/VpnSettings.kt` | ✅ 完成 | 服务器配置；公钥接受 raw base64 或 PEM 两种格式 |
-| `MainActivity.kt` | 🚧 联调版 | 配置表单（IP/端口/TCP/ClientID/令牌/公钥）+ 授权 + 启动；完整 UI TODO(M3) |
+| `vpn/VpnSettings.kt` | ✅ 完成 | 服务器配置；公钥接受 raw base64 或 PEM 两种格式；**受管卡片整体替换（applyManagedServers）** |
+| `service/ServiceClient.kt` | ✅ 完成 | 受管服务 HTTP 客户端：申请试用 / 状态同步 / 服务器列表下发，**全部响应 Ed25519 验签**（对齐 Windows service_client.cpp） |
+| `service/MachineInfo.kt` | ✅ 完成 | 机器指纹 = SHA-256("ScholarVPN-Service-v1" \| ANDROID_ID)，与 C++ fingerprint_of 逐字节一致 |
+| `MainActivity.kt` | 🚧 可用 | 卡片式服务器列表 + 抽屉内受管服务面板（申请/刷新）；速率曲线等 TODO(M3) |
 
 ## 构建
 
@@ -30,10 +32,12 @@
 ## 开发里程碑
 
 - ✅ **M0**：VpnService 授权 + establish 通路
-- ✅ **M1**：TunnelClient 三阶段认证实现（待对现有 Linux 服务端联调）
-- ✅ **M2**：fd↔隧道桥接（待真机验证隧道内 ping 通 / 可上网，验证 TCP 传输切换）
-- 🚧 **M3**：完整 Compose UI（服务器卡片/切换/速率曲线）、DataStore 配置迁移
-- ⬜ **M4**：弱网重连（指数退避状态机，onDead 回调已就位）、心跳恢复、移动网络实测
+- ✅ **M1**：TunnelClient 三阶段认证实现（已与现有 Linux 服务端联调）
+- ✅ **M2**：fd↔隧道桥接（真机验证隧道内 ping 通 / 可上网，TCP 传输切换）
+- ✅ **M4**：弱网重连（指数退避状态机 + 网络事件提前唤醒，2026-11-01 确认已实现）
+- ✅ **受管服务**（2026-11-01）：申请试用 → 状态同步 → 服务器列表下发（验签）→ 卡片自动生成，
+  对接 broker `/trial/*` 与 `/svc/server-list.ini`；fp = SHA-256(salt | ANDROID_ID)
+- 🚧 **M3**：完整 Compose UI（速率曲线、DataStore 配置迁移）、专用通知图标
 
 ## 联调步骤（M1/M2）
 

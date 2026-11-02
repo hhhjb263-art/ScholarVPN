@@ -1,5 +1,10 @@
 #include "AppBridge.h"
-#include "util/utf.h" 
+#include "../service/service_bootstrap.h"   // 发行版内置接入点
+#include "util/utf.h"
+#include "QtCfg.h"   // toQString（cfgstr 与 QString 互转）
+#include "../Config.h"  // scholini::Ini*（config.ini 的 INI 原语）
+
+using namespace scholini;
 #include "update/update_checker.h"
 #include "update/update_fetcher.h"   // update::download_file
 #include "update/update_install.h"
@@ -10,28 +15,35 @@
 #include <QStandardPaths>
 #include <QSettings>
 #include <QThread>
+#include <QTimer>
 
-#if defined(_DEBUG)
-#include <crtdbg.h>
-#include <QMessageBox>
-// 分步堆自检：断在哪一步，损坏就发生在上一步与其之间。
-// 失败时弹窗（_CrtDbgReport 只写调试输出，用户经常看不到），
-// 弹窗文字就是定位信息——把它发给开发者。
-#define CHECK_HEAP_STEP(what) do { \
-    if (!_CrtCheckMemory()) { \
-        QMessageBox __hb(QMessageBox::Critical, QStringLiteral("HEAP CORRUPTED"), \
-            QStringLiteral("堆损坏点: %1（把这条信息完整发我）").arg(QStringLiteral(what)), \
-            QMessageBox::Ok); \
-        __hb.exec(); \
-        __debugbreak(); \
-    } \
-} while (0)
-#else
-#define CHECK_HEAP_STEP(what) do {} while (0)
-#endif
+#include <ctime>
+
+// 历史说明：此处曾有 Debug 专用的分步堆自检诊断宏（全堆遍历）。
+// 多线程下后台线程持续分配，GUI 线程遍历整个堆与之并发，产生竞态误报——
+// Debug 构建频繁弹堆断言即此（2026-10-31 移除）。真实堆越界（update_fetcher
+// 响应头缓冲）已另行修复；若再疑堆损坏，用 Application Verifier + 页堆定位，
+// 不要恢复全堆遍历式自检。
 AppBridge::AppBridge(QObject* parent)
 	: QObject(parent), m_app(new ClientApp)
 {
+	// 受管状态心跳（2026-11-02 需求 3）：启动 30 秒后首次同步，之后每 5 分钟
+	// 轮询一次授权服务器（低频小请求，不需要长连接）。运行中若被判超限，
+	// 服务端会切断会话；这里把闸门置位，防止托盘/命令行绕过界面重连。
+	m_svcTimer = new QTimer(this);
+	QObject::connect(m_svcTimer, &QTimer::timeout, this, [this]() {
+		if (!m_svcCheckBusy.load())
+		{
+			check_service();
+		}
+	});
+	m_svcTimer->start(5 * 60 * 1000);
+	QTimer::singleShot(30 * 1000, this, [this]() {
+		if (!m_svcCheckBusy.load())
+		{
+			check_service();
+		}
+	});
 	// ClientApp 回调在内部 worker 线程触发 → 这里 emit 信号；
 	// 信号连接的槽默认 AutoConnection：跨线程自动 Queued，UI 槽天然安全。
 	m_app->set_state_callback([this](ConnState s) {
@@ -108,12 +120,10 @@ void AppBridge::check_update()
 	{
 		return;
 	}
-	const QString iniPath = QString::fromStdString(
-		narrow(cfg_path_join(cfg_app_dir(), CS("config.ini"))));
-	QSettings st(iniPath, QSettings::IniFormat);
-	const QString policy = st.value(QStringLiteral("Update/PolicyURL")).toString().trimmed();
-	const QString sigUrl = st.value(QStringLiteral("Update/SigURL")).toString().trimmed();
-	QString pubkey = st.value(QStringLiteral("Update/PublicKey")).toString();
+	const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
+	const QString policy = toQString(IniGetStr(iniPath, CS("Update"), CS("PolicyURL"), CS("")));
+	const QString sigUrl = toQString(IniGetStr(iniPath, CS("Update"), CS("SigURL"), CS("")));
+	QString pubkey = toQString(IniGetStr(iniPath, CS("Update"), CS("PublicKey"), CS("")));
 	// INI 值只能是单行，公钥按「SPKI DER 的 base64」存储；
 	// 含 -----BEGIN 的是完整 PEM（也接受）。统一转成 OpenSSL 能吃的 PEM。
 	if (!pubkey.isEmpty() && !pubkey.contains(QStringLiteral("BEGIN")))
@@ -138,9 +148,11 @@ void AppBridge::check_update()
 		                   QString(), QString(),
 		                   QStringLiteral("更新检查未启用"),
 		                   QString(), QString(), 0);
+		m_checkBusy.store(false);   // 早退也要复位，见函数入口的防重入注释
 		return;
 	}
-	m_checkBusy.store(false);
+	// busy 保持到检查线程 finished，由下方回调复位；若在这里提前复位，
+	// 网络检查期间再点按钮就会叠起第二个线程（防重入失效）。
 
 #if defined(_WIN32)
 	const QString osTag = QStringLiteral("win-x64");
@@ -159,17 +171,7 @@ void AppBridge::check_update()
 		                   << "action =" << action_name(r.decision.action)
 		                   << "latest =" << r.decision.policy.latest
 		                   << "err =" << r.error;
-#if defined(_DEBUG)
-		// 线程内堆自检（此时无并发）：通过而 GUI 侧 _CrtCheckMemory 报坏，
-		// 则 GUI 侧是竞态误报——check 线程退出时的清理（TLS/Qt 事件数据）
-		// 也在碰堆，与 GUI 线程的 _CrtCheckMemory 并发会互相干扰。
-		if (!_CrtCheckMemory())
-		{
-			_CrtDbgReport(_CRT_ERROR, __FILE__, __LINE__, nullptr,
-			              "heap corrupted INSIDE check thread (after update::check)");
-			__debugbreak();
-		}
-#endif
+
 		if (self.isNull())
 		{
 			return;
@@ -223,9 +225,7 @@ void AppBridge::download_and_install(const QString& url, const QString& sha256,
 		return;
 	}
 	m_dlCancel.store(false);
-	CHECK_HEAP_STEP("enter download_and_install");
 	m_app->stop();
-	CHECK_HEAP_STEP("after m_app->stop()");
 
 	// dest 用系统临时目录（Qt TempLocation：Windows=%TEMP%，Linux=/tmp）：
 	// 安装包是"下载->校验->安装->删除"的临时文件，而 exe 目录
@@ -236,12 +236,10 @@ void AppBridge::download_and_install(const QString& url, const QString& sha256,
 		const int slash = fileName.lastIndexOf(QLatin1Char('/'));
 		fileName = (slash >= 0) ? fileName.mid(slash + 1) : fileName;
 	}
-	CHECK_HEAP_STEP("after fileName");
 
 	const QString dest = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
 	    + QStringLiteral("/ScholarVPN-") + version + QStringLiteral("-") + fileName;
 	const std::string destStd = dest.toStdString();
-	CHECK_HEAP_STEP("after dest");
 
 	QPointer<AppBridge> self(this);
 	QThread* th = QThread::create([self, url, sha256, size, destStd]() {
@@ -273,4 +271,220 @@ void AppBridge::download_and_install(const QString& url, const QString& sha256,
 	connect(th, &QThread::finished, this, [this]() { m_downloadBusy.store(false); });
 	m_dlThread = th;   // 析构时据此取消并等待
 	th->start();
+}
+
+// ===========================================================================
+// 受管服务（受管试用 / 状态同步 / 服务器列表下发）
+// ===========================================================================
+
+namespace {
+
+// config.ini [Service] 配置（GUI 线程读取后按值传进工作线程）
+struct ServiceCfg {
+	bool enabled = false;
+	QString baseUrl;    // broker 基地址（无尾斜杠约定：客户端拼接带 / 的路径）
+	QString pubKey;     // service 签名公钥（SPKI DER base64 单行）
+	QString fpOld;      // 上次记录的指纹（比对用）
+};
+
+ServiceCfg read_service_cfg()
+{
+	const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
+	ServiceCfg sc;
+	// 发行版内置接入点（service_bootstrap.h）：config 留空 = 用内置；
+	// config 覆盖仅用于测试与换址迁移。是否启用由 [Service] Mode 决定，
+	// 这里只保证「选了使用服务方就一定有接入点」。
+	sc.baseUrl = toQString(IniGetStr(iniPath, CS("Service"), CS("ServiceURL"), CS("")));
+	if (sc.baseUrl.isEmpty())
+	{
+		sc.baseUrl = QString::fromLatin1(service::kServiceBaseUrl);
+	}
+	while (sc.baseUrl.endsWith(QLatin1Char('/')))
+	{
+		sc.baseUrl.chop(1);
+	}
+	sc.pubKey = toQString(IniGetStr(iniPath, CS("Service"), CS("PublicKey"), CS("")));
+	if (sc.pubKey.isEmpty())
+	{
+		sc.pubKey = QString::fromLatin1(service::kServicePubKeyB64);
+	}
+	sc.fpOld = toQString(IniGetStr(iniPath, CS("Service"), CS("Fp"), CS("")));
+	sc.enabled = !sc.baseUrl.isEmpty() && !sc.pubKey.isEmpty();
+	return sc;
+}
+
+// 三个服务线程共同的结果发射：汇总凭据 + 闸门判定
+void emit_service_result(AppBridge* self, const service::Credentials& c,
+                         const QString& fp, bool withToken)
+{
+	const service::Verdict v = service::evaluate(
+		c, static_cast<std::uint64_t>(std::time(nullptr)));
+	// 闸门联动：blocked 时置位 ClientApp 的服务闸门（start() 直接拒绝连接），
+	// 解除时同步清除——心跳周期性刷新，保证运行中状态与服务端一致。
+	if (self)
+	{
+		self->set_service_blocked(v.blocked);
+	}
+	if (withToken)
+	{
+		emit self->serviceRegistered(
+			c.valid ? 1 : 0, fp, QString::fromStdString(c.client_id),
+			QString::fromStdString(c.token), QString::fromStdString(c.status),
+			static_cast<qulonglong>(c.expire_at),
+			static_cast<qulonglong>(c.quota_bytes),
+			QString::fromStdString(c.error));
+	}
+	else
+	{
+		emit self->serviceChecked(
+			v.blocked ? 1 : 0, QString::fromStdString(v.reason), fp,
+			QString::fromStdString(c.client_id), QString::fromStdString(c.status),
+			static_cast<qulonglong>(c.expire_at),
+			static_cast<qulonglong>(c.quota_bytes),
+			static_cast<qulonglong>(c.used_bytes),
+			QString::fromStdString(c.error));
+	}
+}
+
+} // namespace
+
+// 模式选择（设置页「自建 / 使用服务方」单选触发，GUI 线程调用）。
+// 写盘 + 广播；managed 立即同步状态并拉列表（两个独立 busy，互不吞并），
+// off 解除服务闸门——自建模式不受服务方约束，也不应再被锁在阻塞弹窗里。
+void AppBridge::set_service_mode(bool managed)
+{
+	const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
+	IniSetStr(iniPath, CS("Service"), CS("Mode"),
+	          managed ? CS("managed") : CS("off"));
+	emit serviceModeChanged(managed ? 1 : 0);
+	if (managed)
+	{
+		check_service();
+		apply_server_list();
+	}
+	else
+	{
+		set_service_blocked(false);
+	}
+}
+
+// 状态同步：启动时 / 设置页「刷新状态」。
+// busy 语义与 check_update 修复后一致：保持到线程 finished 由回调复位。
+void AppBridge::check_service()
+{
+	if (m_svcCheckBusy.exchange(true))
+	{
+		return;
+	}
+	const ServiceCfg sc = read_service_cfg();
+	QPointer<AppBridge> self(this);
+	QThread* th = QThread::create([self, sc]() {
+		if (!sc.enabled)
+		{
+			if (!self.isNull())
+			{
+				emit self->serviceChecked(0, QStringLiteral("受管服务未启用"),
+				                          QString(), QString(), QString(),
+				                          0, 0, 0, QString());
+			}
+			return;
+		}
+		const service::MachineInfo info = service::collect_machine_info();
+		const QString fp = QString::fromStdString(info.fp);
+		const QString url = sc.baseUrl + QStringLiteral("/trial/status?fp=") + fp;
+		const service::Credentials c = service::fetch_status(
+			url.toStdString(), sc.pubKey.toStdString());
+		if (self.isNull())
+		{
+			return;
+		}
+		emit_service_result(self, c, fp, false);
+	});
+	connect(th, &QThread::finished, th, &QThread::deleteLater);
+	connect(th, &QThread::finished, this, [this]() { m_svcCheckBusy.store(false); });
+	th->start();
+}
+
+// 申请/换发试用（用户显式点击）。响应携带明文令牌，GUI 落盘并触发列表下发。
+void AppBridge::register_service()
+{
+	if (m_svcCheckBusy.exchange(true))
+	{
+		return;
+	}
+	const ServiceCfg sc = read_service_cfg();
+	QPointer<AppBridge> self(this);
+	QThread* th = QThread::create([self, sc]() {
+		if (!sc.enabled)
+		{
+			if (!self.isNull())
+			{
+				emit self->serviceRegistered(0, QString(), QString(), QString(),
+				                             QString(), 0, 0,
+				                             QStringLiteral("受管服务未配置"));
+			}
+			return;
+		}
+		const service::MachineInfo info = service::collect_machine_info();
+		const QString fp = QString::fromStdString(info.fp);
+		const service::Credentials c = service::register_trial(
+			(sc.baseUrl + QStringLiteral("/trial/register")).toStdString(),
+			sc.pubKey.toStdString(), info);
+		if (self.isNull())
+		{
+			return;
+		}
+		emit_service_result(self, c, fp, true);
+	});
+	connect(th, &QThread::finished, th, &QThread::deleteLater);
+	connect(th, &QThread::finished, this, [this]() { m_svcCheckBusy.store(false); });
+	th->start();
+}
+
+// 拉取受管服务器列表（注册成功后由 GUI 触发），暂存等 GUI take 走。
+void AppBridge::apply_server_list()
+{
+	if (m_svcListBusy.exchange(true))
+	{
+		return;
+	}
+	const ServiceCfg sc = read_service_cfg();
+	QPointer<AppBridge> self(this);
+	QThread* th = QThread::create([self, sc]() {
+		if (!sc.enabled)
+		{
+			if (!self.isNull())
+			{
+				emit self->serviceServers(0, QStringLiteral("受管服务未配置"));
+			}
+			return;
+		}
+		// 服务器列表受控下发：必须携带已登记的设备指纹（未申请试用 → 403）
+		const QString listUrl = sc.baseUrl + QStringLiteral("/svc/server-list.ini?fp=") + sc.fpOld;
+		std::string err;
+		std::vector<service::ManagedServer> list = service::fetch_server_list(
+			listUrl.toStdString(),
+			(sc.baseUrl + QStringLiteral("/svc/server-list.ini.sig?fp=") + sc.fpOld).toStdString(),
+			sc.pubKey.toStdString(), err);
+		if (self.isNull())
+		{
+			return;
+		}
+		int count = 0;
+		{
+			std::lock_guard<std::mutex> lk(self->m_svcMutex);
+			self->m_pendingServers = std::move(list);
+			count = static_cast<int>(self->m_pendingServers.size());
+		}
+		emit self->serviceServers(count, QString::fromStdString(err));
+	});
+	connect(th, &QThread::finished, th, &QThread::deleteLater);
+	connect(th, &QThread::finished, this, [this]() { m_svcListBusy.store(false); });
+	th->start();
+}
+
+std::vector<service::ManagedServer> AppBridge::take_managed_servers()
+{
+	std::lock_guard<std::mutex> lk(m_svcMutex);
+	return std::move(m_pendingServers);   // 取走后 m_pendingServers 留空
 }

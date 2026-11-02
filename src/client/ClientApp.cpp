@@ -457,12 +457,19 @@ bool ClientApp::start()
         return false;
     }
 
-    // 强制更新闸门：界面已禁用「连接」，但托盘菜单/命令行仍可能调到这里。
-    // 用户要求强制更新时不允许离线使用，所以这里也必须挡一道。
+    // 强制更新闸门 + 受管服务闸门：界面已禁用「连接」，但托盘菜单/命令行仍可能
+    // 调到这里。用户要求不允许离线使用，所以这里也必须各挡一道。
     if (m_updateBlocked.load())
     {
         LOG_ERR("[Update] 当前版本被要求强制更新，拒绝连接");
         emit_log("当前版本已被要求强制更新，请先更新后再连接");
+        m_running.store(false);
+        return false;
+    }
+    if (m_serviceBlocked.load())
+    {
+        LOG_ERR("[Service] 当前设备服务状态不允许使用，拒绝连接");
+        emit_log("服务状态不允许连接（试用期结束或额度用完，等待服务方确认授权）");
         m_running.store(false);
         return false;
     }
@@ -537,6 +544,7 @@ bool ClientApp::start()
                     {
                         m_route->remove_default_route();   // 只撤默认路由，保留服务器 bypass
                     }
+                    m_dnsProxy.stop();                    // 断线期间路由未定，代理停用
                     m_dnsGuard.restore();                 // 恢复物理网卡 DNS（断线期间可正常上网）
                 }
                 if (s == ConnState::Stopped || s == ConnState::Error)
@@ -584,6 +592,30 @@ bool ClientApp::start()
             // 隧道已建立：此时才清物理网卡 DNS / 禁用多宿主解析（防泄漏），
             // 断线时由状态回调恢复，不会出现\"没连上却把系统 DNS/路由切走\"的黑洞。
             m_dnsGuard.protect(m_tun->get_interface_id(), effective_dns());
+            // P3 DNS 分流：分流模式（非受管）启动本地 DNS 代理——
+            // 国内域名 → 223.5.5.5 直连解析，国外域名 → 8.8.8.8 走隧道（无污染）。
+            // 启动失败（域名表缺失/端口占用）回落原 DNS 行为，绝不因此断流。
+            if (routing_split())
+            {
+                const cfgstr listFile = cfg_path_join(cfg_from_utf8(get_exe_dir()), CS("chn-domains.txt"));
+                // 国外上游 = 配置 DNS 首选（默认 8.8.8.8，走隧道）
+                std::string foreign = narrow(m_cfg.DNS);
+                const std::size_t comma = foreign.find(',');
+                if (comma != std::string::npos)
+                    foreign = foreign.substr(0, comma);
+                while (!foreign.empty() && foreign.back() == ' ')
+                    foreign.pop_back();
+                if (m_dnsProxy.start(listFile, "223.5.5.5",
+                                     foreign.empty() ? "8.8.8.8" : foreign)) {
+                    m_adapter->set_DNS_IPv4(CS("127.0.0.1"));
+                    emit_log("[DnsProxy] DNS 分流已启用（国内直连解析 / 国外走隧道）");
+                }
+            }
+            else
+            {
+                m_dnsProxy.stop();   // 非分流连接不代理，恢复常规 DNS
+                m_adapter->set_DNS_IPv4(effective_dns());
+            }
             emit_log("[Reconnect] Connected, routes + DNS guard active");
 
             // 多用户服务端：identity_ok 通告的虚拟 IP 覆盖网卡地址
@@ -906,6 +938,8 @@ void ClientApp::set_routing_split(bool split)
 // 国内 DNS 的地址落在 chnroute 里，会走直连，隧道挂了也不影响国内访问。
 cfgstr ClientApp::effective_dns() const
 {
+    // 分流模式：TUN DNS 先指向国内上游；连接成功后由 P3 DNS 代理接管
+    // （127.0.0.1，按域名分流：国内直连解析 / 国外走隧道无污染）
     if (!routing_split())
     {
         return m_cfg.DNS;
@@ -917,6 +951,8 @@ cfgstr ClientApp::effective_dns() const
 // 调用点固定在 add_default_route() 之前——先让国内段绕开隧道，再接管默认路由。
 void ClientApp::apply_split_routing()
 {
+    // 受管连接同样支持智能分流：P3 DNS 代理已解决国内 DNS 污染问题——
+    // 国内域名走直连（不烧配额），国外域名走隧道（无污染）
     if (!equals_ci(cfg_to_utf8(m_cfg.RoutingMode), "split"))
     {
         LOG_INFO("[Split] Mode=full：全流量走隧道");
@@ -997,6 +1033,7 @@ void ClientApp::stop()
     }
     m_mgr.reset();
     // 断线/停止：恢复物理网卡 DNS（防 DNS 泄漏守卫的恢复步骤）
+    m_dnsProxy.stop();
     m_dnsGuard.restore();
     m_state.store(ConnState::Stopped);
     if (wasRunning)
@@ -1054,6 +1091,7 @@ void ClientApp::set_server(const ServerEntry& entry)
     // save_config() 会按 m_cfg.servers 全量重写 config.ini，"注册成功清 Token"
     // 或"令牌被拒清 Token"那两次保存会把 Transport 写回 init() 时缓存的值。
     // 不同步的话：用户切到 TCP 连一次 -> 保存把 Transport 改回 0 -> 下次又变 UDP。
+    bool synced = false;
     for (auto& s : m_cfg.servers)
     {
         if (s.ServerIP == entry.ServerIP && s.ServerPort == entry.ServerPort)
@@ -1062,8 +1100,16 @@ void ClientApp::set_server(const ServerEntry& entry)
             s.ClientID = entry.ClientID;
             s.RegisterToken = entry.RegisterToken;
             s.ServerPubKey = entry.ServerPubKey;
+            synced = true;
             break;
         }
+    }
+    // 列表里没有这一条（启动时 Count=0，卡片是受管服务刚下发的）→ 补进去。
+    // 不补的话 save_config() 会按空的 m_cfg.servers 把 [Server] Count 写成 0，
+    // 下一次启动所有卡片凭空消失（"清 Token"那两次保存就会触发）。
+    if (!synced)
+    {
+        m_cfg.servers.push_back(entry);
     }
     // 服务器身份公钥：该服务器配置了公钥就用它验签（多服务器各自独立）；
     // 为空则恢复内置硬编码公钥——绝不能保留上一台服务器的自定义公钥，

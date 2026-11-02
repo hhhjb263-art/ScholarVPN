@@ -23,17 +23,35 @@
 
 #if defined(_DEBUG)
 #include <crtdbg.h>
+#include <cstdlib>   // getenv
+#include <cstring>   // strcmp
 #endif
 
 int main(int argc, char* argv[])
 {
 #if defined(_DEBUG)
-    // Debug 专属：每次 malloc/free 都做完整堆一致性校验。
-    // 作用：堆被越界写坏时，崩溃点会精确落在"发生损坏的那次操作"，
-    // 而不是之后某个无辜的 free（下载按钮的崩溃就是后一种情况，
-    // 真凶在更早的代码里写坏了堆，package_path 的临时串只是踩雷的）。
+    // Debug 专属堆校验——**默认关闭**，按需用环境变量开启。
+    //
+    // ⚠️ 不要默认开 _CRTDBG_CHECK_ALWAYS_DF：它让每次 malloc/free 都遍历整个堆，
+    // 与 DnsProxy 加载 11 万条域名表叠加后是 O(n²)。2026-11-01 实测（/MTd /O2）：
+    //     2 万条 = 32 秒；11 万条 = 十几分钟；关掉后同样的加载只要 109 毫秒。
+    // 表现是"分流模式连上后界面彻底卡死、日志停在 [Split] 自校验通过"，
+    // 极易误判成死锁或崩溃（踩过一次，排查花了半小时）。
+    //
+    // 需要追堆损坏时再显式打开（会很慢，只用于定位）：
+    //   set SV_DEBUG_HEAP=always   → 每次分配都校验（最狠，能精确到出错那次操作）
+    //   set SV_DEBUG_HEAP=1024     → 每 1024 次分配校验一次（11 万条约 4 秒）
     // 上线构建（NDEBUG）完全不受影响。
-    _CrtSetDbgFlag(_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG) | _CRTDBG_CHECK_ALWAYS_DF);
+    if (const char* heapMode = std::getenv("SV_DEBUG_HEAP"))
+    {
+        int flags = _CrtSetDbgFlag(_CRTDBG_REPORT_FLAG);
+        if (std::strcmp(heapMode, "always") == 0)
+            flags |= _CRTDBG_CHECK_ALWAYS_DF;
+        else if (std::strcmp(heapMode, "1024") == 0)
+            flags |= _CRTDBG_CHECK_EVERY_1024_DF;
+        _CrtSetDbgFlag(flags);
+        std::printf("[DEBUG] 堆校验已开启: %s（会显著拖慢启动与加载）\n", heapMode);
+    }
 #endif
     QApplication a(argc, argv);
 

@@ -107,6 +107,16 @@ bool VpnCore::init(const Config &cfg)
         fprintf(stderr, "[VpnCore] 警告: 未配置服务器身份私钥，身份认证不可用\n");
     }
 
+    // 4.5) 受管服务（可选）：SVC_DB 指向 broker 的 sqlite 时启用
+    //      （登录校验 trials 到期/状态、数据面配额切断、域名审计与黑名单）。
+    //      未设置 = 功能关闭，与既有部署行为完全一致。
+    {
+        const char* svc_db = std::getenv("SVC_DB");
+        if (svc_db != nullptr && *svc_db != '\0') {
+            m_udp.set_service_db(svc_db);
+        }
+    }
+
     // 5) 启动 UDP 隧道（服务端绑定监听，多用户：最大会话数 + 虚拟 IP 池）；
     //    --transport tcp 时跳过 UDP 监听（会话机制仍服务 TCP 会话）
     if(!m_udp.start(m_cfg.listen_ip, m_cfg.listen_port,

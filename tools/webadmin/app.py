@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hmac
 import json
 import os
@@ -33,9 +34,119 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import auth
 
+# ---- 受管服务库（broker 的 trials / audit / blacklist）----
+# SQL 唯一所在是 tools/broker/db.py（迁移约束，见 docs/受管服务与试用授权方案.md 8.2）；
+# webadmin 只调用它的函数，不写任何 SQL。库路径：环境变量 SVC_DB >
+# /opt/scholarvpn-broker/service.db（服务器部署）> 仓库相对路径（本地开发）。
+def _svc_broker_dir() -> str:
+    env = os.environ.get("SVC_BROKER_DIR")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(os.path.dirname(here), "broker")
+    if os.path.isdir(local):
+        return local
+    return "/opt/scholarvpn-broker"
+
+BROKER_DIR = _svc_broker_dir()
+sys.path.insert(0, BROKER_DIR)
+import db as svc_db  # noqa: E402
+
+SVC_DB_PATH = os.environ.get("SVC_DB") or (
+    "/opt/scholarvpn-broker/service.db"
+    if os.path.isdir("/opt/scholarvpn-broker")
+    else os.path.join(BROKER_DIR, "service.db"))
+
+
+def svc_connect():
+    """打开受管服务库；不可用时抛 RuntimeError（handler 转 503）。"""
+    if not os.path.exists(SVC_DB_PATH):
+        raise RuntimeError("受管服务库不存在: " + SVC_DB_PATH)
+    return svc_db.connect(SVC_DB_PATH)
+
+
+_SAFE_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                     "0123456789-_.")
+import ipaddress  # noqa: E402  —— 黑名单 ip 类型校验用（stdlib）
+
+
+def _valid_domain(d: str) -> bool:
+    if not d or len(d) > 255:
+        return False
+    if d.startswith("*."):
+        d = d[2:]
+    if not d or d[0] in "-." or d[-1] in "-." or "." not in d:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789.-")
+    return all(c in allowed for c in d)
+
 MAX_BODY = 8 * 1024
 UPSTREAM_TIMEOUT = 15.0
 COOKIE_NAME = "sv_admin_session"
+
+# ---------------------------------------------------------------- 服务器清单校验 ----
+# 客户端用 ServerPubKey 校验该服务器的 Ed25519 签名，格式是 SPKI DER 的 base64
+# （44 字节，固定前缀 302a300506032b6570032100）。
+# ⚠️ 这里必须严格校验：历史上曾把 broker 的 service 签名公钥误填进 pubkey 字段，
+# 导致客户端验签失败、卡在"连接中"（2026-11-01 事故）。填错的公钥一律拒绝入库。
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def _valid_server_pubkey(b64: str) -> bool:
+    if not b64 or len(b64) > 200:
+        return False
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        return False
+    return len(raw) == 44 and raw[:12] == _ED25519_SPKI_PREFIX
+
+
+def _valid_server_addr(addr: str) -> bool:
+    """"host:port"，host 允许 IPv4 或域名，port 1-65535。"""
+    if not addr or len(addr) > 255 or addr.count(":") != 1:
+        return False
+    host, _, port = addr.rpartition(":")
+    if not host or not port.isdigit():
+        return False
+    p = int(port)
+    if p < 1 or p > 65535:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+    return all(c in allowed for c in host.lower())
+
+
+def _local_server_pubkey() -> str:
+    """读本机 VPN 服务器的 server_sig.pub，直接给出 SPKI DER base64。
+
+    存在的意义：让运营"点一下就填对"，而不是手工去 openssl 转换再粘贴——
+    这一步出错就会把服务端公钥填成 broker 的 service 钥。
+    """
+    path = os.environ.get("VPN_SIG_PUB", "/root/ScholarVPN/server/keys/server_sig.pub")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            body = "".join(ln.strip() for ln in f
+                           if ln.strip() and not ln.startswith("-----"))
+    except OSError:
+        return ""
+    return body if _valid_server_pubkey(body) else ""
+
+
+def _service_pubkey_b64() -> str:
+    """broker 的 service 签名公钥（用于防止误填进 pubkey 字段）。"""
+    path = os.environ.get("SERVICE_PUB",
+                          "/opt/scholarvpn-broker/keys/release_pub.pem")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return "".join(ln.strip() for ln in f
+                           if ln.strip() and not ln.startswith("-----"))
+    except OSError:
+        return ""
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -393,6 +504,36 @@ class Handler(BaseHTTPRequestHandler):
                 "vpn_public_port": port,
                 "vpn_address": f"{ip}:{port}" if ip else "",
             })
+        if path == "/api/service/mode":
+            sess = self._require_session()
+            if sess is None:
+                return
+            return self._svc_mode_get(sess)
+        if path == "/api/service/users":
+            sess = self._require_session()
+            if sess is None:
+                return
+            return self._svc_users(sess)
+        if path == "/api/service/audit":
+            sess = self._require_session()
+            if sess is None:
+                return
+            return self._svc_audit(sess)
+        if path == "/api/service/blacklist":
+            sess = self._require_session()
+            if sess is None:
+                return
+            return self._svc_blacklist_get(sess)
+        if path == "/api/service/servers":
+            sess = self._require_session()
+            if sess is None:
+                return
+            return self._svc_servers_get(sess)
+        if path == "/api/service/servers/local-pubkey":
+            sess = self._require_session()
+            if sess is None:
+                return
+            return self._send_json(200, {"pubkey": _local_server_pubkey()})
         if path.startswith("/api/"):
             return self._proxy("GET")
         return self._error(404, "not found")
@@ -415,15 +556,420 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_csrf(sess):
                 return
             return self._create_admin(sess)
+        if path == "/api/service/mode":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_mode_set(sess)
+        if path == "/api/service/users/note":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_user_note(sess)
+        if path == "/api/service/users/approve":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_user_action(sess, "approved")
+        if path == "/api/service/users/reject":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_user_action(sess, "rejected")
+        if path == "/api/service/users/restore":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_user_restore(sess)
+        if path == "/api/service/users/revoke":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_user_action(sess, "revoked")
+        if path == "/api/service/blacklist":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_blacklist_add(sess)
+        if path == "/api/service/servers":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_servers_upsert(sess)
+        if path == "/api/service/servers/toggle":
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            return self._svc_servers_toggle(sess)
         if path.startswith("/api/"):
             return self._proxy("POST")
         return self._error(404, "not found")
 
     def do_DELETE(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/api/service/users/"):
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            fp = urllib.parse.unquote(path.rsplit("/", 1)[1]).strip().lower()
+            return self._svc_user_purge(sess, fp)
+        if path.startswith("/api/service/blacklist/"):
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            domain = urllib.parse.unquote(path.rsplit("/", 1)[1]).strip().lower()
+            return self._svc_blacklist_del(sess, domain)
+        if path.startswith("/api/service/servers/"):
+            sess = self._require_session()
+            if sess is None:
+                return
+            if not self._require_csrf(sess):
+                return
+            addr = urllib.parse.unquote(path.rsplit("/", 1)[1]).strip()
+            return self._svc_servers_del(sess, addr)
         if path.startswith("/api/"):
             return self._proxy("DELETE")
         return self._error(404, "not found")
+
+    # ---------------------------------------------- 受管服务（用户管理）
+    def _svc_mode_get(self, sess) -> None:
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            mode = svc_db.get_setting(conn, "issue_mode", "auto")
+        finally:
+            conn.close()
+        return self._send_json(200, {"mode": mode})
+
+    def _svc_mode_set(self, sess) -> None:
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        mode = str(data.get("mode", "")).strip()
+        if mode not in ("auto", "manual"):
+            return self._error(400, "mode must be auto or manual")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            svc_db.set_setting(conn, "issue_mode", mode)
+        finally:
+            conn.close()
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_issue_mode", detail=mode)
+        return self._send_json(200, {"ok": True, "mode": mode})
+
+    def _svc_user_note(self, sess) -> None:
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        fp = str(data.get("fp", "")).strip().lower()
+        if len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+            return self._error(400, "invalid fp")
+        note = str(data.get("note", "")).strip()[:256]
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            if svc_db.get_trial(conn, fp) is None:
+                return self._error(404, "unknown fp")
+            svc_db.set_note(conn, fp, note)
+        finally:
+            conn.close()
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_note", detail=fp[:16])
+        return self._send_json(200, {"ok": True, "fp": fp, "note": note})
+
+    def _svc_users(self, sess) -> None:
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            rows = svc_db.list_trials(conn)
+        finally:
+            conn.close()
+        users = [{
+            "fp": r["fp"], "client_id": r["client_id"], "status": r["status"],
+            "os": r["os"], "cpu": r["cpu"], "ram_mb": r["ram_mb"],
+            "brand": r["brand"] if "brand" in r.keys() else "",
+            "model": r["model"] if "model" in r.keys() else "",
+            "note": r["note"] if "note" in r.keys() else "",
+            "first_ip": r["first_ip"], "last_ip": r["last_ip"],
+            "created_at": r["created_at"], "expire_at": r["expire_at"],
+            "quota_bytes": r["quota_bytes"], "used_bytes": r["used_bytes"],
+        } for r in rows]
+        return self._send_json(200, {"users": users})
+
+    def _svc_user_action(self, sess, status: str) -> None:
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        fp = str(data.get("fp", "")).strip().lower()
+        if len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+            return self._error(400, "invalid fp")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            if svc_db.get_trial(conn, fp) is None:
+                return self._error(404, "unknown fp")
+            svc_db.set_status(conn, fp, status)
+        finally:
+            conn.close()
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_" + status, detail=fp[:16])
+        return self._send_json(200, {"ok": True, "fp": fp, "status": status})
+
+    def _svc_user_restore(self, sess) -> None:
+        """垃圾桶恢复：rejected/revoked → 重新给一轮试用（3 天 / 2GB）。"""
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        fp = str(data.get("fp", "")).strip().lower()
+        if len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+            return self._error(400, "invalid fp")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            row = svc_db.get_trial(conn, fp)
+            if row is None:
+                return self._error(404, "unknown fp")
+            if row["status"] not in ("rejected", "revoked"):
+                return self._error(400, "only rejected/revoked can be restored")
+            now = int(time.time())
+            svc_db.restore_trial(conn, fp,
+                                 now + 3 * 86400, 2 * 1024 ** 3)
+        finally:
+            conn.close()
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_restore", detail=fp[:16])
+        return self._send_json(200, {"ok": True, "fp": fp, "status": "trial"})
+
+    def _svc_user_purge(self, sess, fp: str) -> None:
+        """垃圾桶彻底删除：抹掉记录，该设备可重新申请试用。"""
+        if len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+            return self._error(400, "invalid fp")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            row = svc_db.get_trial(conn, fp)
+            if row is None:
+                return self._error(404, "unknown fp")
+            if row["status"] not in ("rejected", "revoked"):
+                return self._error(400, "only rejected/revoked can be purged")
+            svc_db.purge_trial(conn, fp)
+        finally:
+            conn.close()
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_purge", detail=fp[:16])
+        return self._send_json(200, {"ok": True, "fp": fp})
+
+    def _svc_audit(self, sess) -> None:
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        client_id = (qs.get("client_id", [""])[0] or "").strip() or None
+        day = (qs.get("day", [""])[0] or "").strip() or None
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            rows = svc_db.list_audit(conn, day=day, client_id=client_id)
+        finally:
+            conn.close()
+        return self._send_json(200, {"audit": [dict(r) for r in rows]})
+
+    def _svc_blacklist_get(self, sess) -> None:
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            rows = svc_db.list_blacklist(conn)
+        finally:
+            conn.close()
+        return self._send_json(200, {"blacklist": [dict(r) for r in rows]})
+
+    # ---------------------------------------------- 受管服务（服务器清单）
+    # 运营在这里维护"哪些 VPN 服务器下发给客户端"；broker 每次请求按
+    # enabled=1 的记录实时生成并签名 server-list.ini（见 broker.py）。
+    def _svc_servers_get(self, sess) -> None:
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            rows = svc_db.list_vpn_servers(conn)
+        finally:
+            conn.close()
+        return self._send_json(200, {
+            "servers": [dict(r) for r in rows],
+            "local_pubkey": _local_server_pubkey(),
+        })
+
+    def _svc_servers_upsert(self, sess) -> None:
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        addr = str(data.get("addr", "")).strip()
+        pubkey = str(data.get("pubkey", "")).strip()
+        remark = str(data.get("remark", "")).strip()[:64]
+        enabled = 1 if data.get("enabled", True) else 0
+        try:
+            sort_order = int(data.get("sort_order", 0) or 0)
+        except (TypeError, ValueError):
+            return self._error(400, "invalid sort_order")
+        if not _valid_server_addr(addr):
+            return self._error(400, "invalid addr（格式 ip:port）")
+        if not _valid_server_pubkey(pubkey):
+            return self._error(
+                400, "invalid pubkey（需要该服务器 keys/server_sig.pub 的 SPKI DER base64）")
+        # 防呆：service 签名公钥绝不能填进服务器 pubkey 字段（2026-11-01 事故：
+        # 填错后客户端验签失败、卡在"连接中"，排查了很久）
+        svc_pub = _service_pubkey_b64()
+        if svc_pub and pubkey == svc_pub:
+            return self._error(
+                400, "pubkey 填成了 broker 的 service 签名公钥；"
+                     "这里要填该 VPN 服务器自己的 keys/server_sig.pub")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            svc_db.upsert_vpn_server(conn, addr=addr, pubkey=pubkey,
+                                     remark=remark, enabled=enabled,
+                                     sort_order=sort_order)
+        finally:
+            conn.close()
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_server_upsert", detail=addr)
+        return self._send_json(200, {"ok": True, "addr": addr})
+
+    def _svc_servers_toggle(self, sess) -> None:
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        addr = str(data.get("addr", "")).strip()
+        enabled = bool(data.get("enabled", True))
+        if not _valid_server_addr(addr):
+            return self._error(400, "invalid addr")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            ok = svc_db.set_vpn_server_enabled(conn, addr, enabled)
+        finally:
+            conn.close()
+        if not ok:
+            return self._error(404, "not found")
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_server_toggle", detail=("%s=%d" % (addr, 1 if enabled else 0)))
+        return self._send_json(200, {"ok": True, "addr": addr, "enabled": enabled})
+
+    def _svc_servers_del(self, sess, addr: str) -> None:
+        if not _valid_server_addr(addr):
+            return self._error(400, "invalid addr")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            ok = svc_db.delete_vpn_server(conn, addr)
+        finally:
+            conn.close()
+        if not ok:
+            return self._error(404, "not found")
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_server_del", detail=addr)
+        return self._send_json(200, {"ok": True, "addr": addr})
+
+    def _svc_blacklist_add(self, sess) -> None:
+        try:
+            data = self._read_json()
+        except ValueError as e:
+            return self._error(400, str(e))
+        value = str(data.get("domain", data.get("value", ""))).strip().lower()
+        note = str(data.get("note", "")).strip()[:100]
+        btype = str(data.get("type", "domain")).strip().lower()
+        if btype not in ("domain", "ip", "machine"):
+            return self._error(400, "invalid type")
+        if btype == "domain" and not _valid_domain(value):
+            return self._error(400, "invalid domain")
+        if btype == "ip":
+            import ipaddress
+            try:
+                ipaddress.ip_address(value)
+            except ValueError:
+                return self._error(400, "invalid ip")
+        if btype == "machine" and (not value or len(value) > 64 or
+                                   any(c not in _SAFE_ID_CHARS for c in value)):
+            return self._error(400, "invalid client_id")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            svc_db.upsert_blacklist(conn, value, note, btype)
+        finally:
+            conn.close()
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_blacklist_add", detail=btype + ":" + value)
+        return self._send_json(200, {"ok": True, "domain": value, "type": btype})
+
+    def _svc_blacklist_del(self, sess, domain: str) -> None:
+        if not _valid_domain(domain):
+            return self._error(400, "invalid domain")
+        try:
+            conn = svc_connect()
+        except RuntimeError as e:
+            return self._error(503, str(e))
+        try:
+            removed = svc_db.remove_blacklist(conn, domain)
+        finally:
+            conn.close()
+        if not removed:
+            return self._error(404, "domain not in blacklist")
+        auth.audit(Config.db_path, sess["username"], self._client_ip(),
+                   "svc_blacklist_del", detail=domain)
+        return self._send_json(200, {"ok": True, "domain": domain})
 
     # ---------------------------------------------------------------- 认证
     def _login(self) -> None:

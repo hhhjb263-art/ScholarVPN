@@ -20,6 +20,7 @@ object UpdateChecker {
 
     data class Policy(
         val latest: String,
+        val notes: String,
         val url: String,
         val sha256: String,
         val size: Long,
@@ -32,10 +33,21 @@ object UpdateChecker {
             ?: throw IllegalStateException("策略缺少 android_url 字段")
         Policy(
             latest = kv["latest"] ?: "",
+            notes = kv["notes"] ?: "",
             url = url,
             sha256 = kv["android_sha256"] ?: "",
             size = kv["android_size"]?.toLongOrNull() ?: 0L,
         )
+    }
+
+    /**
+     * 包哈希比较（2026-11-02 需求 5）：已装包与服务器包不同 = 有新包。
+     * 版本号（minimum 闸门/大更新）之外，非强制的更新提示以包差异为准——
+     * 同版本号重发的修复包也能触发提示。
+     */
+    fun hasNewPackage(installedSha: String, policySha: String): Boolean {
+        return installedSha.isNotEmpty() && policySha.isNotEmpty() &&
+               !installedSha.equals(policySha, ignoreCase = true)
     }
 
     /** 数值版本比较：latest > current 才是有新版本（x.y.z 逐段比较） */

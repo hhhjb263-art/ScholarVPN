@@ -27,8 +27,9 @@ constexpr auto kAuthRetryInterval = std::chrono::milliseconds(500);
 constexpr int kAuthMaxRetries = 10;
 
 // 心跳保活
+// 发送间隔两端统一 1s；判死阈值按传输区分，见 UDP.h 的 m_heartbeatTimeout
+// （UDP 5s / TCP 20s——TCP 外层重传退避 1s→2s→4s 很容易超过 5s）
 constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
-constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
 
 // 从 EVP_PKEY 中取原始公钥（X25519 / Ed25519 均为 32 字节）
 bool get_raw_pubkey(EVP_PKEY* pkey, std::vector<uint8_t>& out)
@@ -661,6 +662,9 @@ void UDP::send_work()
 			if (m_auth_failed.load()) {
 				if (m_auth_deny_reason.load() == 1) {
 					LOG_ERR("[UDP] 注册令牌无效或已使用，已自动清除 RegisterToken，将以登录模式重试\n");
+				} else if (m_auth_deny_reason.load() == 2) {
+					LOG_ERR("[UDP] 已超出使用范围，请联系管理员\n"
+						"      可在「设置 → 服务」刷新状态后重试\n");
 				} else {
 					LOG_ERR("[UDP] 身份认证被服务器拒绝：该身份未注册。\n"
 						"      首次使用请在服务器执行 ./build/vpn_server --gen-token 生成令牌，\n"
@@ -694,14 +698,16 @@ void UDP::send_work()
 			send_packet(static_cast<uint8_t>(m_heart), nullptr, 0, sendbuf);
 			last_heart = now;
 		}
-		// 心跳超时：超过 kHeartbeatTimeout 未收到【能通过认证的】对端报文 -> 判定链路失效
+		// 心跳超时：超过 m_heartbeatTimeout 未收到【能通过认证的】对端报文 -> 判定链路失效
+		// （阈值按传输区分：UDP 5s / TCP 20s，见 UDP.h 的成员注释）
 		if (m_last_rx_ms.load() != 0 &&
-			now - std::chrono::steady_clock::time_point(std::chrono::milliseconds(m_last_rx_ms.load())) > kHeartbeatTimeout) {
+			now - std::chrono::steady_clock::time_point(std::chrono::milliseconds(m_last_rx_ms.load())) > m_heartbeatTimeout) {
 			// 注意措辞：这条不等于"对端不可达"——本端解密失败或被反重放窗口丢弃的帧
 			// 同样不刷新存活时间（上面两条限流日志会给出真正原因），故两者都列出
 			LOG_ERR("[UDP] heartbeat timeout: %lldms 内未收到任何通过认证的对端报文"
 				"（对端不可达，或本端解密失败/被反重放丢弃），重连\n",
-				static_cast<long long>(kHeartbeatTimeout.count() * 1000));
+				static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+					m_heartbeatTimeout).count()));
 			m_need_reconnect.store(true);
 			break;
 		}

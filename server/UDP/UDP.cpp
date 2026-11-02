@@ -1,4 +1,6 @@
 #include "UDP.h"
+
+#include "../ServiceDB.h"   // 受管服务（SVC_DB）：trials 校验/配额/审计/黑名单
 #include "../Crypt/crypt.h"
 #include "../core/log.h"
 
@@ -238,6 +240,12 @@ void UDP::release_session(const std::string& key)
     }
     if (!victim)
         return;
+    // 受管服务：会话下线前把未落库的流量增量兜底收账（心跳 flush 有最长 30s 窗口）
+    if (m_svc && victim->svc_managed && victim->svc_bytes.load() > 0) {
+        const long long d = victim->svc_bytes.exchange(0);
+        m_svc->add_used(victim->client_id, d);
+        m_svc->flush();
+    }
     if (victim->ip_assigned && victim->virtual_ip != 0) {
         release_virtual_ip(victim->virtual_ip);
     }
@@ -590,6 +598,19 @@ int UDP::client_count() const
     return static_cast<int>(m_sessions.size());
 }
 
+// 受管服务装配：SVC_DB 指向 broker 的 sqlite。打不开=功能关闭并告警
+//（不得因此拒绝启动——普通自建部署没有这个文件）。
+void UDP::set_service_db(const std::string& db_path)
+{
+    auto svc = std::make_unique<service::ServiceDB>();
+    if (svc->open(db_path)) {
+        fprintf(stderr, "[SVC] 受管服务已启用: %s\n", db_path.c_str());
+        m_svc = std::move(svc);
+    } else {
+        fprintf(stderr, "[SVC] 受管服务库打开失败，功能停用: %s\n", db_path.c_str());
+    }
+}
+
 void UDP::set_identity(std::shared_ptr<EVP_PKEY> sig_priv, const std::string& keys_dir)
 {
     m_sig_priv = std::move(sig_priv);
@@ -637,15 +658,19 @@ bool UDP::forward_tun_packet(packet_buffer&& buf)
     if (!s || !s->authenticated.load())
         return false;
     if (!s->send_queue.push(std::move(buf))) {
-        // 发送队列满：该客户端持续消费不动（TCP 对端不收 / 链路劣化）。
-        // 按既定策略直接断开而非无限堆积——否则内存无界增长，且
-        // TCP-over-TCP 队头阻塞会把其他会话一起拖死。
-        // TCP 交 epoll 线程统一 close（fd 唯一 owner），UDP 无连接直接释放
-        fprintf(stderr, "[UDP] 发送队列满，断开会话 %s\n", s->peer_key.c_str());
-        if (s->is_tcp)
-            s->tcp_drop.store(true);   // epoll 线程收尾时 close + release_session
-        else
-            release_session(key);
+        // 发送队列满 = 该客户端一时消费不动（对端窗口关闭 / 链路劣化 / 瞬时突发）。
+        //
+        // 这里**只丢这一个包，不砍会话**。理由：
+        //   · 队列本身有界（512 包），内存不会无界增长，砍会话并不换来内存安全；
+        //   · 内层是 TCP 的话，丢包会被端到端重传补回来（等价于路由器拥塞丢包），
+        //     而砍掉整个会话会让该客户端所有连接同时断——用户看到的是
+        //     "用着用着整条 VPN 掉线重连"，比慢一点难受得多；
+        //   · 真失联有 30s 心跳超时兜底，不需要在这里用断连当看门狗。
+        const uint32_t n = s->txq_full_logged.fetch_add(1);
+        if (n < 3) {
+            fprintf(stderr, "[UDP] 下行队列满，丢弃该包（会话保留）%s%s\n",
+                    s->peer_key.c_str(), n == 2 ? "（同类日志将抑制）" : "");
+        }
         return false;
     }
     wake_send_waiters();   // 有下行数据：精确唤醒 send_work（无 sleep 轮询）
@@ -906,9 +931,10 @@ void UDP::send_work()
         for (auto& s : sessions) {
             if (!s->handshaked.load() || !s->enc_ready.load())
                 continue;
-            // 每会话本轮最多排空 64 包：持续下载时不再"每轮只发 1 包"
-            // （高负载下吞吐被遍历节奏限制），同时预算防热会话饿死其他会话
-            for (int n = 0; n < 64 && s->send_queue.pop(buf); ++n) {
+            // 每会话本轮最多排空 256 包：高吞吐（10MB/s ≈ 7000 包/秒）下
+            // 预算太小会让 send_work 高频空转重扫会话表；256 包 ≈ 360KB/轮，
+            // 配合事件唤醒足够吃满带宽，仍保留"防单会话独占"的预算语义
+            for (int n = 0; n < 256 && s->send_queue.pop(buf); ++n) {
                 if (buf.is_empty()) {
                     buf.clear();
                     continue;
@@ -924,6 +950,19 @@ void UDP::send_work()
                 if (!send_packet(*s, static_cast<uint8_t>(m_data), buf.get_data(), pay_size, sendbuf)) {
                     // TCP 连接级失败已在 send_packet 内标记 tcp_drop（epoll 线程断开）
                     fprintf(stderr, "[UDP] 发送数据失败: %s\n", s->peer_key.c_str());
+                }
+                if (m_svc && s->svc_managed) {
+                    s->svc_bytes.fetch_add(static_cast<long long>(pay_size));
+                    if (!s->svc_over.load() && s->svc_quota > 0 &&
+                        s->svc_used_base + s->svc_bytes.load() >= s->svc_quota) {
+                        s->svc_over.store(true);
+                        fprintf(stderr, "[SVC] 试用流量已达上限，切断会话 (id=%s)\n",
+                                s->client_id.c_str());
+                        m_svc->flush();
+                        release_session(s->peer_key);
+                        buf.clear();
+                        continue;   // 会话已摘除，本轮跳过剩余队列
+                    }
                 }
                 buf.clear();
                 any = true;
@@ -976,8 +1015,9 @@ void UDP::recv_work()
 
         // 批处理：一次 poll 唤醒后排空内核接收缓冲（突发流量下把 N 次
         // poll+recvfrom 压成 1 次 poll + N 次 recvfrom，降低系统调用开销）。
-        // 每轮上限 64 包：给心跳/停止检查留节奏，也防止单连接长期独占收包线程
-        for (int budget = 0; budget < 64 && is_running(); ++budget) {
+        // 每轮上限 256 包：高吞吐下减少 poll 轮次（突发流量下 N 次 recvfrom
+        // 压进 1 次 poll 的语义不变），心跳/停止检查仍有节奏保障
+        for (int budget = 0; budget < 256 && is_running(); ++budget) {
             recvbuf.resize(KMax_packet_size);
             socklen_t peer_addr_size = sizeof(peer_addr);
 
@@ -1131,6 +1171,51 @@ void UDP::handle_framed(Session& s, const tunnel_header& hdr,
                                 (n == 2) ? "（同类日志已抑制）" : "");
                     }
                     break;
+                }
+                // 受管服务挂钩（仅 trials 用户计费/审计/黑名单；老用户零影响）：
+                // 先计费再入队——超量会话在此切断，不再进 TUN
+                if (m_svc && s.svc_managed) {
+                    s.svc_bytes.fetch_add(static_cast<long long>(inner_len));
+                    if (!s.svc_over.load() && s.svc_quota > 0 &&
+                        s.svc_used_base + s.svc_bytes.load() >= s.svc_quota) {
+                        s.svc_over.store(true);
+                        fprintf(stderr, "[SVC] 试用流量已达上限，切断会话 (id=%s)\n",
+                                s.client_id.c_str());
+                        m_svc->flush();
+                        release_session(s.peer_key);
+                        break;
+                    }
+                }
+                if (m_svc) {
+                    // 黑名单：目的 IPv4（单 IP 精确匹配，包头的 dst 在 offset 16）
+                    if (inner_len >= 20) {
+                        uint32_t dst = 0;
+                        std::memcpy(&dst, pkt.data() + 16, 4);
+                        if (m_svc->ip_blocked(ntohl(dst))) {
+                            const uint32_t nb = s.svc_blk_logged.fetch_add(1);
+                            if (nb < 3) {
+                                fprintf(stderr, "[SVC] 目的 IP 黑名单命中丢弃 (%s)%s\n",
+                                        s.client_id.c_str(),
+                                        (nb == 2) ? "（同类日志已抑制）" : "");
+                            }
+                            break;
+                        }
+                    }
+                    // 黑名单：整机（client_id）——逐包检查已移出热路径，
+                    // 由心跳每 30s 扫描在线会话兜底（新增黑名单 ≤30s 生效）
+                    std::string domain;
+                    if (service::extract_domain(pkt.data(), pkt.size(), domain)) {
+                        if (m_svc->domain_blocked(domain)) {
+                            const uint32_t nb = s.svc_blk_logged.fetch_add(1);
+                            if (nb < 3) {
+                                fprintf(stderr, "[SVC] 黑名单命中丢弃: %s (id=%s)%s\n",
+                                        domain.c_str(), s.client_id.c_str(),
+                                        (nb == 2) ? "（同类日志已抑制）" : "");
+                            }
+                            break;   // 丢弃：不进 TUN，客户端侧表现为目标不可达
+                        }
+                        m_svc->audit_hit(s.client_id, domain);
+                    }
                 }
                 if (m_queue_recv.push(packet_buffer(std::move(pkt))))
                     wake_recv_waiters();   // 上行入队：精确唤醒 VpnCore 转发线程
@@ -1499,6 +1584,43 @@ void UDP::handle_identity(Session& s, const std::vector<uint8_t>& inner)
             fprintf(stderr, "[UDP][AUTH] 客户端登录成功 id=%s (%s)\n", client_id.c_str(), s.peer_key.c_str());
         }
     }
+
+    // 受管服务：整机黑名单（machine 类型，值 = client_id；对任何接入者生效）
+    if (m_svc && m_svc->machine_blocked(client_id)) {
+        fprintf(stderr, "[SVC] 机器黑名单拒绝接入 %s\n", client_id.c_str());
+        deny(2);
+        return;
+    }
+
+    // 受管服务：trials 状态/到期校验（在踢旧会话/分配 VIP 之前，任何状态变更前拒绝）。
+    // client_id 不在 trials 里 = 手工注册的老用户，完全不受影响。
+    if (m_svc) {
+        const service::TrialInfo t = m_svc->get_trial(client_id);
+        if (t.found) {
+            std::string why;
+            const long long now_s = static_cast<long long>(time(nullptr));
+            if (t.status == "rejected")
+                why = "该设备的服务申请已被拒绝";
+            else if (t.expire_at != 0 && now_s >= t.expire_at)
+                why = "已超出使用范围";   // 3 天有效期已过
+            else if (t.quota_bytes != 0 && t.used_bytes >= t.quota_bytes)
+                why = "已超出使用范围";   // 2GB 流量已用完（登录即拒，不进数据面）
+            else if (t.status != "trial" && t.status != "approved")
+                why = "服务状态异常";
+            if (!why.empty()) {
+                fprintf(stderr, "[SVC] 拒绝接入 %s: %s\n", client_id.c_str(), why.c_str());
+                deny(2);
+                return;
+            }
+            s.svc_managed = true;
+            s.svc_used_base = t.used_bytes;
+            s.svc_quota = t.quota_bytes;
+            if (t.quota_bytes != 0) {
+                fprintf(stderr, "[SVC] 受管用户 %s：已用 %lld / 配额 %lld 字节\n",
+                        client_id.c_str(), t.used_bytes, t.quota_bytes);
+            }
+        }
+    }
     s.client_id = client_id;
     s.cli_pub_hex = cli_pub_hex;
 
@@ -1576,12 +1698,37 @@ void UDP::heartbeat_work()
     // 保证 stop()/SIGTERM 能快速 join 本线程（原先整段睡 10s 会让优雅退出卡近 10s，
     // 导致 stop/restart 看起来无效、需 kill -9，甚至被 watchdog 漏杀成孤儿）
     auto next_due = std::chrono::steady_clock::now() + kHeartbeatInterval;
+    int svc_flush_beats = 0;   // 每 3 拍（约 30s）把会话流量/审计聚合 flush 进受管服务库
     while (is_running()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (!is_running())
             break;
         if (std::chrono::steady_clock::now() < next_due)
             continue;
+        if (m_svc) {
+            std::vector<std::shared_ptr<Session>> blk;
+            {
+                std::lock_guard<std::mutex> lock(m_sessions_mutex);
+                for (auto& kv : m_sessions) {
+                    if (kv.second->svc_managed && kv.second->svc_bytes.load() > 0) {
+                        const long long d = kv.second->svc_bytes.exchange(0);
+                        m_svc->add_used(kv.second->client_id, d);
+                    }
+                    // 整机黑名单：在线会话即时生效（无需等它发包）
+                    if (!kv.second->client_id.empty() &&
+                        m_svc->machine_blocked(kv.second->client_id)) {
+                        blk.push_back(kv.second);
+                    }
+                }
+            }
+            for (auto& v : blk) {
+                fprintf(stderr, "[SVC] 机器黑名单命中，切断会话 (id=%s)\n",
+                        v->client_id.c_str());
+                release_session(v->peer_key);
+            }
+            m_svc->flush();
+            ++svc_flush_beats;
+        }
         next_due = std::chrono::steady_clock::now() + kHeartbeatInterval;
         const uint64_t now = now_ms();
         std::vector<std::shared_ptr<Session>> sessions;

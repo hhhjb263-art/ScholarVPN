@@ -2,6 +2,8 @@ package com.scholarvpn.client.vpn
 
 import android.content.Context
 import android.util.Base64
+import com.scholarvpn.client.service.Credentials
+import com.scholarvpn.client.service.ServiceClient
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -16,6 +18,7 @@ data class ServerEntry(
     var clientId: String = "user",
     var registerToken: String = "", // 一次性注册令牌（空=登录模式）
     var serverPubKey: String = "",  // 服务器公钥（raw base64 或 PEM 原文）
+    var managed: Boolean = false,   // 受管下发（服务方列表），刷新时整体替换
 )
 
 /** 隧道连接所需的运行时配置（由 [VpnSettings] 从条目派生） */
@@ -35,7 +38,57 @@ data class ServerConfig(
  */
 class VpnSettings(context: Context) {
 
+    private val appContext = context.applicationContext
     private val prefs = context.getSharedPreferences("scholarvpn", Context.MODE_PRIVATE)
+
+    // ---- 受管服务状态（对齐 Windows config.ini [Service] 段） ----
+
+    data class ServiceState(
+        val fp: String = "",
+        val clientId: String = "",
+        val token: String = "",       // 一次性注册令牌（隧道握手用，成功后由 clearRegisterToken 消费）
+        val status: String = "",
+        val expireAt: Long = 0,
+        val quotaBytes: Long = 0,
+        val usedBytes: Long = 0,
+        val limitKind: String = "",   // 服务器选定的限制维度：days | bytes | none
+        val remaining: Long = 0,      // 该维度剩余量；0 = 已超限
+    )
+
+    fun loadServiceState(): ServiceState? {
+        val fp = prefs.getString("svc_fp", null) ?: return null
+        val cid = prefs.getString("svc_client_id", null) ?: return null
+        return ServiceState(
+            fp = fp,
+            clientId = cid,
+            token = prefs.getString("svc_token", "") ?: "",
+            status = prefs.getString("svc_status", "") ?: "",
+            expireAt = prefs.getLong("svc_expire_at", 0),
+            quotaBytes = prefs.getLong("svc_quota", 0),
+            usedBytes = prefs.getLong("svc_used", 0),
+        )
+    }
+
+    fun saveServiceState(s: ServiceState) {
+        prefs.edit()
+            .putString("svc_fp", s.fp)
+            .putString("svc_client_id", s.clientId)
+            .putString("svc_token", s.token)
+            .putString("svc_status", s.status)
+            .putLong("svc_expire_at", s.expireAt)
+            .putLong("svc_quota", s.quotaBytes)
+            .putLong("svc_used", s.usedBytes)
+            .apply()
+    }
+
+    /** 把凭据里的最新用量/状态刷回本地（保留 fp/clientId/token）。 */
+    fun updateServiceUsage(s: Credentials) {
+        val cur = loadServiceState() ?: return
+        saveServiceState(
+            cur.copy(status = s.status, expireAt = s.expireAt,
+                     quotaBytes = s.quotaBytes, usedBytes = s.usedBytes)
+        )
+    }
 
     // ---- 服务器列表 ----
 
@@ -54,6 +107,7 @@ class VpnSettings(context: Context) {
                     clientId = o.optString("clientId", "user"),
                     registerToken = o.optString("token"),
                     serverPubKey = o.optString("pub"),
+                    managed = o.optBoolean("managed", false),
                 )
             }
             return list
@@ -86,7 +140,8 @@ class VpnSettings(context: Context) {
                 .put("tcp", s.useTcp)
                 .put("clientId", s.clientId)
                 .put("token", s.registerToken)
-                .put("pub", s.serverPubKey))
+                .put("pub", s.serverPubKey)
+                .put("managed", s.managed))
         }
         prefs.edit().putString("servers_json", arr.toString()).apply()
     }
@@ -125,6 +180,42 @@ class VpnSettings(context: Context) {
             servers[idx].registerToken = ""
             saveServers(servers)
         }
+    }
+
+    /**
+     * 受管卡片整体替换（对齐 Windows QtWidgetsClass::apply_managed_servers）：
+     * 保留用户自建卡片；旧受管卡片整体删除；按服务方下发的列表重建。
+     * 受管卡片默认 TCP——移动网络对非标端口的 UDP 国际方向 QoS 丢弃严重
+     * （握手通、数据全死，2026-11-01 实测），用户可在编辑页自切。
+     *
+     * @return 新增卡片数（0 = 服务方列表为空，不动作）
+     */
+    fun applyManagedServers(
+        servers: List<Pair<String, String>>,
+        clientId: String,
+        token: String,
+    ): Int {
+        if (servers.isEmpty()) return 0
+        val cur = loadServers()
+        val kept = cur.filterNot { it.managed }.toMutableList()
+        var added = 0
+        for ((addr, pub) in servers) {
+            val split = ServiceClient.splitAddr(addr) ?: continue
+            kept += ServerEntry(
+                name = "",
+                ip = split.first,
+                port = split.second,
+                useTcp = true,
+                clientId = clientId,
+                registerToken = token,
+                serverPubKey = pub,
+                managed = true,
+            )
+            added++
+        }
+        if (kept.size != cur.size || added > 0) saveServers(kept)
+        if (added > 0) setActiveIndex(0)   // 卡片集合变了，选中项回到第一张
+        return added
     }
 
     /**

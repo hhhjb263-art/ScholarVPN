@@ -14,6 +14,7 @@
 #include<qlineedit.h>
 #include <QPainter>
 #include <QTimer>
+#include <QProgressBar>
 #include <QSystemTrayIcon>
 #include <QMenu>
 #include <QCloseEvent>
@@ -144,6 +145,16 @@ private:
 	void update_glass_card();          // 刷新半透明区里的"当前服务器"摘要卡
 	void update_home_btn();            // 按当前连接状态刷新主页面"连接/断开"按钮
 	void update_dia_highlight();       // 刷新 dia 卡片列表的选中高亮
+	// 受管服务：服务不可用阻塞弹窗（刷新异步：ActionRole 不关窗，结果原地更新/关闭）
+	void show_service_blocked_box(const QString& reason);
+	// 受管服务：把拉到的服务器列表合并进 [ServerN]（撤旧托管卡、追加新卡、自建卡不动）
+	void apply_managed_servers(int count);
+	// 受管服务：切回「自建」时把受管卡片从 [ServerN] 撤掉（自建模式不看到/不连服务方卡）
+	void remove_managed_cards();
+	// [ServerN] 读写（apply/remove 共用；oldCount 用于清理删剩的脏节）
+	static std::vector<ServerEntry> read_server_entries(const cfgstr& ini_path, int* countOut);
+	static void write_server_entries(const cfgstr& ini_path, int oldCount,
+	                                 const std::vector<ServerEntry>& list);
 	bool eventFilter(QObject* obj, QEvent* ev) override;
 	void resizeEvent(QResizeEvent* ev) override;   // 覆盖层随主窗口尺寸同步
 	void createtray();
@@ -179,6 +190,13 @@ private:
 	QPushButton* m_homeBtn = nullptr;     // 连接/断开
 	QPushButton* m_homeEditBtn = nullptr; // 编辑
 	QLabel*      m_homeHint = nullptr;    // 无服务器时的占位提示
+	QFrame*      m_homeAccent = nullptr;  // 连接状态色条（卡片左缘）
+	QLabel*      m_homeAvatar = nullptr;  // 服务器头像圈（名称首字母）
+	QLabel*      m_homeTag = nullptr;     // 受管服务徽标（仅受管卡片）
+	QProgressBar* m_homeUsageBar = nullptr;  // 受管用量进度条
+	QLabel*      m_homeUsageText = nullptr; // 受管用量文字
+	QList<QLabel*> m_cardDots;              // Switch 卡片的在线状态圆点
+	void update_home_usage();               // 受管用量行/进度条刷新
 
 	QString     m_serverIp;
 	ConnState   m_state{ ConnState::Stopped };
@@ -208,6 +226,11 @@ private:
 	QString  m_updateLatest;
 	quint64  m_updateSize = 0;
 	bool m_lastDownloadOk = false;   // 最近一次下载结果（强制弹窗循环据此退出）
+
+	// 受管服务阻塞弹窗（刷新异步进行：结果经 serviceChecked 原地更新或 accept）
+	QPointer<QMessageBox> m_svcBox;
+	bool m_svcCheckPending = false;
+	QLabel* m_svcInfo = nullptr;   // 主页用量条：剩余时长/流量（受管模式显示）
 	QSystemTrayIcon* m_trayicon = nullptr;
 	QMenu* m_menu = nullptr;
 	QAction* m_actionShow = nullptr;
@@ -217,7 +240,7 @@ private:
 
 class Setting : public QDialog {
 public:
-	explicit Setting(QWidget* parent, AppBridge* bridge);
+	explicit Setting(QWidget* parent, AppBridge* bridge, int initialPage = 0);
 	~Setting();
 	// 更新状态同步（由主界面转发 AppBridge 信号；本类无 Q_OBJECT，用普通方法）
 	void applyUpdateInfo(int status, int action, const QString& latest,
@@ -225,9 +248,19 @@ public:
 	                     const QString& url, const QString& sha256, quint64 size);
 	void applyDownloadProgress(int pct);
 	void applyDownloadFinished(bool ok, const QString& err);
+	// 受管服务状态同步（同上，由主界面转发）
+	void applyServiceInfo(int blocked, const QString& reason, const QString& fp,
+	                      const QString& clientId, const QString& status,
+	                      qulonglong expire, qulonglong quota, qulonglong used,
+	                      const QString& error);
+	void applyServiceServers(const QString& text);
 private:
 	void create_setting();
 	void build_about_page(class QStackedWidget* stack, class QListWidget* nav);
+	void build_service_page(class QStackedWidget* stack, class QListWidget* nav);
+	// config.ini [Service] Mode 读取（接入点已内置，无需读 URL/公钥）
+	bool st_cfg_managed() const;
+	int m_initialPage = 0;   // 打开时定位的导航页（0=通用 1=服务 2=关于）
 	QCheckBox* m_chkAutoStart = nullptr;
 	AppBridge* m_bridge = nullptr;
 	// 关于页控件
@@ -237,4 +270,9 @@ private:
 	QPushButton* m_btnUpdateNow = nullptr;
 	QString m_url, m_sha256, m_latest, m_notes;
 	quint64 m_size = 0;
+	// 服务页控件
+	QLabel* m_svcStatus = nullptr;
+	QLabel* m_svcDetail = nullptr;
+	QPushButton* m_btnSvcApply = nullptr;
+	QPushButton* m_btnSvcRefresh = nullptr;
 };

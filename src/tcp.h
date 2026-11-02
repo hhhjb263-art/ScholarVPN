@@ -41,7 +41,23 @@ private:
     // 不再是每帧一次 vector::erase）
     void compact_rx();
 
+    // 把 m_txPending 里没写完的字节尽力冲出去（预算 200ms，写不动就留着）。
+    // @return false = 连接已死（致命错误，调用方应停止发送）
+    bool flush_tx_pending();
+
     std::vector<uint8_t> m_rxBuf;       // 接收累积缓冲（可能同时含多帧）
     size_t m_rxOff = 0;                 // 已消费前缀长度（有效数据从 data()+m_rxOff 起）
     size_t m_consumed = 0;              // 上一帧交付的字节数（下次调用先推进 m_rxOff）
+
+    // ---- 发送积压 ----
+    // 为什么需要它：外层 TCP 是可靠传输，应用层一旦丢帧就等于人为制造丢包，
+    // 内层 TCP 会把它当拥塞信号反复重传 + 砍拥塞窗口，吞吐直接塌陷
+    // （TCP-over-TCP 最忌讳的做法）。所以 socket 暂时不可写时不再丢帧，
+    // 而是把整帧留在这里，等 socket 可写再冲出去。
+    //
+    // 只在 m_send_mutex 保护下访问（send_packet 持锁调 raw_send，
+    // send_work 与 recv_work 两个线程因此天然串行），不需要额外加锁。
+    std::vector<uint8_t> m_txPending;
+    size_t m_txPendingOff = 0;          // 已写出前缀长度
+    uint32_t m_txBacklogLogged = 0;     // "转入积压"日志的已打印次数（限流，防刷屏）
 };

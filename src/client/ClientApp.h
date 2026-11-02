@@ -32,6 +32,7 @@
 #include "../route_manager.h"
 #include "../reconnect_manager.h"
 #include "../DnsLeakGuard.h"
+#include "../DnsProxy.h"
 
 #if defined(_WIN32)
 #pragma comment(lib, "Ws2_32.lib")
@@ -63,10 +64,14 @@ public:
 	bool routing_split() const;
 	void set_routing_split(bool split);
 
-	// 服务端策略判定为强制更新时置位：start() 会直接拒绝连接。
-	// 放在这里而不是只靠界面禁用，是为了堵住托盘/命令行等绕过路径。
+	// 强制更新时禁止连接（界面禁用之外的第二道闸门）
 	void set_update_blocked(bool blocked) { m_updateBlocked.store(blocked); }
 	bool update_blocked() const { return m_updateBlocked.load(); }
+
+	// 受管服务判定不允许使用（试用到期/超量/被拒）时置位：start() 直接拒绝连接。
+	// 与强制更新闸门同一设计：界面禁用之外堵住托盘/命令行绕过路径。
+	void set_service_blocked(bool blocked) { m_serviceBlocked.store(blocked); }
+	bool service_blocked() const { return m_serviceBlocked.load(); }
 
 	// 当前进程是否已提权（管理员）。创建 Wintun 网卡 / 改路由 / 改 DNS 都需要，
 	// 因此普通用户（免 UAC）启动时返回 false，init() 会失败、连接功能不可用。
@@ -114,6 +119,8 @@ private:
 	std::string m_remote;       // 解析后的服务器 IP（UDP / 路由只用 IP）
 	std::string m_serverHost;   // 配置原文，可能是域名；每次 start() 重新解析
 	std::atomic<bool> m_updateBlocked{ false };   // 强制更新时禁止连接
+	std::atomic<bool> m_serviceBlocked{ false };  // 受管服务判定不允许使用时禁止连接
+
 	uint16_t m_port = 0;
 
 	// 以下的成员持有保证生命周期
@@ -122,6 +129,7 @@ private:
 	std::unique_ptr<RouteManager> m_route;
 	std::unique_ptr<ReconnectManager> m_mgr;
 	DnsLeakGuard m_dnsGuard;              // 防 DNS 泄漏（清物理网卡 DNS + 断线恢复）
+	DnsProxy m_dnsProxy;                  // P3：本地 DNS 代理（分流模式按域名选上游）
 	// 桥接线程
 	std::thread m_threadTunToUdp;
 	std::thread m_threadUdpToTun;

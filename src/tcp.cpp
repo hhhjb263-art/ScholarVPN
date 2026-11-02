@@ -13,6 +13,11 @@
 
 namespace {
 
+// 发送积压上限：超过它说明对端长时间不消费（窗口关闭/进程卡死），
+// 继续攒只会吃内存，直接判连接死亡走重连。4MB ≈ 2900 个满帧，
+// 远大于正常链路一次 RTO 突发需要的量。
+constexpr size_t kMaxTxPending = 4 * 1024 * 1024;
+
 // connect() 失败原因分类打印：这三种情况在用户侧都表现为"TCP 连不上"，
 // 但排查方向完全不同（代码 / 防火墙 / 路由），必须能区分开
 void log_connect_error(const char* ip, unsigned port, int err)
@@ -62,6 +67,11 @@ TCP::TCP(const char* remoteip, uint16_t port,
          bool is_running, size_t queueMax)
     : UDP(remoteip, port, is_running, queueMax)
 {
+    // 心跳判死放宽到 20s（基类默认 5s 是给 UDP 用的）。
+    // 外层 TCP 可靠但会重传：一次 RTO 退避（1s→2s→4s→8s）就可能超过 5s，
+    // 把"正在重传"误判成"对端已死"会触发无谓重连，重连期间所有内层连接
+    // 同时卡死——用户看到的就是"用一会儿整条断掉、再连又慢"。
+    m_heartbeatTimeout = std::chrono::seconds(20);
 }
 
 // 协议版本：TCP 帧标 v_tcp（接收侧 version 校验据此丢弃错误传输的报文）
@@ -144,25 +154,55 @@ bool TCP::establish()
 // TCP：循环写直到整帧发出（send 可能部分写）。
 // 非阻塞 socket 的 WSAEWOULDBLOCK 用 WSAPoll 等可写（事件驱动，无 sleep 轮询）。
 //
-// 等待上限 1s（原 5s）。为什么必须缩短：send_packet 全程持有 m_send_mutex，
-// 而收包线程处理对端心跳时要拿同一把锁回 heart_response——写侧在对端窗口
-// 关闭时卡 5s，收包线程就跟着卡 5s，期间 m_last_rx_ms 不刷新，
-// 正好触到客户端 5s 心跳超时阈值 → "网速卡住 + 无故重连"。
-// 单帧丢弃有隧道内 TCP 重传兜底，代价远小于拖死收包线程。
+// 两条硬约束（改之前先读 tcp.h 里 m_txPending 的说明）：
+//  1) send_packet 全程持有 m_send_mutex，而收包线程回心跳要拿同一把锁。
+//     所以单次 raw_send 的等待预算压到 200ms——写不动就把剩余字节转入
+//     积压缓冲立刻返回，绝不能在这里卡 1s 把收包线程一起拖死。
+//  2) 外层 TCP 可靠，应用层丢帧 = 人为制造丢包 → 内层 TCP 重传 + 拥塞塌陷。
+//     所以"写不动"不再是失败而是积压；只有连接级致命错误才返回 false。
 bool TCP::raw_send(const uint8_t* data, size_t len)
 {
+	// 有积压：新帧只能排在它后面（流式字节序不能乱），交给 flush 一起冲
+	if (m_txPendingOff < m_txPending.size())
+	{
+		if (m_txPending.size() + len > kMaxTxPending)
+		{
+			LOG_ERR("[TCP] 发送积压超过 %zu 字节（对端长期不收），标记重连\n",
+				static_cast<size_t>(kMaxTxPending));
+			m_need_reconnect.store(true);
+			return false;
+		}
+		// 回收已写出的前缀，避免 vector 无界增长
+		if (m_txPendingOff > 0)
+		{
+			m_txPending.erase(m_txPending.begin(),
+				m_txPending.begin() + static_cast<std::ptrdiff_t>(m_txPendingOff));
+			m_txPendingOff = 0;
+		}
+		m_txPending.insert(m_txPending.end(), data, data + len);
+		return flush_tx_pending();
+	}
+
+	// 无积压：直接写，预算 200ms
 	size_t off = 0;
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
 	while (off < len) {
 		sock_ssize_t n = send(m_sock, reinterpret_cast<const char*>(data + off),
 			static_cast<int>(len - off), 0);
 		if (n == SOCK_ERR) {
 			int err = sock_last_error();
 			if (err == kSockWouldBlock) {
-				// 缓冲满：等 socket 可写后重试；总时长超限放弃本帧
 				if (std::chrono::steady_clock::now() >= deadline) {
-					LOG_ERR("[TCP] send 持续 1s 不可写（对端窗口关闭/消费不动），放弃本帧\n");
-					return false;
+					// 写不动：剩余部分整段转入积压（不丢帧）。下一次发送
+					// （最迟 1s 后的心跳）会先把它冲出去
+					m_txPending.assign(data + off, data + len);
+					m_txPendingOff = 0;
+					if (m_txBacklogLogged < 3) {
+						++m_txBacklogLogged;
+						LOG_INFO("[TCP] socket 暂不可写，%zu 字节转入积压（不丢帧）",
+							len - off);
+					}
+					return true;
 				}
 				sock_pollfd pfd{};
 				pfd.fd = m_sock;
@@ -193,6 +233,52 @@ bool TCP::raw_send(const uint8_t* data, size_t len)
 		}
 		off += static_cast<size_t>(n);
 	}
+	return true;
+}
+
+// 尽力把积压冲出去。写不动不算失败（留着下次再冲），只有连接级错误返回 false。
+// 调用时机：每次 raw_send（最迟由 1s 一次的心跳触发），所以积压不会长期滞留。
+bool TCP::flush_tx_pending()
+{
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+	while (m_txPendingOff < m_txPending.size())
+	{
+		const size_t remain = m_txPending.size() - m_txPendingOff;
+		sock_ssize_t n = send(m_sock,
+			reinterpret_cast<const char*>(m_txPending.data() + m_txPendingOff),
+			static_cast<int>(remain), 0);
+		if (n == SOCK_ERR)
+		{
+			const int err = sock_last_error();
+			if (err == kSockWouldBlock)
+			{
+				if (std::chrono::steady_clock::now() >= deadline)
+					return true;          // 还写不动：留着，下次继续
+				sock_pollfd pfd{};
+				pfd.fd = m_sock;
+				pfd.events = POLLOUT;
+				const int pr = sock_poll(&pfd, 1, 20);
+				if (pr == SOCK_ERR) { m_need_reconnect.store(true); return false; }
+				if (pr > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+				{
+					m_need_reconnect.store(true);
+					return false;
+				}
+				continue;
+			}
+			LOG_ERR("[TCP] 冲刷积压失败: err=%d，标记重连\n", err);
+			m_need_reconnect.store(true);
+			return false;
+		}
+		if (n == 0)
+		{
+			m_need_reconnect.store(true);
+			return false;
+		}
+		m_txPendingOff += static_cast<size_t>(n);
+	}
+	m_txPending.clear();
+	m_txPendingOff = 0;
 	return true;
 }
 

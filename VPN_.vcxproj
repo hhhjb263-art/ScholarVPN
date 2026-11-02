@@ -72,6 +72,7 @@
 xcopy /Y /D "$(ProjectDir)third_party\wintun-0.14.1\wintun\bin\amd64\wintun.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)src\gui\style.qss" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)docs\routing\chnroute.txt" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)docs\routing\chn-domains.txt" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)source\icon.ico" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Widgetsd.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Guid.dll" "$(OutDir)"
@@ -111,6 +112,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qicod.dll" "$(OutDir)i
 xcopy /Y /D "$(ProjectDir)third_party\wintun-0.14.1\wintun\bin\amd64\wintun.dll" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)src\gui\style.qss" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)docs\routing\chnroute.txt" "$(OutDir)"
+xcopy /Y /D "$(ProjectDir)docs\routing\chn-domains.txt" "$(OutDir)"
 xcopy /Y /D "$(ProjectDir)source\icon.ico" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Widgets.dll" "$(OutDir)"
 xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\bin\Qt6Gui.dll" "$(OutDir)"
@@ -138,6 +140,9 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)im
     <ClInclude Include="src\platform\cfgstr.h" />
     <ClInclude Include="src\platform\cidr.h" />
     <ClInclude Include="src\platform\iplist.h" />
+    <ClInclude Include="src\service\machine_id.h" />
+    <ClInclude Include="src\service\service_bootstrap.h" />
+    <ClInclude Include="src\service\service_client.h" />
     <ClInclude Include="src\version.h" />
     <ClInclude Include="src\update\update_policy.h" />
     <ClInclude Include="src\update\update_fetcher.h" />
@@ -163,6 +168,7 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)im
     <ClCompile Include="src\AdapterConfig.cpp" />
     <ClCompile Include="src\client\ClientApp.cpp" />
     <ClCompile Include="src\DnsLeakGuard.cpp" />
+    <ClCompile Include="src\DnsProxy.cpp" />
     <ClCompile Include="src\gui\AppBridge.cpp" />
     <ClCompile Include="src\gui\moc_AppBridge.cpp" />
     <ClCompile Include="src\gui\moc_QtWidgetsClass.cpp" />
@@ -172,6 +178,8 @@ xcopy /Y /D "D:\Qt\6.9.1\msvc2022_64\plugins\imageformats\qico.dll" "$(OutDir)im
     <ClCompile Include="src\PacketQueue.cpp" />
     <ClCompile Include="src\platform\cfgstr.cpp" />
     <ClCompile Include="src\platform\iplist.cpp" />
+    <ClCompile Include="src\service\machine_id.cpp" />
+    <ClCompile Include="src\service\service_client.cpp" />
     <ClCompile Include="src\update\update_policy.cpp" />
     <ClCompile Include="src\update\update_fetcher.cpp" />
     <ClCompile Include="src\update\update_checker.cpp" />

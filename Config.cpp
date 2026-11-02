@@ -29,7 +29,7 @@
 //   Linux  ：自实现解析（保留注释/未知键，原子写回，UTF-8）
 // ============================================================================
 
-namespace
+namespace scholini
 {
     // ---- 字符串小工具（cfgstr 两种底层类型都要能编） ----
 
@@ -204,7 +204,10 @@ namespace
 
 #endif
 
-} // namespace
+} // namespace scholini
+
+// LoadClientConfig / SaveClientConfig 内部继续无限定使用
+using namespace scholini;
 
 Config::Config(cfgstr path, cfgstr dirPath)
     : ini_path(std::move(path)), dir_path(std::move(dirPath))
@@ -353,6 +356,7 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
         e.ClientID = IniGetStr(ini_path, sec, CS("ClientID"), outCfg.ClientID);
         e.RegisterToken = IniGetStr(ini_path, sec, CS("RegisterToken"), outCfg.RegisterToken);
         e.ServerPubKey = StripQuotes(IniGetStr(ini_path, sec, CS("ServerPubKey"), CS("")));
+        e.managed = IniGetInt(ini_path, sec, CS("Managed"), 0) != 0;
 
         // 传输方式：0=UDP（默认）1=TCP。
         // 必须按字符串容错解析：手工把 ini 写成 "Transport=TCP" 时不能被静默当成 0，
@@ -427,6 +431,7 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
             IniSetStr(ini_path, sec, CS("ClientID"), e.ClientID);
             IniSetStr(ini_path, sec, CS("RegisterToken"), e.RegisterToken);
             IniSetStr(ini_path, sec, CS("ServerPubKey"), e.ServerPubKey);
+            IniSetInt(ini_path, sec, CS("Managed"), e.managed ? 1 : 0);
         }
         IniSetInt(ini_path, CS("Server"), CS("Count"), static_cast<int>(found.size()));
     }
@@ -475,6 +480,19 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     outCfg.UpdatePolicyURL = IniGetStr(ini_path, CS("Update"), CS("PolicyURL"), outCfg.UpdatePolicyURL);
     outCfg.UpdateSigURL = IniGetStr(ini_path, CS("Update"), CS("SigURL"), outCfg.UpdateSigURL);
     outCfg.ReleasePubKey = IniGetStr(ini_path, CS("Update"), CS("PublicKey"), outCfg.ReleasePubKey);
+
+    // [Service] 受管服务（缺失键保持默认 off，老配置无需迁移）
+    outCfg.ServiceMode = IniGetStr(ini_path, CS("Service"), CS("Mode"), outCfg.ServiceMode);
+    outCfg.ServiceURL = IniGetStr(ini_path, CS("Service"), CS("ServiceURL"), outCfg.ServiceURL);
+    outCfg.ServicePubKey = IniGetStr(ini_path, CS("Service"), CS("PublicKey"), outCfg.ServicePubKey);
+    outCfg.ServiceFp = IniGetStr(ini_path, CS("Service"), CS("Fp"), outCfg.ServiceFp);
+    outCfg.ServiceClientId = IniGetStr(ini_path, CS("Service"), CS("ClientID"), outCfg.ServiceClientId);
+    outCfg.ServiceToken = IniGetStr(ini_path, CS("Service"), CS("Token"), outCfg.ServiceToken);
+    outCfg.ServiceStatus = IniGetStr(ini_path, CS("Service"), CS("Status"), outCfg.ServiceStatus);
+    outCfg.ServiceExpireAt = IniGetStr(ini_path, CS("Service"), CS("ExpireAt"), outCfg.ServiceExpireAt);
+    outCfg.ServiceQuotaBytes = IniGetStr(ini_path, CS("Service"), CS("QuotaBytes"), outCfg.ServiceQuotaBytes);
+    outCfg.ServiceUsedBytes = IniGetStr(ini_path, CS("Service"), CS("UsedBytes"), outCfg.ServiceUsedBytes);
+    outCfg.ServiceManagedServers = IniGetStr(ini_path, CS("Service"), CS("ManagedServers"), outCfg.ServiceManagedServers);
 
     outCfg.ClientID = IniGetStr(ini_path, CS("Identity"), CS("ClientID"), outCfg.ClientID);
     outCfg.RegisterToken = IniGetStr(ini_path, CS("Identity"), CS("RegisterToken"), outCfg.RegisterToken);
@@ -528,6 +546,19 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
     ok &= IniSetStr(ini_path, CS("Update"), CS("PolicyURL"), cfg.UpdatePolicyURL);
     ok &= IniSetStr(ini_path, CS("Update"), CS("SigURL"), cfg.UpdateSigURL);
     ok &= IniSetStr(ini_path, CS("Update"), CS("PublicKey"), cfg.ReleasePubKey);
+
+    // [Service]
+    ok &= IniSetStr(ini_path, CS("Service"), CS("Mode"), cfg.ServiceMode);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("ServiceURL"), cfg.ServiceURL);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("PublicKey"), cfg.ServicePubKey);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("Fp"), cfg.ServiceFp);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("ClientID"), cfg.ServiceClientId);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("Token"), cfg.ServiceToken);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("Status"), cfg.ServiceStatus);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("ExpireAt"), cfg.ServiceExpireAt);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("QuotaBytes"), cfg.ServiceQuotaBytes);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("UsedBytes"), cfg.ServiceUsedBytes);
+    ok &= IniSetStr(ini_path, CS("Service"), CS("ManagedServers"), cfg.ServiceManagedServers);
 
     // 多服务器模式下信息已由 [ServerN] 承载，主节/身份节的旧键清掉
     IniDelKey(ini_path, CS("Server"), CS("ServerIP"));

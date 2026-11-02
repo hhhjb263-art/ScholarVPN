@@ -11,6 +11,7 @@
 #pragma comment(lib, "winhttp.lib")
 
 #include <cstdlib>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include <openssl/evp.h>
 
 #include <atomic>
+#include <map>
 
 namespace update {
 
@@ -105,6 +107,42 @@ struct HandleGuard {
     }
 };
 
+// "Name: value" 行 → 小写名 map（受管服务验签头 X-Service-Signature 用）
+void parse_header_lines(const std::string& raw, std::map<std::string, std::string>& out)
+{
+    std::size_t pos = 0;
+    while (pos < raw.size())
+    {
+        std::size_t nl = raw.find('\n', pos);
+        if (nl == std::string::npos)
+        {
+            nl = raw.size();
+        }
+        std::string line = raw.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos)
+        {
+            continue;
+        }
+        std::string name = line.substr(0, colon);
+        for (char& c : name)
+        {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        std::size_t b = colon + 1;
+        while (b < line.size() && (line[b] == ' ' || line[b] == '\t'))
+        {
+            ++b;
+        }
+        out[name] = line.substr(b);
+    }
+}
+
 } // namespace
 
 FetchResult fetch_text(const std::string& url, int timeoutMs)
@@ -163,6 +201,34 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
     {
         r.error = "接收响应失败（超时或 TLS 握手失败）";
         return r;
+    }
+
+    // 原始响应头（状态行 + 头区，CRLF 分隔）→ 解析进 r.headers
+    DWORD hdrLen = 0;
+    ::WinHttpQueryHeaders(req.h, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                          WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &hdrLen,
+                          WINHTTP_NO_HEADER_INDEX);
+    if (hdrLen > 0)
+    {
+        std::vector<wchar_t> hdr(hdrLen);
+        if (::WinHttpQueryHeaders(req.h, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                                  WINHTTP_HEADER_NAME_BY_INDEX, hdr.data(),
+                                  &hdrLen, WINHTTP_NO_HEADER_INDEX))
+        {
+            // 宽字符头直接转 UTF-8 再按行解析（签名头是 ASCII，转换无损）。
+            // ⚠️ n 是含结尾 NUL 的字节数，缓冲必须给足 n 字节——曾写成 n-1
+            // 导致 1 字节堆越界（Debug 堆断言崩溃/Release 静默踩坏相邻块）
+            const int n = ::WideCharToMultiByte(CP_UTF8, 0, hdr.data(), -1,
+                                                nullptr, 0, nullptr, nullptr);
+            if (n > 1)
+            {
+                std::string raw(static_cast<std::size_t>(n), '\0');
+                ::WideCharToMultiByte(CP_UTF8, 0, hdr.data(), -1, &raw[0], n,
+                                      nullptr, nullptr);
+                raw.resize(static_cast<std::size_t>(n) - 1);   // 去掉结尾 NUL
+                parse_header_lines(raw, r.headers);
+            }
+        }
     }
 
     DWORD status = 0;
@@ -425,6 +491,7 @@ DownloadResult download_file(const std::string& url,
 #include <fcntl.h>
 #include <poll.h>
 #include <cerrno>
+#include <cctype>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -437,9 +504,46 @@ DownloadResult download_file(const std::string& url,
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 
 namespace update {
 namespace {
+
+// "Name: value" 行 → 小写名 map（与 Windows 侧同语义；受管服务验签头用）
+void parse_header_lines(const std::string& raw, std::map<std::string, std::string>& out)
+{
+    std::size_t pos = 0;
+    while (pos < raw.size())
+    {
+        std::size_t nl = raw.find('\n', pos);
+        if (nl == std::string::npos)
+        {
+            nl = raw.size();
+        }
+        std::string line = raw.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos)
+        {
+            continue;
+        }
+        std::string name = line.substr(0, colon);
+        for (char& c : name)
+        {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        std::size_t b = colon + 1;
+        while (b < line.size() && (line[b] == ' ' || line[b] == '\t'))
+        {
+            ++b;
+        }
+        out[name] = line.substr(b);
+    }
+}
 
 struct UrlParts {
     bool https = true;
@@ -758,6 +862,14 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
                   "]=[" + head + "] hex=[" + hex + "]";
         r.status = status;
         return r;
+    }
+    {
+        // 头区单独解析进 r.headers（body 之前的部分）
+        const std::size_t hdrEnd = raw.find("\r\n\r\n");
+        if (hdrEnd != std::string::npos)
+        {
+            parse_header_lines(raw.substr(0, hdrEnd), r.headers);
+        }
     }
     r.status = status;
     if (status < 200 || status >= 300)

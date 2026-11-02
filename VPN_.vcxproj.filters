@@ -49,6 +49,15 @@
     <ClInclude Include="src\platform\iplist.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="src\service\machine_id.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\service\service_bootstrap.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\service\service_client.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="src\version.h">
       <Filter>头文件</Filter>
     </ClInclude>
@@ -141,6 +150,12 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\platform\iplist.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\service\machine_id.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\service\service_client.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\update\update_policy.cpp">

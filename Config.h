@@ -29,6 +29,8 @@ struct ServerEntry
     // 该服务器的身份公钥（Ed25519 SPKI PEM 的 base64 正文，单行，不带头尾行）。
     // 每台服务器密钥独立，客户端用它验证该服务器签名（防中间人）；留空=用内置硬编码公钥。
     cfgstr ServerPubKey;
+    // 受管服务下发的卡片：UI 不显示 IP/端口等服务方信息（姓名=下发时的地名）
+    bool managed = false;
 };
 
 // Client runtime settings, loaded from / saved to an INI file.
@@ -84,7 +86,43 @@ struct ClientConfig
     cfgstr UpdatePolicyURL = CS("");   // 策略文件地址
     cfgstr UpdateSigURL = CS("");      // 签名地址；留空 = PolicyURL + ".sig"
     cfgstr ReleasePubKey = CS("");     // 发布公钥 PEM；留空 = 内置（无内置则视为未启用）
+
+    // ---- 受管服务（[Service]）----
+    // Mode: off = 自建（默认，与旧行为完全一致，无任何新增网络行为）
+    //       managed = 受管试用（向服务方申请试用/同步配额/自动下发服务器列表）
+    // ServiceURL 与 PublicKey 由部署方写进配置，绝不硬编码进客户端（红线 4）。
+    cfgstr ServiceMode = CS("off");
+    cfgstr ServiceURL = CS("");        // broker 基地址，如 https://host
+    cfgstr ServicePubKey = CS("");     // service 签名公钥（SPKI DER base64 单行）
+    // —— 以下由客户端在受管流程中写入 ——
+    cfgstr ServiceFp = CS("");            // 机器指纹 64hex
+    cfgstr ServiceClientId = CS("");      // trial-xxxxxxxx
+    cfgstr ServiceToken = CS("");         // 最近一次发号的注册令牌
+    cfgstr ServiceStatus = CS("");        // trial | approved | rejected | 空=未知
+    cfgstr ServiceExpireAt = CS("0");     // unix 秒；0 = 不限（字符串承载，避免 int32 截断）
+    cfgstr ServiceQuotaBytes = CS("0");
+    cfgstr ServiceUsedBytes = CS("0");
+    // 上次成功下发的受管服务器 "ip:port" 逗号清单：刷新列表时据此替换这批卡片，
+    // 用户自建卡片不受影响
+    cfgstr ServiceManagedServers = CS("");
 };
+
+// ============================================================================
+// config.ini 的 INI 原语（GUI/桥接层增量读写用；LoadClientConfig/Save 也走它们）。
+// ⚠️ 编码约定：Windows 走 Win32 INI API（文件为 ANSI/本地码页），Linux 走
+// ini_doc（UTF-8）。因此 config.ini 【禁止】用 QSettings 读写——QSettings 写
+// UTF-8，GetPrivateProfileStringW 按 ANSI 解码，非 ASCII 会变乱码
+// （"香港"→"棣橣离"事故，2026-10-31）。注册表等其它存储不受此限制。
+// ============================================================================
+namespace scholini {
+cfgstr IniGetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& def);
+int IniGetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int def);
+bool IniSetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& val);
+bool IniSetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int val);
+void IniDelKey(const cfgstr& path, const cfgstr& sec, const cfgstr& key);
+void IniDelSection(const cfgstr& path, const cfgstr& sec);
+std::vector<cfgstr> IniSections(const cfgstr& path);
+} // namespace scholini
 
 class Config
 {

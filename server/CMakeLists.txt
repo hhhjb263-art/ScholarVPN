@@ -17,6 +17,7 @@ endif()
 add_library(vpn_modules STATIC
     Buffer/PacketBuffer.cpp
     Buffer/QueueBuffer.cpp
+    ServiceDB.cpp
     UDP/UDP.cpp
     TCP/tcpserver.cpp
     tun/tun.cpp
@@ -41,7 +42,9 @@ target_include_directories(vpn_modules PUBLIC
 find_package(Threads REQUIRED)
 # 加密（X25519 / HKDF / AES-256-GCM）
 find_package(OpenSSL REQUIRED)
-target_link_libraries(vpn_modules PUBLIC Threads::Threads OpenSSL::Crypto)
+# 受管服务（SVC_DB）：trials/审计/黑名单落在 broker 的 sqlite 库
+find_package(SQLite3 REQUIRED)
+target_link_libraries(vpn_modules PUBLIC Threads::Threads OpenSSL::Crypto SQLite::SQLite3)
 
 # 编译告警
 target_compile_options(vpn_modules PRIVATE -Wall -Wextra)

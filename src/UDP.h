@@ -6,6 +6,7 @@
 #include "replay_window.h"
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -102,6 +103,12 @@ protected:
     std::atomic<bool> m_need_reconnect{ false };
     std::atomic<uint32_t> m_seq{ 0 };
 	std::atomic<int64_t> m_last_rx_ms{ 0 };	// 最近一次收到合法报文的时间（steady_clock ms）
+
+    // 心跳判死阈值。UDP 默认 5s（丢包=真丢，快速发现断线是对的）；
+    // TCP 子类在构造时放宽——外层 TCP 是可靠传输，一次 RTO 退避
+    // （1s→2s→4s）就可能超过 5s，把"正在重传"误判成"对端已死"会触发
+    // 无谓重连，而重连期间所有内层连接同时卡死（表现为"用着用着整条断掉"）。
+    std::chrono::steady_clock::duration m_heartbeatTimeout{ std::chrono::seconds(5) };
     HandshakeState m_hs_state = HS_IDLE;
     uint32_t m_client_isn = 0;    // 客户端随机初始序列号（模仿TCP ISN）
     uint32_t m_server_isn = 0;

@@ -223,9 +223,20 @@ struct Session
     // 会话被踢后旧连接的余包）会持续解密失败。原先完全静默，两侧都表现为
     // "对端不可达"，排查时无法区分"没收到"和"收到了但解不开"
     std::atomic<uint32_t> auth_fail_logged{ 0 };
+    // "下行队列满丢包"日志的已打印次数（限流）：拥塞期间会连续满，逐包打印会刷爆日志
+    std::atomic<uint32_t> txq_full_logged{ 0 };
 
     std::atomic<int64_t> last_rx_ms{ 0 };     // 最近收到【已认证】对端报文的时间
     std::atomic<int64_t> created_at_ms{ 0 };  // 会话创建时间（握手超时清理用）
+
+    // ---- 受管服务（ServiceDB；client_id 不在 trials 里 = 手工注册老用户，全默认无约束）----
+    // 登录时从 trials 读快照；数据面按会话累计流量，心跳线程周期 flush 进 DB
+    bool svc_managed = false;                 // client_id 在 trials 表里
+    long long svc_used_base = 0;              // 登录时快照（DB 的 used_bytes）
+    long long svc_quota = 0;                  // 0 = 不限（正式用户）
+    std::atomic<long long> svc_bytes{ 0 };    // 本会话累计流量（上行+下行，字节）
+    std::atomic<bool> svc_over{ false };      // 已判定超量（防止重复切断）
+    std::atomic<uint32_t> svc_blk_logged{ 0 };// 黑名单丢弃限流日志计数
 };
 
 // 虚拟 IP 池：以服务端 TUN 地址为网关，在网段内分配未占用地址（排除网络/广播/网关）。

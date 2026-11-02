@@ -81,6 +81,15 @@
   input.num{width:76px;background:var(--bg);border:1px solid var(--line);border-radius:8px;
             padding:5px 8px;color:var(--txt);font:13px var(--mono)}
   .hint{color:var(--dim2);font-size:12px}
+  #svcPanel{padding:14px 20px;border-bottom:1px solid var(--line);
+            background:#141821;max-height:64vh;overflow:auto}
+  #svcPanel .card{margin-bottom:12px}
+  .badge{display:inline-block;padding:1px 8px;border-radius:8px;font-size:12px;
+         border:1px solid var(--line)}
+  .badge.trial{color:var(--warn);border-color:#5c4a1c}
+  .badge.approved{color:var(--ok);border-color:#1c4a2c}
+  .badge.rejected{color:var(--err);border-color:#5c2124}
+  .badge.revoked{color:var(--err);border-color:#5c2124;background:#241416}
   .toast{position:fixed;right:20px;bottom:20px;background:var(--panel2);
          border:1px solid var(--line);border-radius:10px;padding:10px 14px;
          font-size:13px;opacity:0;transform:translateY(8px);transition:.18s;pointer-events:none}
@@ -117,6 +126,7 @@
   <span class="ctl" id="who">—</span>
   <button id="btnAccount" title="修改密码">账号</button>
   <button id="btnAdmins" title="管理员账号">管理员</button>
+  <button id="btnSvc" title="受管服务用户管理">用户</button>
   <button id="btnLogout">退出</button>
   <button id="btnRefresh" class="primary">刷新</button>
 </header>
@@ -140,6 +150,89 @@
   <span id="adminList" class="hint"></span>
 </div>
 
+<div id="svcPanel" class="hidden">
+  <div class="card">
+    <h3>下发服务器列表（勾选即下发）
+      <button class="sm" id="btnSrvRefresh">刷新</button>
+      <span class="grow"></span>
+      <span id="srvMsg" class="hint"></span>
+    </h3>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+      <input id="srvAddr" class="small" placeholder="地址 ip:端口，如 1.2.3.4:443" autocomplete="off">
+      <input id="srvRemark" class="small" placeholder="显示名，如 香港" autocomplete="off">
+      <input id="srvPubkey" class="small" style="min-width:300px"
+             placeholder="该服务器公钥（SPKI DER base64）" autocomplete="off">
+      <button class="sm" id="btnSrvLocal" title="读取本机 /root/ScholarVPN/server/keys/server_sig.pub">用本机公钥</button>
+      <button class="sm primary" id="btnSrvAdd">添加 / 更新</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th>下发</th><th>地址</th><th>显示名</th>
+        <th>公钥<span class="hint">（点击复制）</span></th><th>更新时间</th><th>操作</th>
+      </tr></thead>
+      <tbody id="srvRows"></tbody>
+    </table>
+    <div class="hint" style="margin-top:6px">
+      客户端启动时按 <code>?fp=</code> 拉取；只下发勾选的条目，改完即时生效（broker 每次请求实时生成并签名，无需重启）。
+    </div>
+  </div>
+  <div class="card">
+    <h3>受管用户
+        <span id="svcModeBadge" class="badge">…</span>
+        <button id="btnSvcMode" class="sm" style="margin-left:8px">切换发号模式</button>
+      <button class="sm" id="btnSvcTab">在册</button>
+      <button class="sm" id="btnSvcTrash">垃圾桶(<span id="svcTrashCount">0</span>)</button>
+      <button class="sm" id="btnSvcRefresh">刷新</button>
+      <select id="svcFilter" class="sm">
+        <option value="">全部状态</option>
+        <option value="trial">试用中</option>
+        <option value="pending">待审批</option>
+        <option value="approved">已授权</option>
+      </select>
+      <span class="grow"></span>
+      <span id="svcMsg" class="hint"></span>
+    </h3>
+    <table>
+      <thead><tr>
+        <th>状态</th><th>账号</th><th>机器指纹<span class="hint">（点击复制）</span></th><th>系统 / 内存</th>
+        <th>设备<span class="hint">（品牌 型号）</span></th><th>已用 / 配额</th><th>到期</th><th>最近 IP</th><th>申请时间</th><th>备注<span class="hint">（点击编辑）</span></th><th>操作</th>
+      </tr></thead>
+      <tbody id="svcUsers"></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3>域名审计（按用户 / 按天）
+      <input id="auditCid" class="small" placeholder="client_id（可空）" autocomplete="off">
+      <input id="auditDay" class="small" placeholder="YYYY-MM-DD（可空）" autocomplete="off">
+      <button class="sm" id="btnAuditLoad">查询</button>
+      <span class="grow"></span>
+      <span id="auditMsg" class="hint"></span>
+    </h3>
+    <table>
+      <thead><tr><th>日期</th><th>账号</th><th>域名</th><th>次数</th></tr></thead>
+      <tbody id="auditRows"></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3>黑名单（服务端出口执行：域名 / 单 IP / 整机）
+      <select id="blType" class="sm">
+        <option value="domain">域名</option>
+        <option value="ip">单 IP</option>
+        <option value="machine">整机（client_id）</option>
+      </select>
+      <input id="blDomain" class="small" placeholder="按类型填写" autocomplete="off">
+      <input id="blNote" class="small" placeholder="备注（可空）" autocomplete="off">
+      <button class="sm primary" id="btnBlAdd">添加</button>
+      <span class="grow"></span>
+      <span id="blMsg" class="hint"></span>
+    </h3>
+    <table>
+      <thead><tr><th>类型</th><th>值<span class="hint">（点击复制）</span></th><th>备注</th><th>加入时间</th><th>操作</th></tr></thead>
+      <tbody id="blRows"></tbody>
+    </table>
+  </div>
+</div>
+
 <div id="alert" class="hidden"></div>
 
 <main>
@@ -160,7 +253,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { servers: [], current: null, csrf: "", username: "" };
+const state = { servers: [], current: null, csrf: "", username: "", svcTab: "active", svcUsers: [], svcCellTips: null };
 
 /* ------------------------------------------------------------------ 基础 */
 function toast(msg) {
@@ -189,6 +282,14 @@ async function copyText(text) {
     catch { toast("复制失败，请手动选中"); }
     ta.remove();
   }
+}
+
+/* 点击单元格复制完整值（悬停 title 已提示） */
+function makeCopyable(td, value) {
+  if (!value) return;
+  td.style.cursor = "pointer";
+  td.title = (td.title ? td.title + "\n" : "") + "点击复制";
+  td.onclick = () => copyText(value);
 }
 
 /* ------------------------------------------------------------------ API */
@@ -527,6 +628,378 @@ function exportJSON(id, info, toks) {
   toast("已导出");
 }
 
+/* ------------------------------------------------------------------ 用户管理（受管服务） */
+state.svcUsers = [];
+
+function fmtBytes(n) {
+  if (!n) return "—";
+  if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(1) + " GB";
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(0) + " MB";
+  return n + " B";
+}
+function fmtTime(ts) {
+  if (!ts) return "不限";
+  const d = new Date(ts * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+         " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+const SVC_STATUS_TXT = { trial: "试用中", approved: "已授权", rejected: "已拒绝", revoked: "已取消授权", pending: "待审批" };
+
+async function svcModeLoad() {
+  try {
+    const r = await api("/api/service/mode");
+    const b = $("svcModeBadge");
+    b.textContent = r.mode === "manual" ? "人工审批" : "自动发号";
+    b.dataset.mode = r.mode || "auto";
+  } catch (e) { $("svcModeBadge").textContent = "…"; }
+}
+$("btnSvcMode").onclick = async () => {
+  const cur = $("svcModeBadge").dataset.mode || "auto";
+  const next = cur === "auto" ? "manual" : "auto";
+  const tip = next === "manual"
+    ? "切换为「人工审批」：新设备申请将进入待审批，需在下方转正式。"
+    : "切换为「自动发号」：新设备申请即自动获得 3 天 / 2GB 试用。";
+  if (!confirm(tip)) return;
+  await api("/api/service/mode", { method: "POST", body: { mode: next } });
+  svcModeLoad();
+};
+
+$("btnSvc").onclick = () => {
+  const p = $("svcPanel");
+  $("accountPanel").classList.add("hidden");
+  $("adminPanel").classList.add("hidden");
+  p.classList.toggle("hidden");
+  if (!p.classList.contains("hidden")) { svcLoad(); srvLoad(); svcModeLoad(); }
+};
+$("btnSvcRefresh").onclick = () => svcLoad();
+$("svcFilter").onchange = () => svcRender();
+
+/* ---------------------------------------------------- 下发服务器列表 ---- */
+/* 后台勾选 → 写库 → broker 每次请求按 enabled=1 实时生成并签名 server-list.ini */
+
+async function srvLoad() {
+  const tb = $("srvRows");
+  const msg = $("srvMsg");
+  tb.textContent = "";
+  try {
+    const j = await api("/api/service/servers");
+    const rows = j.servers || [];
+    const on = rows.filter((r) => r.enabled).length;
+    msg.textContent = rows.length + " 台，下发 " + on + " 台";
+    if (!rows.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 6; td.className = "empty";
+      td.textContent = "还没有配置服务器";
+      tr.appendChild(td); tb.appendChild(tr);
+      return;
+    }
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+
+      const tdOn = document.createElement("td");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.checked = !!r.enabled;
+      cb.onchange = async () => {
+        cb.disabled = true;
+        try {
+          await api("/api/service/servers/toggle",
+                    { method: "POST", body: { addr: r.addr, enabled: cb.checked } });
+          toast((cb.checked ? "已启用 " : "已停用 ") + r.addr);
+          await srvLoad();
+        } catch (e) {
+          cb.checked = !cb.checked;
+          alertBox("err", e.message);
+        } finally { cb.disabled = false; }
+      };
+      tdOn.appendChild(cb);
+
+      const tdAddr = document.createElement("td");
+      tdAddr.textContent = r.addr; tdAddr.className = "tok";
+      makeCopyable(tdAddr, r.addr);
+
+      const tdName = document.createElement("td");
+      tdName.textContent = r.remark || "—";
+
+      const tdKey = document.createElement("td");
+      tdKey.textContent = (r.pubkey || "").slice(0, 18) + "…";
+      tdKey.title = r.pubkey || "";
+      tdKey.className = "tok";
+      makeCopyable(tdKey, r.pubkey || "");
+
+      const tdT = document.createElement("td");
+      tdT.textContent = fmtTime(r.updated_at || r.created_at);
+
+      const tdA = document.createElement("td");
+      const b = document.createElement("button");
+      b.className = "sm danger"; b.textContent = "删除";
+      b.onclick = async () => {
+        if (!confirm("确认删除 " + r.addr + "？删除后不再下发给客户端。")) return;
+        try {
+          await api("/api/service/servers/" + encodeURIComponent(r.addr),
+                    { method: "DELETE" });
+          toast("已删除 " + r.addr);
+          await srvLoad();
+        } catch (e) { alertBox("err", e.message); }
+      };
+      tdA.appendChild(b);
+
+      tr.appendChild(tdOn); tr.appendChild(tdAddr); tr.appendChild(tdName);
+      tr.appendChild(tdKey); tr.appendChild(tdT); tr.appendChild(tdA);
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    msg.textContent = e.message;
+  }
+}
+
+$("btnSrvRefresh").onclick = () => srvLoad();
+
+$("btnSrvAdd").onclick = async () => {
+  const msg = $("srvMsg");
+  const addr = $("srvAddr").value.trim();
+  const remark = $("srvRemark").value.trim();
+  const pubkey = $("srvPubkey").value.trim();
+  msg.textContent = "";
+  if (!addr || !pubkey) { msg.textContent = "地址和公钥必填"; return; }
+  try {
+    await api("/api/service/servers",
+              { method: "POST", body: { addr, remark, pubkey, enabled: true } });
+    $("srvAddr").value = ""; $("srvRemark").value = ""; $("srvPubkey").value = "";
+    toast("已保存 " + addr);
+    await srvLoad();
+  } catch (e) {
+    msg.textContent = e.message;
+  }
+};
+
+$("btnSrvLocal").onclick = async () => {
+  const msg = $("srvMsg");
+  try {
+    const j = await api("/api/service/servers/local-pubkey");
+    if (j.pubkey) { $("srvPubkey").value = j.pubkey; toast("已填入本机服务器公钥"); }
+    else { msg.textContent = "读不到本机 server_sig.pub"; }
+  } catch (e) { msg.textContent = e.message; }
+};
+
+async function svcLoad() {
+  const msg = $("svcMsg");
+  try {
+    const j = await api("/api/service/users");
+    state.svcUsers = j.users || [];
+    msg.textContent = state.svcUsers.length + " 个用户";
+    svcRender();
+  } catch (e) {
+    msg.textContent = e.message;
+  }
+}
+
+function svcRender() {
+  const tb = $("svcUsers");
+  tb.textContent = "";
+  const trash = state.svcTab === "trash";
+  const trashN = state.svcUsers.filter((u) => u.status === "rejected" || u.status === "revoked").length;
+  $("svcTrashCount").textContent = String(trashN);
+  $("svcFilter").style.display = trash ? "none" : "";
+  const rows = state.svcUsers.filter((u) =>
+    trash ? (u.status === "rejected" || u.status === "revoked")
+          : (!$("svcFilter").value || u.status === $("svcFilter").value));
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 11; td.className = "hint";
+    td.textContent = trash ? "垃圾桶是空的" :
+        (state.svcUsers.length ? "当前筛选无结果" : "暂无受管用户");
+    tr.appendChild(td); tb.appendChild(tr);
+    return;
+  }
+  for (const u of rows) {
+    const tr = document.createElement("tr");
+    const cells = [];
+    const badge = document.createElement("span");
+    badge.className = "badge " + (u.status || "");
+    badge.textContent = SVC_STATUS_TXT[u.status] || (u.status || "未知");
+    cells.push(badge);
+    cells.push(u.client_id);
+    // 截断显示的列：鼠标悬停显示完整内容（老板要求）
+    state.svcCellTips = { fp: u.fp || "", client_id: u.client_id || "" };
+    cells.push(u.fp ? u.fp.slice(0, 16) + "…" : "—");
+    cells.push((u.os || "—") + " / " + (u.ram_mb ? u.ram_mb + " MB" : "—"));
+    cells.push(((u.brand || "—") + " " + (u.model || "")).trim() || "—");
+    cells.push(fmtBytes(u.used_bytes) + " / " + (u.quota_bytes ? fmtBytes(u.quota_bytes) : "不限"));
+    cells.push(u.expire_at ? fmtTime(u.expire_at) : "不限");
+    cells.push(u.last_ip || "—");
+    cells.push(fmtTime(u.created_at));
+    const noteTd = document.createElement("td");
+    noteTd.textContent = u.note || "—";
+    noteTd.title = u.note ? "点击编辑备注" : "点击添加备注";
+    noteTd.style.cssText = "max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;"
+        + (u.note ? "" : "color:var(--hint,#8a8a8a);");
+    noteTd.onclick = async () => {
+        const n = prompt("备注（仅后台可见，不下发客户端）", u.note || "");
+        if (n === null) return;
+        await api("/api/service/users/note", { method: "POST", body: { fp: u.fp, note: n.trim() } });
+        svcLoad();
+    };
+    cells.push(noteTd);
+    const act = document.createElement("div");
+    act.className = "row";
+    if (!trash) {
+      if (u.status !== "approved") {
+        const bA = document.createElement("button");
+        bA.className = "sm primary"; bA.textContent = "转正式";
+        bA.onclick = () => svcSetStatus(u, "approved");
+        act.appendChild(bA);
+      }
+      if (u.status !== "rejected") {
+        const bR = document.createElement("button");
+        bR.className = "sm danger"; bR.textContent = "拒绝";
+        bR.onclick = () => svcSetStatus(u, "rejected");
+        act.appendChild(bR);
+      }
+      if (u.status === "approved") {
+        const bV = document.createElement("button");
+        bV.className = "sm danger"; bV.textContent = "取消授权";
+        bV.onclick = () => svcSetStatus(u, "revoked");
+        act.appendChild(bV);
+      }
+    } else {
+      const bRes = document.createElement("button");
+      bRes.className = "sm primary"; bRes.textContent = "恢复试用";
+      bRes.onclick = () => svcRestore(u);
+      act.appendChild(bRes);
+      const bP = document.createElement("button");
+      bP.className = "sm danger"; bP.textContent = "彻底删除";
+      bP.onclick = () => svcPurge(u);
+      act.appendChild(bP);
+    }
+    cells.push(act);
+    for (const c of cells) {
+      const td = document.createElement("td");
+      if (c instanceof Node) td.appendChild(c);
+      else td.textContent = c;
+      td.style.whiteSpace = "nowrap";
+      tr.appendChild(td);
+    }
+    // 账号列(1)/指纹列(2)：悬停看完整值，点击复制
+    if (tr.children[1]) makeCopyable(tr.children[1], u.client_id);
+    if (tr.children[2]) makeCopyable(tr.children[2], u.fp);
+    tb.appendChild(tr);
+  }
+}
+
+async function svcSetStatus(u, status) {
+  const what = status === "approved" ? "转为正式（解除配额与到期）"
+             : status === "revoked" ? "取消授权（立即停止服务）"
+             : "拒绝/停用";
+  if (!confirm("确认将 " + u.client_id + " " + what + "？")) return;
+  const path = status === "approved" ? "approve"
+             : status === "revoked" ? "revoke" : "reject";
+  try {
+    await api("/api/service/users/" + path, { method: "POST", body: { fp: u.fp } });
+    toast("已更新 " + u.client_id + " → " + (SVC_STATUS_TXT[status] || status));
+    await svcLoad();
+  } catch (e) {
+    alertBox("err", e.message);
+  }
+}
+
+$("btnAuditLoad").onclick = async () => {
+  const msg = $("auditMsg");
+  const tb = $("auditRows");
+  tb.textContent = "";
+  const cid = $("auditCid").value.trim();
+  const day = $("auditDay").value.trim();
+  const q = new URLSearchParams();
+  if (cid) q.set("client_id", cid);
+  if (day) q.set("day", day);
+  try {
+    const j = await api("/api/service/audit?" + q.toString());
+    const rows = j.audit || [];
+    msg.textContent = rows.length + " 条";
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      for (const [vi, v] of [r.day, r.client_id, r.domain, r.hits].entries()) {
+        const td = document.createElement("td");
+        td.textContent = v;
+        if (vi === 2) makeCopyable(td, v);   // 域名列点击复制
+        tr.appendChild(td);
+      }
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    msg.textContent = e.message;
+  }
+};
+
+const BL_TYPE_NAME = { domain: "域名", ip: "IP", machine: "整机" };
+$("blType").onchange = () => {
+  const t = $("blType").value;
+  $("blDomain").placeholder =
+      t === "domain" ? "域名，如 t.me 或 *.example.com"
+    : t === "ip" ? "目的 IP，如 1.2.3.4"
+    : "client_id，如 trial-ab12cd34";
+};
+$("btnBlAdd").onclick = async () => {
+  const msg = $("blMsg");
+  const value = $("blDomain").value.trim().toLowerCase();
+  const note = $("blNote").value.trim();
+  const type = $("blType").value;
+  msg.textContent = "";
+  if (!value) { msg.textContent = "请输入内容"; return; }
+  try {
+    await api("/api/service/blacklist", { method: "POST", body: { domain: value, note, type } });
+    $("blDomain").value = ""; $("blNote").value = "";
+    toast("已加入黑名单 " + value);
+    await blLoad();
+  } catch (e) {
+    msg.textContent = e.message;
+  }
+};
+
+async function blLoad() {
+  const tb = $("blRows");
+  tb.textContent = "";
+  try {
+    const j = await api("/api/service/blacklist");
+    const rows = j.blacklist || [];
+    $("blMsg").textContent = rows.length + " 条";
+    let blIdx = 0;
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      const tdType = document.createElement("td");
+      tdType.textContent = BL_TYPE_NAME[r.type] || r.type || "域名";
+      const tdD = document.createElement("td");
+      tdD.textContent = r.domain; tdD.className = "tok";
+      makeCopyable(tdD, r.domain);   // 值点击复制
+      const tdN = document.createElement("td");
+      tdN.textContent = r.note || "";
+      const tdT = document.createElement("td");
+      tdT.textContent = fmtTime(r.added_at);
+      const tdA = document.createElement("td");
+      const b = document.createElement("button");
+      b.className = "sm danger"; b.textContent = "移除";
+      b.onclick = async () => {
+        if (!confirm("确认从黑名单移除 " + r.domain + "？")) return;
+        try {
+          await api("/api/service/blacklist/" + encodeURIComponent(r.domain),
+                    { method: "DELETE" });
+          toast("已移除 " + r.domain);
+          await blLoad();
+        } catch (e) { alertBox("err", e.message); }
+      };
+      tdA.appendChild(b);
+      tr.appendChild(tdType); tr.appendChild(tdD); tr.appendChild(tdN);
+      tr.appendChild(tdT); tr.appendChild(tdA);
+      tb.appendChild(tr);
+      blIdx += 1;
+    }
+  } catch (e) {
+    $("blMsg").textContent = e.message;
+  }
+}
+
 /* ------------------------------------------------------------------ 账号 / 管理员 */
 $("btnAccount").onclick = () => {
   const p = $("accountPanel");
@@ -591,6 +1064,41 @@ async function loadAdmins() {
     $("adminList").textContent = names.join("、");
   } catch (e) {
     $("adminList").textContent = e.message;
+  }
+}
+
+$("btnSvcTab").onclick = () => {
+  state.svcTab = "active";
+  $("btnSvcTab").classList.add("primary");
+  $("btnSvcTrash").classList.remove("primary");
+  svcRender();
+};
+$("btnSvcTrash").onclick = () => {
+  state.svcTab = "trash";
+  $("btnSvcTrash").classList.add("primary");
+  $("btnSvcTab").classList.remove("primary");
+  svcRender();
+};
+
+async function svcRestore(u) {
+  if (!confirm("恢复 " + u.client_id + " 为新一轮试用（3 天 / 2GB）？")) return;
+  try {
+    await api("/api/service/users/restore", { method: "POST", body: { fp: u.fp } });
+    toast("已恢复 " + u.client_id);
+    await svcLoad();
+  } catch (e) {
+    alertBox("err", e.message);
+  }
+}
+
+async function svcPurge(u) {
+  if (!confirm("彻底删除 " + u.client_id + " 的记录？\n删除后该设备可重新申请试用。")) return;
+  try {
+    await api("/api/service/users/" + u.fp, { method: "DELETE" });
+    toast("已删除 " + u.client_id);
+    await svcLoad();
+  } catch (e) {
+    alertBox("err", e.message);
   }
 }
 

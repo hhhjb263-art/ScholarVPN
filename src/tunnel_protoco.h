@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "platform/sock_compat.h"   // htons/htonl（Windows 走 winsock2，Linux 走 netinet）
+#include "platform/sock_compat.h"
 
 #pragma pack(push,1)
 struct tunnel_header
@@ -27,34 +27,29 @@ enum type : uint8_t
     disconnect = 5,
     m_key_exchange = 6,
     m_key_response = 7,
-    m_auth_hello = 8,          // stage1: C->S [nonce_c]
-    m_auth_server_hello = 9,   // stage1: S->C [nonce_s || DH_SRV_EPHEM_PUB || sig_srv]
-    m_auth_client_hello = 10,  // stage1: C->S [DH_CLI_EPHEM_PUB]
-    m_identity = 11,           // stage3 encrypted inner: identity msg
-    m_identity_ok = 12,        // stage3 encrypted inner: identity OK
-    m_identity_deny = 13       // stage3 encrypted inner: identity DENY
+    m_auth_hello = 8,
+    m_auth_server_hello = 9,
+    m_auth_client_hello = 10,
+    m_identity = 11,
+    m_identity_ok = 12,
+    m_identity_deny = 13
 };
 enum HandshakeState {
     HS_IDLE,
-    HS_SEND_REQ,    // 已发送握手请求，等待服务端ACK
+    HS_SEND_REQ,
     HS_WAIT_ACK,
-    HS_SEND_FIN,    // 收到ACK，发送最终确认包
+    HS_SEND_FIN,
     HS_SUCCESS
 };
 constexpr uint32_t Kmagic = 0x4D56504E;
 constexpr uint8_t Kversion = v_udp;
 constexpr size_t Ktunnel_header = sizeof(tunnel_header);
 constexpr size_t Max_payload_len = 1429;
-// 发送序号安全上限（=2^31）：达到即触发重连换新会话（新密钥=新反重放
-// 窗口），防止 32 位序号回绕被滑窗误判。100k 包/s 也需 ~6h 才触达，
-// 实际流量远低于此；重连代价对用户几乎无感
 constexpr uint32_t kSeqRekeyLimit = 0x80000000u;
-// 数据面明文载荷上限：AES-GCM 封装 inner(1) + nonce(12) + tag(16) 后不得超过 Max_payload_len
-// （对应 TUN MTU 1400，与 server/Buffer/tunnel_protoco.h 保持一致）
 constexpr size_t KMax_data_payload = 1400;
-constexpr size_t KAuthNonceLen = 16;             // nonce_c / nonce_s
-constexpr size_t KAuthDhPubLen = 32;             // ephemeral X25519 pub / Ed25519 pub
-constexpr size_t KAuthSigLen = 64;               // Ed25519 signature
-constexpr size_t KAuthServerHelloLen = KAuthNonceLen + KAuthDhPubLen + KAuthSigLen;            // 112
-constexpr size_t KAuthClientHelloLen = KAuthDhPubLen;                                               // 32
-constexpr size_t KAuthIdentityFixed = KAuthNonceLen * 2 + KAuthDhPubLen * 3 + 1;                     // 129
+constexpr size_t KAuthNonceLen = 16;
+constexpr size_t KAuthDhPubLen = 32;
+constexpr size_t KAuthSigLen = 64;
+constexpr size_t KAuthServerHelloLen = KAuthNonceLen + KAuthDhPubLen + KAuthSigLen;
+constexpr size_t KAuthClientHelloLen = KAuthDhPubLen;
+constexpr size_t KAuthIdentityFixed = KAuthNonceLen * 2 + KAuthDhPubLen * 3 + 1;

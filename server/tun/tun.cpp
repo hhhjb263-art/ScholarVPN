@@ -33,7 +33,6 @@ Tun &Tun::operator=(Tun &&other) noexcept
         other.m_fd = -1;
     }
     return *this;
-    // TODO: 在此处插入 return 语句
 }
 
 bool Tun::create_tun(const char *name)
@@ -53,7 +52,6 @@ bool Tun::create_tun(const char *name)
     ifr.ifr_name[IFNAMSIZ -1] = '\0';
     if(ioctl(m_fd,TUNSETIFF,&ifr) < 0){
          fprintf(stderr, "[TUN ERROR] TUNSETIFF ioctl failed: %s\n", strerror(errno));
-        // 创建失败，关闭打开的fd并重置
         ::close(m_fd);
         m_fd = -1;
         return false;
@@ -90,7 +88,7 @@ bool Tun::read_buf(packet_buffer &buf)
 {
     if(m_fd < 0)
         return false;
-        
+
     buf.resize(Max_payload_len);
 
     ssize_t ret = ::read(m_fd, buf.data(), Max_payload_len);
@@ -99,7 +97,6 @@ bool Tun::read_buf(packet_buffer &buf)
         return false;
     }
 
-    // 按实际读取字节 resize
     buf.resize(static_cast<size_t>(ret));
     buf.set_direction(PacketDirection::TuntoNetwork);
     return true;

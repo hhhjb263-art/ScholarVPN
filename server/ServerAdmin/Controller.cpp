@@ -1,7 +1,3 @@
-// ============================================================================
-// Controller.cpp —— vpn_controller（中转）实现（类声明见 Controller.h）
-// 只做「VPN 服务器 ↔ 中转服务器」的业务接口：agent 通道 + 命令转发。
-// ============================================================================
 #include "Controller.h"
 #include "AdminWire.h"
 #include "../Crypt/crypt.h"
@@ -20,17 +16,17 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <openssl/crypto.h>   // CRYPTO_memcmp
+#include <openssl/crypto.h>
 #include <poll.h>
 #include <sys/socket.h>
-#include <sys/stat.h>         // umask
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
 
-constexpr size_t kMaxHttpReq   = 8192;     // 管理请求上限（与 AdminServer 一致）
-constexpr int    kForwardMs    = 10000;    // 转发等待 agent 回传的上限
-constexpr int    kHeartbeatGap = 45000;    // 45s 没动静（3×15s 心跳）判 agent 失联
+constexpr size_t kMaxHttpReq = 8192;
+constexpr int kForwardMs = 10000;
+constexpr int kHeartbeatGap = 45000;
 constexpr int    kPollSliceMs  = 500;
 
 long long now_ms()
@@ -99,8 +95,6 @@ bool send_all(int fd, const std::string& data)
     return true;
 }
 
-// 收一帧见 AdminWire.h 的 wire::Conn::recv_frame（循环读到凑齐或超时）
-
 const char* reason_phrase(int status)
 {
     switch (status) {
@@ -128,8 +122,6 @@ std::string make_http_response(int status, const std::string& body)
     return r;
 }
 
-// 从已收齐的请求头块（raw[0..he) 为头，he = "\r\n\r\n" 的位置）里取 Content-Length。
-// 缺省/非法按 0 处理。存在的意义：body 可能落在后续 TCP 段里，必须知道还要读多少。
 size_t header_content_length(const std::string& raw, size_t he)
 {
     long long cl = 0;
@@ -151,7 +143,7 @@ size_t header_content_length(const std::string& raw, size_t he)
     return cl > 0 ? static_cast<size_t>(cl) : 0;
 }
 
-Controller* g_ctl = nullptr;         // 供信号处理
+Controller* g_ctl = nullptr;
 void on_signal(int) { if (g_ctl != nullptr) g_ctl->stop(); }
 
 void usage(const char* prog)
@@ -170,7 +162,7 @@ void usage(const char* prog)
         prog);
 }
 
-}  // namespace
+}
 
 Controller::Controller(Options opt) : opt_(std::move(opt)) {}
 
@@ -185,7 +177,6 @@ Controller::~Controller()
 
 bool Controller::start()
 {
-    // 读白名单（不存在 = 空表：任何 agent 都会被拒，直到 --add-agent 登记）
     std::ifstream fin(opt_.agents_file);
     std::string line;
     while (std::getline(fin, line)) {
@@ -193,7 +184,6 @@ bool Controller::start()
         if (!line.empty()) whitelist_.push_back(line);
     }
 
-    // TLS 是 agent 通道的传输层保护；证书/私钥必须成对出现。
     if (!opt_.tls_cert.empty() || !opt_.tls_key.empty()) {
         if (opt_.tls_cert.empty() || opt_.tls_key.empty()) {
             fprintf(stderr, "[controller] TLS_CERT 与 TLS_KEY 必须同时设置\n");
@@ -240,7 +230,7 @@ void Controller::stop()
 
 void Controller::run()
 {
-    http_loop();   // 阻塞：HTTP 入口跑在调用线程
+    http_loop();
 }
 
 bool Controller::in_whitelist(const std::string& pubkey_hex) const
@@ -255,11 +245,10 @@ std::shared_ptr<Controller::Agent> Controller::find_agent(const std::string& id)
     return it == agents_.end() ? nullptr : it->second;
 }
 
-// ============================ agent 通道 ============================
+// 与各 VPN 节点之间的长连接循环，转发管理指令并回收结果
 void Controller::agent_loop()
 {
     while (running_.load()) {
-        // 先 poll 监听 fd（500ms 节拍，便于检查 running_）
         pollfd lp{}; lp.fd = agent_fd_; lp.events = POLLIN;
         if (::poll(&lp, 1, kPollSliceMs) <= 0) continue;
         if (!(lp.revents & POLLIN)) continue;
@@ -279,11 +268,10 @@ void Controller::agent_loop()
             if (!conn.enable_tls_server(tls_ctx_, wire::kTimeoutMs, terr)) {
                 fprintf(stderr, "[controller] agent %s TLS 握手失败: %s\n",
                         ip.c_str(), terr.c_str());
-                continue;   // conn 析构时关闭 fd
+                continue;
             }
         }
 
-        // ---- 握手（管理连接很少，短暂占用本线程可接受）----
         const std::vector<uint8_t> nonce = generate_nonce(16);
         const std::string nonce_hex = to_hex(nonce.data(), nonce.size());
         if (!conn.send_frame(wire::Json().str("type", "challenge")
@@ -339,12 +327,11 @@ void Controller::agent_loop()
         ag->fr = std::move(fr);
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            agents_[ag->id] = ag;   // 同 id 重连：覆盖旧连接（旧的会在下面因断开被摘除）
+            agents_[ag->id] = ag;
         }
         fprintf(stderr, "[controller] agent 接入: id=%s ip=%s 指纹=%s\n",
                 ag->id.c_str(), ip.c_str(), pub_hex.substr(0, 16).c_str());
 
-        // ---- 长连接：收心跳 / 命令回执，直到断开或心跳超时 ----
         while (running_.load()) {
             const int r = ag->conn.recv_frame(ag->fr, frame, kPollSliceMs);
             if (r < 0) break;
@@ -372,7 +359,6 @@ void Controller::agent_loop()
                     ag->pcv.notify_all();
                 }
             }
-            // heartbeat：只刷新 last_seen，无需处理
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -383,7 +369,6 @@ void Controller::agent_loop()
     }
 }
 
-// ============================ 业务转发 ============================
 bool Controller::forward(const std::string& server_id, const std::string& method,
                          const std::string& path, const std::string& body,
                          int& status, std::string& resp_body, std::string& err)
@@ -402,7 +387,7 @@ bool Controller::forward(const std::string& server_id, const std::string& method
                                      .str("method", method).str("path", path)
                                      .str("body", body).done();
     {
-        std::lock_guard<std::mutex> lk(ag->wmtx);   // 命令帧不能交错
+        std::lock_guard<std::mutex> lk(ag->wmtx);
         if (!ag->conn.send_frame(cmd)) { err = "agent send failed"; return false; }
     }
 
@@ -417,10 +402,9 @@ bool Controller::forward(const std::string& server_id, const std::string& method
     return true;
 }
 
-// ============================ 最小 HTTP 入口 ============================
 bool Controller::check_auth(const HttpReq& req) const
 {
-    if (opt_.admin_token.empty()) return true;   // 未设令牌 = 不鉴权（仅限环本机调试）
+    if (opt_.admin_token.empty()) return true;
     auto it = req.headers.find("authorization");
     if (it == req.headers.end()) return false;
     if (it->second.rfind("Bearer ", 0) != 0) return false;
@@ -441,13 +425,10 @@ void Controller::http_loop()
         const int cfd = ::accept(http_fd_, reinterpret_cast<sockaddr*>(&clt), &cl);
         if (cfd < 0) continue;
 
-        // 读全一条请求：先读到头部结束（\r\n\r\n），再按 Content-Length 把 body 读满。
-        // 不能一见到 \r\n\r\n 就收手——body 完全可能落在后续 TCP 段里
-        // （POST /api/servers/{id}/tokens 的 {"count":N} 正是靠它）。
         std::string raw;
         char buf[4096];
         size_t he = std::string::npos;
-        size_t need = 0;                 // 头 + body 的完整长度（算出前为 0）
+        size_t need = 0;
         bool too_large = false;
         for (;;) {
             if (he == std::string::npos) {
@@ -457,8 +438,8 @@ void Controller::http_loop()
                     if (need > kMaxHttpReq) { too_large = true; break; }
                 }
             }
-            if (he != std::string::npos && raw.size() >= need) break;   // 整条收齐
-            if (raw.size() >= kMaxHttpReq) break;                       // 头都没读完就超限
+            if (he != std::string::npos && raw.size() >= need) break;
+            if (raw.size() >= kMaxHttpReq) break;
             const ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
             if (n <= 0) break;
             raw.append(buf, size_t(n));
@@ -478,7 +459,8 @@ void Controller::http_loop()
     }
 }
 
-void Controller::handle_http(int fd, const std::string& raw, const std::string& /*ip*/)
+// 管理端 HTTP 路由入口：新增管理接口在这里加分支
+void Controller::handle_http(int fd, const std::string& raw, const std::string&)
 {
     HttpReq req;
     const size_t he = raw.find("\r\n\r\n");
@@ -526,7 +508,6 @@ void Controller::handle_http(int fd, const std::string& raw, const std::string& 
         return;
     }
 
-    // GET /api/servers —— 已接入 agent 列表
     if (req.method == "GET" && req.path == "/api/servers") {
         std::string body = "{\"servers\":[";
         {
@@ -545,7 +526,6 @@ void Controller::handle_http(int fd, const std::string& raw, const std::string& 
         return;
     }
 
-    // /api/servers/{id}/info|tokens[/{token}] —— 转发到指定 agent
     static const std::string kPre = "/api/servers/";
     if (req.path.rfind(kPre, 0) == 0) {
         const std::string rest = req.path.substr(kPre.size());
@@ -580,7 +560,6 @@ void Controller::handle_http(int fd, const std::string& raw, const std::string& 
     send_all(fd, make_http_response(404, "{\"error\":\"not found\"}"));
 }
 
-// ============================ 入口 ============================
 int main(int argc, char* argv[])
 {
     ::umask(077);

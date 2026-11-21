@@ -36,6 +36,11 @@ TRANSPORT="${TRANSPORT:-both}"           # 传输方式：both|udp|tcp（默认 
 KEY_PATH="${KEY_PATH:-$SCRIPT_DIR/keys/server_sig.key}"
 MAX_CLIENTS="${MAX_CLIENTS:-0}"     # 最大并发客户端数，0=服务端默认(64)；多用户自动分配虚拟 IP
 ENABLE_IPV6="${ENABLE_IPV6:-0}"        # 1=同时开启 IPv6 转发
+# ---- 内网访问（客户端经隧道访问服务器侧私网）----
+# INTRANET_ALLOW：允许客户端访问的私网网段，逗号分隔；留空=不允许访问任何私网
+# INTRANET_ENFORCE=1：未列入白名单的私网目的地址一律丢弃（默认，安全）；0=保留旧行为
+INTRANET_ALLOW="${INTRANET_ALLOW:-}"
+INTRANET_ENFORCE="${INTRANET_ENFORCE:-1}"
 # ---- 运行 / 日志 ----
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"        # 重点日志保存目录（按天轮转）
 RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/run}"           # PID / 标志文件目录
@@ -285,6 +290,8 @@ do_install() {
         echo "KEY_PATH=\"$KEY_PATH\""
         echo "MAX_CLIENTS=\"$MAX_CLIENTS\""
         echo "ENABLE_IPV6=\"$ENABLE_IPV6\""
+        echo "INTRANET_ALLOW=\"$INTRANET_ALLOW\""
+        echo "INTRANET_ENFORCE=\"$INTRANET_ENFORCE\""
         echo "QUIET=\"$QUIET\""
         echo "MAX_RESTARTS=\"$MAX_RESTARTS\""
         echo "LOGS_DIR=\"$LOGS_DIR\""
@@ -397,6 +404,42 @@ IFACE="${IFACE:-$(detect_iface)}"
 echo "[*] 出口网卡: $IFACE"
 
 # ===== 3. 防火墙 / NAT（自动选择 iptables 或 nftables）=====
+# 内网访问白名单：默认丢弃客户端发往私网段（RFC1918/链路本地）的流量，
+# 只放行 INTRANET_ALLOW 列出的网段。公网流量不受影响，原有全局代理用法不变。
+# 规则放在独立链里并插到 FORWARD 首位，避免被通用的 TUN→出口 ACCEPT 规则提前放行。
+setup_intranet_iptables() {
+    local chain="SCHOLARVPN_INTRANET"
+    local s net
+    iptables -N "$chain" 2>/dev/null || iptables -F "$chain"
+
+    if [ "$INTRANET_ENFORCE" = "1" ]; then
+        local old_ifs="$IFS"
+        IFS=','
+        for s in $INTRANET_ALLOW; do
+            s=$(printf '%s' "$s" | tr -d ' \t')
+            [ -z "$s" ] && continue
+            iptables -A "$chain" -d "$s" -j RETURN
+        done
+        IFS="$old_ifs"
+        for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
+            iptables -A "$chain" -d "$net" -j DROP
+        done
+    fi
+    iptables -A "$chain" -j RETURN
+
+    iptables -C FORWARD -i "$TUN_NAME" -j "$chain" 2>/dev/null || \
+        iptables -I FORWARD 1 -i "$TUN_NAME" -j "$chain"
+
+    if [ -n "$INTRANET_ALLOW" ]; then
+        # 内网可能不在默认出口网卡上：补通用转发与 NAT（多网卡服务器）
+        iptables -C FORWARD -i "$TUN_NAME" ! -o "$TUN_NAME" -j ACCEPT 2>/dev/null || \
+            iptables -A FORWARD -i "$TUN_NAME" ! -o "$TUN_NAME" -j ACCEPT
+        iptables -t nat -C POSTROUTING -s "$TUN_NET" ! -o "$TUN_NAME" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -A POSTROUTING -s "$TUN_NET" ! -o "$TUN_NAME" -j MASQUERADE
+    fi
+    echo "[*] 内网访问: enforce=$INTRANET_ENFORCE allow=${INTRANET_ALLOW:-<空，仅允许访问公网>}"
+}
+
 setup_firewall() {
     # 3.1 优先 iptables（多数系统都有，即使后端是 nft）
     if command -v iptables >/dev/null 2>&1; then
@@ -407,6 +450,7 @@ setup_firewall() {
             iptables -A FORWARD -i "$TUN_NAME" -o "$IFACE" -j ACCEPT
         iptables -C FORWARD -i "$IFACE" -o "$TUN_NAME" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
             iptables -A FORWARD -i "$IFACE" -o "$TUN_NAME" -m state --state ESTABLISHED,RELATED -j ACCEPT
+        setup_intranet_iptables
         # vpn_server 同端口双栈监听：UDP 与 TCP 一律放行
         iptables -C INPUT -p udp --dport "$VPN_PORT" -j ACCEPT 2>/dev/null || \
             iptables -A INPUT -p udp --dport "$VPN_PORT" -j ACCEPT
@@ -437,6 +481,37 @@ table inet vpn {
     }
 }
 EOF
+        # 内网访问白名单（与 iptables 分支等价，独立链优先级 -10 先于 forward）
+        if [ "$INTRANET_ENFORCE" = "1" ] || [ -n "$INTRANET_ALLOW" ]; then
+            local allow_set="" old_ifs="$IFS" s
+            IFS=','
+            for s in $INTRANET_ALLOW; do
+                s=$(printf '%s' "$s" | tr -d ' \t')
+                if [ -z "$s" ]; then
+                    continue
+                fi
+                if [ -z "$allow_set" ]; then
+                    allow_set="$s"
+                else
+                    allow_set="$allow_set, $s"
+                fi
+            done
+            IFS="$old_ifs"
+            {
+                echo "table inet vpn {"
+                echo "    chain intranet {"
+                echo "        type filter hook forward priority -10; policy accept;"
+                if [ -n "$allow_set" ]; then
+                    echo "        iifname \"$TUN_NAME\" ip daddr { $allow_set } accept"
+                fi
+                if [ "$INTRANET_ENFORCE" = "1" ]; then
+                    echo "        iifname \"$TUN_NAME\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop"
+                fi
+                echo "    }"
+                echo "}"
+            } | nft -f - || echo "[警告] nft 内网访问规则安装失败，请改用 iptables" >&2
+            echo "[*] 内网访问: enforce=$INTRANET_ENFORCE allow=${INTRANET_ALLOW:-<空，仅允许访问公网>}"
+        fi
         return 0
     fi
     echo "[警告] 未找到 iptables / nftables，NAT 可能未生效" >&2

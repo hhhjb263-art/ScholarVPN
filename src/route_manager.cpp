@@ -76,12 +76,9 @@ bool RouteManager::add_default_route(uint32_t metric)
 	return add_tunnel_route(CS("0.0.0.0"),0,metric);
 }
 
-// IPv6 kill-switch：::/0 也指向 TUN（下一跳 ::，on-link）。
-// TUN 上没有 IPv6 地址 → 系统发不出去（等效黑洞）；客户端 tun→udp 方向
-// 只转发 IPv4，这些包在本地被丢弃（ClientApp::tun_to_udp_loop），
-// 应用侧快速失败后回落 IPv4。目的：避免 V6 优先流量绕过隧道泄漏真实出口 IP。
 bool RouteManager::add_ipv6_default_route(uint32_t metric)
 {
+	// 默认不参与连接流程：本地静默丢弃 v6 包会让 V6 优先应用卡到超时
 	if (m_tunnelId.Value == 0) {
 		::SetLastError(ERROR_INVALID_HANDLE);
 		return false;
@@ -90,12 +87,13 @@ bool RouteManager::add_ipv6_default_route(uint32_t metric)
 	InitializeIpForwardEntry(&row);
 	row.InterfaceLuid = m_tunnelId;
 	row.DestinationPrefix.Prefix.si_family = AF_INET6;
-	row.DestinationPrefix.PrefixLength = 0;          // ::/0
-	row.NextHop.si_family = AF_INET6;                // 下一跳 ::（on-link）
+	row.DestinationPrefix.PrefixLength = 0;
+	row.NextHop.si_family = AF_INET6;
 	row.Metric = metric;
 	return create_route(row);
 }
 
+// 给服务器地址加一条走物理网关的 /32 排除路由，保证握手包不进隧道
 bool RouteManager::add_server_bypass_route(const cfgstr& serverIp)
 {
 	SOCKADDR_INET destination{};
@@ -125,11 +123,6 @@ void RouteManager::remove_default_route() noexcept
 {
 	for (auto it = m_createdRoutes.rbegin(); it != m_createdRoutes.rend(); ++it)
 	{
-		// 默认路由 = 目的前缀 0.0.0.0/0。
-		// 必须显式判地址族：IPv6 kill-switch 路由（::/0）的 PrefixLength 同样为 0、
-		// 且共用同一 union 的那 4 字节也是 0，只按"前缀长度 0 + 地址为 0"匹配会把
-		// 它误删（它是后加的、rbegin 先命中）——那样重连时 IPv4 默认路由反而留在
-		// 网卡上，断线后全流量仍进 TUN = 黑洞。
 		if (it->DestinationPrefix.PrefixLength == 0 &&
 			it->DestinationPrefix.Prefix.si_family == AF_INET &&
 			it->DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr == 0)
@@ -143,7 +136,7 @@ void RouteManager::remove_default_route() noexcept
 
 void RouteManager::clear_routes() noexcept
 {
-	remove_split_routes();   // 分流条目数量大，单独走一条路径撤销
+	remove_split_routes();
 	for (auto it = m_createdRoutes.rbegin(); it != m_createdRoutes.rend(); it++) {
 		::DeleteIpForwardEntry2(&(*it));
 	}
@@ -164,10 +157,9 @@ bool RouteManager::create_route(const MIB_IPFORWARD_ROW2& route)
 	return false;
 }
 
-// 分流：把一批 CIDR 指向"通往 probeIp 的物理出口"。
-// 一次 GetBestRoute2 拿到出口网卡与网关，复用到全部条目，避免每条查一遍路由表。
 int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const cfgstr& probeIp)
 {
+	// 分流前缀比隧道的 0.0.0.0/1 更长，最长前缀匹配下优先命中，走物理网关
 	if (cidrs.empty()) {
 		return 0;
 	}
@@ -191,7 +183,7 @@ int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const 
 	for (const auto& c : cidrs) {
 		const uint64_t key = (static_cast<uint64_t>(c.addr) << 8) | c.prefix;
 		if (!m_splitKeys.insert(key).second) {
-			continue;   // 已注入过
+			continue;
 		}
 		MIB_IPFORWARD_ROW2 row{};
 		InitializeIpForwardEntry(&row);
@@ -200,8 +192,6 @@ int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const 
 		row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = ::htonl(c.addr);
 		row.DestinationPrefix.PrefixLength = c.prefix;
 		row.NextHop = best.NextHop;
-		// metric 必须低于隧道默认路由（0.0.0.0/1），否则同前缀长度下会被隧道抢走，
-		// 表现为"分流看似生效、国内流量仍然绕了一圈"
 		row.Metric = 1;
 
 		const NETIO_STATUS st = ::CreateIpForwardEntry2(&row);
@@ -210,7 +200,7 @@ int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const 
 			++ok;
 		}
 		else {
-			m_splitKeys.erase(key);   // 失败不占位
+			m_splitKeys.erase(key);
 		}
 	}
 	LOG_INFO("分流路由: 注入 %d / %zu 条（出口 LUID=%llu）",
@@ -218,6 +208,7 @@ int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const 
 	return ok;
 }
 
+// 只撤分流路由，保留默认路由与服务器排除路由（split→full 切换时用）
 void RouteManager::remove_split_routes() noexcept
 {
 	for (auto it = m_splitRoutes.rbegin(); it != m_splitRoutes.rend(); ++it) {
@@ -232,8 +223,7 @@ std::size_t RouteManager::split_route_count() const noexcept
 	return m_splitRoutes.size();
 }
 
-// 自校验：把 m_splitKeys 里的条目拿到系统路由表里对一遍。
-// 这是唯一能证明"注入真的生效"的办法——API 返回值不可信。
+// 读回系统路由表统计真正生效的分流条目：接口返回成功不等于写进去了
 int RouteManager::count_active_split_routes() const
 {
 	if (m_splitKeys.empty()) {
@@ -261,7 +251,7 @@ int RouteManager::count_active_split_routes() const
 	return found;
 }
 
-#else // ---------------------------- Linux ----------------------------
+#else
 
 #include "route_manager.h"
 #include "platform/exec.h"
@@ -281,7 +271,6 @@ bool valid_ipv4(const std::string& ip)
     return ::inet_pton(AF_INET, ip.c_str(), &a) == 1;
 }
 
-// 接口名会拼进 shell 命令，只允许 [A-Za-z0-9._-]
 bool safe_ifname(const std::string& name)
 {
     if (name.empty() || name.size() >= IFNAMSIZ)
@@ -304,7 +293,6 @@ struct BestRoute {
     std::string via;
 };
 
-// 对应 Windows 的 GetBestRoute2：查"到目标地址实际会走哪张网卡、哪个网关"
 BestRoute best_route_for(const std::string& ip)
 {
     BestRoute r;
@@ -313,9 +301,6 @@ BestRoute best_route_for(const std::string& ip)
     {
         return r;
     }
-    // 输出首行形如：
-    //   1.2.3.4 via 192.168.1.1 dev eth0 src 192.168.1.5 uid 1000
-    //   1.2.3.4 dev eth0 src ...            （同网段直连，无 via）
     const std::size_t nl = out.find('\n');
     const std::string line = (nl == std::string::npos) ? out : out.substr(0, nl);
 
@@ -335,7 +320,6 @@ BestRoute best_route_for(const std::string& ip)
     return r;
 }
 
-// 加一条路由；已存在视为成功（幂等），并把删除命令记进 added
 bool add_route_tracked(const std::string& route_spec, std::vector<std::string>& added)
 {
     const std::string add = "ip route add " + route_spec;
@@ -344,7 +328,6 @@ bool add_route_tracked(const std::string& route_spec, std::vector<std::string>& 
         added.push_back("ip route del " + route_spec);
         return true;
     }
-    // 失败但系统里已有等价路由 → 视为成功（重复添加不该让连接失败）
     std::string cur;
     run_cmd("ip route show " + route_spec, &cur);
     if (!cur.empty())
@@ -355,7 +338,7 @@ bool add_route_tracked(const std::string& route_spec, std::vector<std::string>& 
     return false;
 }
 
-} // namespace
+}
 
 RouteManager::RouteManager(tun_id_t tunnelId)
     : m_tunnelId(std::move(tunnelId))
@@ -405,10 +388,6 @@ bool RouteManager::add_default_route(uint32_t metric)
         LOG_ERROR("add_default_route: 非法接口名");
         return false;
     }
-    // 用两条半路由（0.0.0.0/1 + 128.0.0.0/1）而不是替换 0.0.0.0/0：
-    //   - 不碰系统原有 default，NetworkManager/DHCP 续租不会打架；
-    //   - 断开时只删这两条，绝不会误删物理网卡的默认路由；
-    //   - 前缀更长 → 优先于原 default，效果等价于"全流量进隧道"。
     const std::string m = std::to_string(metric);
     bool ok = true;
     for (const char* prefix : { "0.0.0.0/1", "128.0.0.0/1" })
@@ -430,13 +409,13 @@ bool RouteManager::add_default_route(uint32_t metric)
     return ok;
 }
 
-bool RouteManager::add_ipv6_default_route(uint32_t /*metric*/)
+bool RouteManager::add_ipv6_default_route(uint32_t)
 {
-    // 与 Windows 端保持一致：不接管 IPv6（接管后会静默丢包，应用要等超时才回落）
     LOG_WARN("add_ipv6_default_route: Linux 端未启用（与 Windows 行为一致，避免 IPv6 黑洞）");
     return false;
 }
 
+// 同 Windows：服务器地址的排除路由必须先于默认路由存在
 bool RouteManager::add_server_bypass_route(const cfgstr& serverIp)
 {
     const std::string ip = cfg_to_utf8(serverIp);
@@ -465,8 +444,6 @@ bool RouteManager::add_server_bypass_route(const cfgstr& serverIp)
 	return true;
 }
 
-// 分流：批量把国内 CIDR 指到物理出口。
-// 逐条 fork `ip` 进程的话 4000 条要几十秒，必须用 `ip -batch` 一次性喂进去。
 int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const cfgstr& probeIp)
 {
 	if (cidrs.empty()) {
@@ -484,14 +461,12 @@ int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const 
 		LOG_ERROR("add_bypass_routes: 无法创建 batch 文件 %s", batchPath.c_str());
 		return 0;
 	}
-	// batch 里每行是"ip 之后的参数"，且必须带 route 对象：
-	// 只写 "replace ..." 会被 ip 当成无效对象，整批静默失败。
 	std::vector<cidr::Cidr> fresh;
 	fresh.reserve(cidrs.size());
 	for (const auto& c : cidrs) {
 		const uint64_t key = (static_cast<uint64_t>(c.addr) << 8) | c.prefix;
 		if (!m_splitKeys.insert(key).second) {
-			continue;   // 已注入过
+			continue;
 		}
 		fresh.push_back(c);
 		std::fprintf(f, "route replace %s", cidr::to_string(c).c_str());
@@ -512,7 +487,6 @@ int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const 
 		return 0;
 	}
 
-	// 记录删除命令（同样是 batch 行，撤销时一次执行）
 	m_splitRoutes.reserve(m_splitRoutes.size() + fresh.size());
 	for (const auto& c : fresh) {
 		std::string del = "route del " + cidr::to_string(c);
@@ -528,6 +502,7 @@ int RouteManager::add_bypass_routes(const std::vector<cidr::Cidr>& cidrs, const 
 	return static_cast<int>(fresh.size());
 }
 
+// 只撤分流路由，保留默认路由与服务器排除路由
 void RouteManager::remove_split_routes() noexcept
 {
 	if (m_splitRoutes.empty()) {
@@ -552,8 +527,7 @@ std::size_t RouteManager::split_route_count() const noexcept
 	return m_splitRoutes.size();
 }
 
-// 自校验：解析 `ip -4 route show` 的第一列目标前缀，与 m_splitKeys 比对。
-// 每行形如：117.128.0.0/10 via 192.168.1.1 dev eth0 metric 1
+// 解析 ip route 输出，核对分流条目是否真的落表
 int RouteManager::count_active_split_routes() const
 {
 	if (m_splitKeys.empty()) {
@@ -578,7 +552,6 @@ int RouteManager::count_active_split_routes() const
 
 void RouteManager::remove_default_route() noexcept
 {
-    // 只删 0.0.0.0/1 与 128.0.0.0/1，保留 bypass
     for (auto it = m_addedRoutes.begin(); it != m_addedRoutes.end();)
     {
         const bool is_split_default =
@@ -589,14 +562,14 @@ void RouteManager::remove_default_route() noexcept
             ++it;
             continue;
         }
-        run_cmd(*it);            // 已经是 "ip route del ..."
+        run_cmd(*it);
         it = m_addedRoutes.erase(it);
     }
 }
 
 void RouteManager::clear_routes() noexcept
 {
-    remove_split_routes();   // 分流条目走 batch，先撤
+    remove_split_routes();
     for (auto it = m_addedRoutes.rbegin(); it != m_addedRoutes.rend(); ++it)
     {
         run_cmd(*it);
@@ -604,4 +577,4 @@ void RouteManager::clear_routes() noexcept
     m_addedRoutes.clear();
 }
 
-#endif // _WIN32
+#endif

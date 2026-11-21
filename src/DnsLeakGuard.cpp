@@ -10,19 +10,11 @@
 
 namespace {
 
-// 禁用"智能多宿主名称解析"的注册表键（组策略路径，键不存在时需创建）
 const wchar_t* kPolicyKey = L"SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient";
 const wchar_t* kPolicyValue = L"DisableSmartNameResolution";
 
-// 黑洞 DNS 地址：设置为静态 DNS 后查询会快速失败，且不会被 DHCP 回填覆盖
 const wchar_t* kBlackHoleDns = L"0.0.0.0";
 
-// 刷新 DNS 解析缓存（等价 ipconfig /flushdns）
-// 注意：dnsapi.dll 的 DnsFlushResolverCache 是非公开导出，不能保证所有 Windows 都有，
-// 不能用 extern 声明 + 静态链接（旧系统加载 dnsapi 缺导出会崩）；
-// 改为 LoadLibrary/GetProcAddress 动态获取，拿不到就静默跳过。
-// 另外：SetInterfaceDnsSettings 本身会通知 DNS Client 立即生效，
-// 不需要重启 dnscache 系统服务（重启会让全系统 DNS 闪断，属高风险操作）。
 void flush_dns_cache()
 {
     typedef BOOL(WINAPI* DnsFlushResolverCacheFn)(void);
@@ -37,20 +29,15 @@ void flush_dns_cache()
         fn();
 }
 
-} // namespace
+}
 
-// 备份并清空非 TUN 接口的 DNS + 禁用多宿主解析（防回退到运营商/本地 DNS）
-bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& /*dnsServers*/)
+// 隧道建立后锁定各网卡 DNS，防止查询绕过隧道泄漏真实出口
+bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr&)
 {
-    restore();   // 清理上一次的状态（防重复调用 / 崩溃残留）
+    restore();
 
     bool ok = true;
 
-    //    Windows 默认会同时向所有网卡配置的 DNS 服务器发查询（多宿主解析），
-    //    即使 TUN 网卡设置了 8.8.8.8，物理网卡残留的运营商 DNS 仍会被查询 → 泄漏。
-    //    写入组策略键 DisableSmartNameResolution=1，断开时恢复。
-    //    注意：该键在未配置过组策略的系统上不存在，必须用 RegCreateKeyExW 创建，
-    //    RegOpenKeyExW 打开不存在的键会失败，导致静默写不进去。
     HKEY key = nullptr;
     DWORD disp = 0;
     if (::RegCreateKeyExW(HKEY_LOCAL_MACHINE, kPolicyKey, 0, nullptr, 0,
@@ -68,18 +55,9 @@ bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& /*dnsServers*/)
     }
     else
     {
-        ok = false;   // 没权限写入组策略键（多半没以管理员运行）
+        ok = false;
     }
 
-    //    注意：物理网卡往往是 DHCP（DNS 由 DHCP/路由器下发），
-    //    GetInterfaceDnsSettings 对这种网卡返回的 NameServer 可能为空，
-    //    因此不能"读不到就跳过"——统一设置为黑洞地址 0.0.0.0（静态覆盖 DHCP），
-    //    查询会快速失败而不是泄漏。
-    //     同时：无论读到没读到原 DNS，**每个接口都要进备份列表**——
-    //    - 读到原值：restore 时写回；
-    //    - 读不到（DHCP 自动）：wasDhcp=true，restore 时以 Flags=0（不设 NAMESERVER）
-    //      切回 DHCP 自动获取。否则黑洞 0.0.0.0 会把网卡永久切成静态模式，
-    //      断开后 DNS 永远恢复不了（电脑断网）——这是高危缺陷。
     ULONG size = 0;
     GetAdaptersAddresses(AF_UNSPEC,
                          GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
@@ -100,13 +78,12 @@ bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& /*dnsServers*/)
         if (a->OperStatus != IfOperStatusUp)
             continue;
         if (a->Luid.Value == keepId.Value)
-            continue;   // 跳过 TUN 网卡（它的 DNS 由 set_DNS_IPv4 管理）
+            continue;
 
         GUID g{};
         if (ConvertInterfaceLuidToGuid(&a->Luid, &g) != NO_ERROR)
             continue;
 
-        // 读取该接口当前 DNS（SDK 10.0.26100+：传 GUID 值 + 调用方提供的结构体，先设 Version）
         DNS_INTERFACE_SETTINGS cur{};
         cur.Version = DNS_INTERFACE_SETTINGS_VERSION1;
         cfgstr dns;
@@ -125,41 +102,29 @@ bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& /*dnsServers*/)
         bk.ipv4Dns = dns;
         if (gotSettings)
         {
-            // 读取成功：NameServer 为空 = 原本 DHCP 自动获取（wasDhcp=true，恢复时切回自动）；
-            // 非空 = 原本静态 DNS（恢复时写回原串）。
             bk.wasDhcp = dns.empty();
         }
         else
         {
-            // 读取失败：不知道真实配置，保守按"静态 DNS"处理（wasDhcp=false），
-            // 恢复时把当前值原样写回（此刻 ipv4Dns 为空 → 恢复为空 = 不变更），
-            // 绝不能误判成 DHCP——否则会把用户原本手配的静态 DNS 清成自动。
             bk.wasDhcp = false;
         }
         m_backup.push_back(std::move(bk));
 
-        // 强制设置黑洞地址
         DNS_INTERFACE_SETTINGS bh{};
         bh.Version = DNS_INTERFACE_SETTINGS_VERSION1;
         bh.Flags = DNS_SETTING_NAMESERVER;
         bh.NameServer = const_cast<PWSTR>(kBlackHoleDns);
         if (SetInterfaceDnsSettings(g, &bh) != NO_ERROR)
-            ok = false;   // 设置失败（权限/网卡被占用），上层需记日志
+            ok = false;
     }
 
-    // 刷新 DNS 解析缓存让配置立即生效
     flush_dns_cache();
 
-    // 派生崩溃看门狗：本进程退出（含崩溃/被杀）后自动复位这些网卡的 DNS，
-    // 覆盖 restore() 来不及执行的异常退出。正常退出时 restore() 先行，看门狗幂等无害。
     spawn_crash_watchdog();
 
     return ok;
 }
 
-// 派生分离的 PowerShell 看门狗：
-//   Wait-Process 等本进程退出 → 逐网卡复位（DHCP→自动 / 静态→写回原值）。
-//   用 InterfaceIndex 而非网卡名，避免中文网卡名的编码问题。
 void DnsLeakGuard::spawn_crash_watchdog()
 {
     if (m_backup.empty())
@@ -182,13 +147,11 @@ void DnsLeakGuard::spawn_crash_watchdog()
     {
         if (bk.wasDhcp)
         {
-            // 原 DHCP 自动获取：复位为自动（等价"恢复为默认"）
             cmd += L" Set-DnsClientServerAddress -InterfaceIndex "
                  + std::to_wstring(bk.ifIndex) + L" -ResetServerAddresses;";
         }
         else if (!bk.ipv4Dns.empty())
         {
-            // 原静态 DNS：写回原串（可能是 "1.1.1.1,8.8.8.8" 逗号分隔，拆开逐个加引号）
             cmd += L" Set-DnsClientServerAddress -InterfaceIndex "
                  + std::to_wstring(bk.ifIndex) + L" -ServerAddresses";
             const cfgstr dns = bk.ipv4Dns;
@@ -220,10 +183,8 @@ void DnsLeakGuard::spawn_crash_watchdog()
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
     }
-    // 派生失败静默忽略：还有正常 restore() 和下次启动的残留清理两层兜底
 }
 
-// 恢复全部备份的 DNS + 恢复多宿主解析设置 + 清理崩溃残留的黑洞
 void DnsLeakGuard::restore()
 {
     {
@@ -243,8 +204,6 @@ void DnsLeakGuard::restore()
                 {
                     if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
                         continue;
-                    // 注意：不过滤 OperStatus！崩溃发生时某网卡可能恰好断开（如 Wi-Fi 掉线），
-                    // 黑洞残留在其配置里，重新连接后才会暴露——宕着的网卡也必须扫描清理。
                     GUID g{};
                     if (ConvertInterfaceLuidToGuid(&a->Luid, &g) != NO_ERROR)
                         continue;
@@ -257,14 +216,10 @@ void DnsLeakGuard::restore()
                     FreeInterfaceDnsSettings(&cur);
                     if (!isBlackHole)
                         continue;
-                    // 黑洞 -> 清除静态 DNS，切回 DHCP 自动获取。
-                    //   关键：必须 Flags=DNS_SETTING_NAMESERVER + NameServer=L""（空串=清除）。
-                    //    若写 Flags=0 + NameServer=nullptr，语义是"本次不修改任何设置"，
-                    //    黑洞会原样保留，DHCP 网卡永久失真（断线后 DNS 不恢复）——高危缺陷。
                     DNS_INTERFACE_SETTINGS reset{};
                     reset.Version = DNS_INTERFACE_SETTINGS_VERSION1;
-                    reset.Flags = DNS_SETTING_NAMESERVER;      // 声明要修改 NAMESERVER 字段
-                    reset.NameServer = const_cast<PWSTR>(L""); // 空串 = 清除静态 DNS → 回退 DHCP 自动
+                    reset.Flags = DNS_SETTING_NAMESERVER;
+                    reset.NameServer = const_cast<PWSTR>(L"");
                     SetInterfaceDnsSettings(g, &reset);
                 }
             }
@@ -309,7 +264,7 @@ void DnsLeakGuard::restore()
     flush_dns_cache();
 }
 
-#else // ---------------------------- Linux ----------------------------
+#else
 
 #include "platform/exec.h"
 
@@ -328,7 +283,7 @@ const char* kResolvConf = "/etc/resolv.conf";
 
 bool safe_ifname(const std::string& name)
 {
-    if (name.empty() || name.size() >= 16)   // IFNAMSIZ
+    if (name.empty() || name.size() >= 16)
     {
         return false;
     }
@@ -386,7 +341,6 @@ bool has_resolvectl()
     return run_cmd("command -v resolvectl >/dev/null 2>&1") == 0;
 }
 
-// "8.8.8.8,1.1.1.1" -> "8.8.8.8 1.1.1.1"
 std::string dns_list(const std::string& csv)
 {
     std::string out;
@@ -410,7 +364,6 @@ std::string dns_list(const std::string& csv)
     return out;
 }
 
-// 单引号转义（拼进 sh -c 时防止命令注入/断行）
 std::string sh_quote(const std::string& s)
 {
     std::string out = "'";
@@ -423,9 +376,8 @@ std::string sh_quote(const std::string& s)
     return out;
 }
 
-} // namespace
+}
 
-// 看门狗要执行的恢复命令（fork 之前拼好，子进程只 execl）
 std::string DnsLeakGuard::build_restore_command() const
 {
     if (m_useResolvectl)
@@ -446,7 +398,7 @@ std::string DnsLeakGuard::build_restore_command() const
 
 bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& dnsServers)
 {
-    restore();   // 清掉上一次的状态（防重复调用 / 上次崩溃残留）
+    restore();
 
     if (!safe_ifname(keepId))
     {
@@ -456,10 +408,6 @@ bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& dnsServers)
     m_ifname = keepId;
     const std::string servers = dns_list(dnsServers);
 
-    // ---- 方案 A：systemd-resolved（首选）----
-    // `resolvectl domain <if> '~.'` 把"所有域名"的解析都路由到该 link，
-    // 物理网卡上的 DNS 自然不再被使用；不碰 /etc/resolv.conf，
-    // 也不与 NetworkManager 抢文件，断开 revert 即可。
     if (has_resolvectl())
     {
         if (!servers.empty())
@@ -479,7 +427,6 @@ bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& dnsServers)
         LOG_WARN("DnsLeakGuard: resolvectl domain 失败，回退到改写 resolv.conf");
     }
 
-    // ---- 方案 B：直接改写 /etc/resolv.conf ----
     if (servers.empty())
     {
         LOG_ERROR("DnsLeakGuard: 未配置 DNS，拒绝改写 resolv.conf（会把系统 DNS 弄空）");
@@ -521,7 +468,6 @@ bool DnsLeakGuard::protect(tun_id_t keepId, const cfgstr& dnsServers)
     }
     content += "# generated by ScholarVPN while connected; restored on disconnect\n";
 
-    // 符号链接必须先删：直接写会穿透到 systemd 的 stub 文件，重启后失效
     if (m_resolvWasSymlink && ::unlink(kResolvConf) != 0)
     {
         LOG_ERROR("DnsLeakGuard: 删除 resolv.conf 符号链接失败: %s", std::strerror(errno));
@@ -564,7 +510,6 @@ void DnsLeakGuard::restore()
     }
     m_active = false;
 
-    // 关闭写端：看门狗读到 EOF 后会执行一次恢复（幂等）然后退出
     if (m_pipeWriteFd >= 0)
     {
         ::close(m_pipeWriteFd);
@@ -580,9 +525,6 @@ void DnsLeakGuard::restore()
 
 void DnsLeakGuard::spawn_pipe_watchdog()
 {
-    // fork 之后子进程只能调 async-signal-safe 函数：多线程程序里 malloc 可能
-    // 被其他线程持锁，子进程再 popen/拼接字符串会死锁。
-    // 所以恢复命令在这里就拼好，子进程只做 read + execl。
     const std::string cmd = build_restore_command();
 
     int fds[2];
@@ -603,7 +545,6 @@ void DnsLeakGuard::spawn_pipe_watchdog()
     {
         ::close(fds[1]);
         char c = 0;
-        // 父进程活着时永远阻塞；父死/被 kill -9 → EOF
         while (::read(fds[0], &c, 1) > 0) {}
         ::close(fds[0]);
         ::execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
@@ -614,4 +555,4 @@ void DnsLeakGuard::spawn_pipe_watchdog()
     m_pipeWriteFd = fds[1];
 }
 
-#endif // _WIN32
+#endif

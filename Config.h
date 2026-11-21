@@ -6,43 +6,25 @@
 #include <string>
 #include <vector>
 
-// ============================================================================
-// 配置层（跨平台）
-//
-// 字符串类型统一用 cfgstr：
-//   Windows = std::wstring（Win32 INI API / 宽字符路径，行为与改造前完全一致）
-//   Linux   = std::string UTF-8
-// 业务代码一律不要写 std::wstring 或 L"..."，用 cfgstr + CS("...")
-// ============================================================================
-
-// 一台服务器的配置
 struct ServerEntry
 {
-    cfgstr Name;            // 显示名，如 "服务器A"
-    cfgstr ServerIP;        // 服务器 IP
+    cfgstr Name;
+    cfgstr ServerIP;
     int ServerPort = 51820;
-    // 传输方式：0 = UDP（默认），1 = TCP（应对运营商丢 UDP，可配合 443 端口）
     uint8_t transport = 0;
-    // 每台服务器各自的认证身份（各服务器独立注册）
-    cfgstr ClientID;        // 该服务器的客户端标识
-    cfgstr RegisterToken;   // 该服务器的一次性注册令牌（空=登录模式）
-    // 该服务器的身份公钥（Ed25519 SPKI PEM 的 base64 正文，单行，不带头尾行）。
-    // 每台服务器密钥独立，客户端用它验证该服务器签名（防中间人）；留空=用内置硬编码公钥。
+    cfgstr ClientID;
+    cfgstr RegisterToken;
     cfgstr ServerPubKey;
-    // 受管服务下发的卡片：UI 不显示 IP/端口等服务方信息（姓名=下发时的地名）
     bool managed = false;
 };
 
-// Client runtime settings, loaded from / saved to an INI file.
 struct ClientConfig
 {
 #ifdef _DEBUG
     cfgstr ServerIP = CS("192.168.1.12");
 #else
-    // Release builds: no hardcoded server; user fills it in config.ini (empty default avoids mojibake)
     cfgstr ServerIP = CS("");
 #endif
-    // Debug-only server override: DEBUG builds prefer this key, RELEASE builds ignore it.
 #ifdef _DEBUG
     cfgstr DebugServerIP = CS("192.168.1.12");
 #else
@@ -50,70 +32,41 @@ struct ClientConfig
 #endif
     int ServerPort = 51820;
 
-    // 多服务器列表（INI 格式：[Server] Count=N + [ServerN] Name/IP/Port）。
-    // servers[0] 即默认/活动服务器，读写时与上面的 ServerIP/ServerPort 保持同步。
     std::vector<ServerEntry> servers;
 
-    // Virtual adapter (TUN) settings
-    // VirtualIP: optional. Empty = adopt the server-assigned virtual IP after
-    // authentication (multi-user servers always assign one); non-empty = fallback
-    // for old servers that do not advertise an address.
     cfgstr VirtualIP = CS("");
     int VirtualPrefix = 24;
     cfgstr DNS = CS("8.8.8.8,1.1.1.1");
     uint32_t MTU = 1400;
     uint8_t Metric = 5;
 
-    // Identity (three-phase auth)
-    cfgstr ClientID = CS("user");        // client identifier
-    cfgstr RegisterToken = CS("");       // one-time register token (empty = login mode)
-    // 默认/活动服务器的身份公钥（与 servers[0].ServerPubKey 同步，空=用内置公钥）
+    cfgstr ClientID = CS("user");
+    cfgstr RegisterToken = CS("");
     cfgstr ServerPubKey;
 
-    // ---- 流量分流（[Routing]）----
-    // Mode: full = 全流量走隧道（默认，保持旧行为）；split = 国内 IP 直连
     cfgstr RoutingMode = CS("full");
-    // 国内列表来源：builtin = 程序目录的 chnroute.txt；也可填 http(s) URL（P2）
     cfgstr ChinaIPList = CS("builtin");
-    // 额外直连网段（逗号分隔），用于"连上后仍要访问本地局域网"的场景
     cfgstr BypassSubnets = CS("");
-    // 查物理出口用的探测地址，空 = 8.8.8.8
+    cfgstr IntranetSubnets = CS("");
     cfgstr ProbeIP = CS("");
 
-    // ---- 客户端更新（[Update]）----
-    // 全部留空 = 不启用更新检查（默认值，升级后老用户行为不变）。
-    // 一旦 PolicyURL 与 ReleasePubKey 都有值，启动时就会校验；验签失败即拒绝使用。
-    cfgstr UpdatePolicyURL = CS("");   // 策略文件地址
-    cfgstr UpdateSigURL = CS("");      // 签名地址；留空 = PolicyURL + ".sig"
-    cfgstr ReleasePubKey = CS("");     // 发布公钥 PEM；留空 = 内置（无内置则视为未启用）
+    cfgstr UpdatePolicyURL = CS("");
+    cfgstr UpdateSigURL = CS("");
+    cfgstr ReleasePubKey = CS("MCowBQYDK2VwAyEAc0EJCcbif2w8vPpeutGT+o7bqTFTdOoRSdrDuOJ4xj4=");
 
-    // ---- 受管服务（[Service]）----
-    // Mode: off = 自建（默认，与旧行为完全一致，无任何新增网络行为）
-    //       managed = 受管试用（向服务方申请试用/同步配额/自动下发服务器列表）
-    // ServiceURL 与 PublicKey 由部署方写进配置，绝不硬编码进客户端（红线 4）。
     cfgstr ServiceMode = CS("off");
-    cfgstr ServiceURL = CS("");        // broker 基地址，如 https://host
-    cfgstr ServicePubKey = CS("");     // service 签名公钥（SPKI DER base64 单行）
-    // —— 以下由客户端在受管流程中写入 ——
-    cfgstr ServiceFp = CS("");            // 机器指纹 64hex
-    cfgstr ServiceClientId = CS("");      // trial-xxxxxxxx
-    cfgstr ServiceToken = CS("");         // 最近一次发号的注册令牌
-    cfgstr ServiceStatus = CS("");        // trial | approved | rejected | 空=未知
-    cfgstr ServiceExpireAt = CS("0");     // unix 秒；0 = 不限（字符串承载，避免 int32 截断）
+    cfgstr ServiceURL = CS("");
+    cfgstr ServicePubKey = CS("");
+    cfgstr ServiceFp = CS("");
+    cfgstr ServiceClientId = CS("");
+    cfgstr ServiceToken = CS("");
+    cfgstr ServiceStatus = CS("");
+    cfgstr ServiceExpireAt = CS("0");
     cfgstr ServiceQuotaBytes = CS("0");
     cfgstr ServiceUsedBytes = CS("0");
-    // 上次成功下发的受管服务器 "ip:port" 逗号清单：刷新列表时据此替换这批卡片，
-    // 用户自建卡片不受影响
     cfgstr ServiceManagedServers = CS("");
 };
 
-// ============================================================================
-// config.ini 的 INI 原语（GUI/桥接层增量读写用；LoadClientConfig/Save 也走它们）。
-// ⚠️ 编码约定：Windows 走 Win32 INI API（文件为 ANSI/本地码页），Linux 走
-// ini_doc（UTF-8）。因此 config.ini 【禁止】用 QSettings 读写——QSettings 写
-// UTF-8，GetPrivateProfileStringW 按 ANSI 解码，非 ASCII 会变乱码
-// （"香港"→"棣橣离"事故，2026-10-31）。注册表等其它存储不受此限制。
-// ============================================================================
 namespace scholini {
 cfgstr IniGetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& def);
 int IniGetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int def);
@@ -122,7 +75,7 @@ bool IniSetInt(const cfgstr& path, const cfgstr& sec, const cfgstr& key, int val
 void IniDelKey(const cfgstr& path, const cfgstr& sec, const cfgstr& key);
 void IniDelSection(const cfgstr& path, const cfgstr& sec);
 std::vector<cfgstr> IniSections(const cfgstr& path);
-} // namespace scholini
+}
 
 class Config
 {
@@ -133,18 +86,14 @@ public:
     Config(cfgstr path, cfgstr dirPath);
     ~Config();
 
-    // 配置根目录：Windows=%APPDATA%；Linux=$XDG_CONFIG_HOME 或 ~/.config
-    // （保留原函数名与语义，Windows 端行为不变；程序数据目录用 cfg_app_dir()）
     static cfgstr GetAppDataRoaming();
 
-    // Directory / file helpers
     static bool CreateDir(const cfgstr& dirPath);
     static bool FileExists(const cfgstr& filePath);
     static bool DirExists(const cfgstr& dirPath);
     static std::string ReadTextFile(const cfgstr& filePath);
     static bool WriteTextFile(const cfgstr& filePath, const std::string& content);
 
-    // Load settings from the INI file; creates it with defaults when missing.
     bool LoadClientConfig(ClientConfig& outCfg);
     bool SaveClientConfig(const ClientConfig& cfg);
 };

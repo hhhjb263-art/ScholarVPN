@@ -28,7 +28,6 @@ std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
 LogSink g_sink;
 
-// exe 所在目录（带尾部分隔符）；失败返回空串
 cfgstr GetExeDir()
 {
 #if defined(_WIN32)
@@ -94,7 +93,7 @@ bool HasConsole()
 #endif
 }
 
-} // namespace
+}
 
 namespace Logger {
 
@@ -104,7 +103,7 @@ void Init()
     if (g_logFile) return;
 
     const cfgstr dir = cfg_path_join(GetExeDir(), CS("log"));
-    MakeDir(dir); // 目录已存在时失败可忽略
+    MakeDir(dir);
 
     const std::tm tm = LocalTime();
     char name[64]{};
@@ -120,8 +119,6 @@ void Init()
 #endif
     if (g_logFile)
     {
-        // 写入 UTF-8 BOM，方便记事本等编辑器识别编码；
-        // Linux 下 tail/vim 不认 BOM 也不受影响，保持跨平台行为一致
         const char bom[] = "\xEF\xBB\xBF";
         std::fwrite(bom, 1, sizeof(bom) - 1, g_logFile);
     }
@@ -149,8 +146,6 @@ void Log(const char* fmt, ...)
 
         line = "[" + CurrentTimestamp() + "] " + msg;
 
-        // 有控制台才打印：Windows 打包为子系统时没有控制台；
-        // Linux 下重定向到文件/被 systemd 接管时不是 tty，也不该往 stdout 灌
         if (HasConsole())
         {
             std::puts(line.c_str());
@@ -163,7 +158,6 @@ void Log(const char* fmt, ...)
             std::fflush(g_logFile);
         }
 
-        // 转发给订阅者（UI 日志窗口），在调用线程执行
         if (g_sink)
         {
             g_sink(line);
@@ -187,4 +181,4 @@ void Shutdown()
     }
 }
 
-} // namespace Logger
+}

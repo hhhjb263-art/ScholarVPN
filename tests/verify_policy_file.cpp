@@ -1,14 +1,3 @@
-// ============================================================================
-// tests/verify_policy_file.exe —— 发布自检工具：验证策略文件与签名的匹配
-//
-// 用法：
-//   verify_policy_file.exe <policy.ini> <policy.ini.sig> <release_pub.pem> [os] [current]
-//
-// 发布流程中把它跑在"上传之前"：签名与文件哪怕差一个字节，这里都过不去。
-// 与 Python 侧 scripts/sign-update-policy.py 的 verify 是双向校验：
-//   Python 签 → C++ 验（本工具）——证明两端对格式约定的理解一致。
-// ============================================================================
-
 #include "update/update_checker.h"
 
 #include <cstdio>
@@ -26,7 +15,6 @@ namespace {
 
 std::string read_file(const char* path)
 {
-    // 签名对象是文件原始字节，必须按二进制读（不能做任何行尾转换）
     FILE* f = std::fopen(path, "rb");
     if (f == nullptr)
     {
@@ -43,7 +31,7 @@ std::string read_file(const char* path)
     return out;
 }
 
-} // namespace
+}
 
 int main(int argc, char** argv)
 {

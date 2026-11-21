@@ -11,11 +11,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
-/**
- * 用户协议门禁（2026-11-02 防滥用）：首次启动全屏展示协议，
- * 勾选并点「同意并继续」后才放行 content；拒绝则 finish()。
- * 同意结果存 SharedPreferences（scholarvpn_general / agreement_accepted）。
- */
 @Composable
 fun AgreementGate(content: @Composable () -> Unit) {
     val context = LocalContext.current

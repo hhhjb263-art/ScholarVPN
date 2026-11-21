@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""离线解密抓到的身份帧：用假服务端派生的 key_c2s 解手机的 type=11 帧。"""
 import re, hmac, hashlib, struct
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -8,10 +7,8 @@ MAGIC = bytes([0x4E, 0x50, 0x56, 0x4D])
 
 log = open(LOG, encoding="utf-8").read()
 
-# 从日志取派生材料
 shared = bytes.fromhex(re.search(r"shared=(\w+)", log).group(1))
 nonceC = bytes.fromhex(re.search(r"auth_hello: nonceC=(\w+)", log).group(1))
-# nonceS 从 ServerHello 的 payload 前缀取
 srv = re.search(r"\[send\] type=9 plen=112 seq=0 payload=(\w+)", log).group(1)
 nonceS = bytes.fromhex(srv[:32])
 
@@ -28,7 +25,6 @@ key_s2c = hkdf_expand(prk, "rx", 32)
 print("key_c2s =", key_c2s.hex())
 print("key_s2c =", key_s2c.hex())
 
-# 取所有 type=11 的帧（seq 与完整 payload）
 frames = []
 for m in re.finditer(r"\[recv\] ver=2 type=11 plen=(\d+) seq=(\d+) payload=(\w+)", log):
     frames.append((int(m.group(2)), int(m.group(1)), bytes.fromhex(m.group(3))))
@@ -56,7 +52,6 @@ for seq, plen, payload in frames[:3]:
         print("           idLen  =", idlen, " clientId =", rest[129:129+idlen].decode())
         sig = rest[129+idlen:]
         print("           sig    =", len(sig), "字节")
-        # 用报文里的 cliPub 验签（对齐服务端第 3 步）
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         try:
             Ed25519PublicKey.from_public_bytes(rest[96:128]).verify(sig, rest[:129+idlen])

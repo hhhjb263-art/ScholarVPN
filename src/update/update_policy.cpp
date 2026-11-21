@@ -18,8 +18,6 @@ std::string trim(const std::string& s)
     return s.substr(b, e - b + 1);
 }
 
-// 读一段数字；缺段按 0 处理（"1.6" 等价 "1.6.0"）。
-// 遇非数字返回 false。
 bool next_segment(const std::string& s, std::size_t& pos, int& out)
 {
     if (pos >= s.size())
@@ -31,7 +29,7 @@ bool next_segment(const std::string& s, std::size_t& pos, int& out)
     const std::size_t end = (dot == std::string::npos) ? s.size() : dot;
     if (end == pos)
     {
-        return false;   // "1..2" 这类空段
+        return false;
     }
     int value = 0;
     for (std::size_t i = pos; i < end; ++i)
@@ -44,7 +42,7 @@ bool next_segment(const std::string& s, std::size_t& pos, int& out)
         value = value * 10 + (c - '0');
         if (value > 0xFFFF)
         {
-            return false;   // 明显不合理，防止溢出
+            return false;
         }
     }
     out = value;
@@ -52,7 +50,7 @@ bool next_segment(const std::string& s, std::size_t& pos, int& out)
     return true;
 }
 
-} // namespace
+}
 
 int compare_version(const std::string& a, const std::string& b)
 {
@@ -75,10 +73,10 @@ int compare_version(const std::string& a, const std::string& b)
             return (va < vb) ? -1 : 1;
         }
     }
-    // 只比较前三段：第四段（构建号）不参与判定
     return 0;
 }
 
+// 解析已签名的更新策略文本；新增策略字段从这里扩展
 bool parse_policy(const std::string& text, const std::string& os, Policy& out)
 {
     out = Policy();
@@ -102,7 +100,7 @@ bool parse_policy(const std::string& text, const std::string& os, Policy& out)
         const std::size_t eq = line.find('=');
         if (eq == std::string::npos)
         {
-            continue;   // 坏行跳过，不让一条错行废掉整份策略
+            continue;
         }
         kv[trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
     }
@@ -119,7 +117,6 @@ bool parse_policy(const std::string& text, const std::string& os, Policy& out)
     }
     out.minimum = get("minimum");
     out.notes = get("notes");
-    // 平台专属字段优先；没有则回退到通用写法（单平台部署时只写 url/sha256 即可）
     out.url = get((os + "_url").c_str());
     if (out.url.empty())
     {
@@ -150,6 +147,7 @@ bool parse_policy(const std::string& text, const std::string& os, Policy& out)
     return true;
 }
 
+// 由当前版本得出更新决策（无动作/提示/强制），是是否拦住连接的判定点
 Decision decide(const Policy& p, const std::string& currentVersion)
 {
     Decision d;
@@ -165,7 +163,6 @@ Decision decide(const Policy& p, const std::string& currentVersion)
     const int cLatest = compare_version(currentVersion, p.latest);
     if (cLatest == -2)
     {
-        // 自身版本号异常（不该发生）：提示但不阻塞，避免把用户卡死
         d.action = Action::Optional;
         d.reason = "当前版本号无法解析";
         return d;
@@ -182,7 +179,6 @@ Decision decide(const Policy& p, const std::string& currentVersion)
         }
         if (cMin == -2)
         {
-            // 服务端把 minimum 配错：降级为可选，不能让一个笔误锁死所有人
             d.action = (cLatest < 0) ? Action::Optional : Action::None;
             d.reason = "最低版本号无法解析，按可选处理";
             return d;
@@ -211,4 +207,4 @@ const char* action_name(Action a)
     }
 }
 
-} // namespace update
+}

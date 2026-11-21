@@ -1,10 +1,3 @@
-// ============================================================================
-// tests/test_fetcher.cpp —— HTTP 拉取的基本验证（需要外网）
-//
-// 编译（MSVC）：
-//   cl /std:c++20 /utf-8 /I. /Isrc tests\test_fetcher.cpp src\update\update_fetcher.cpp
-// ============================================================================
-
 #include "update/update_fetcher.h"
 
 #include <cstdio>

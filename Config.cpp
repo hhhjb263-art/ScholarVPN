@@ -1,7 +1,7 @@
 #include "Config.h"
-#include "src/logger.h"   // LOG_ERR（Transport 等配置项解析异常要能看见）
+#include "src/logger.h"
 
-#include <algorithm>   // std::sort（多服务器节按编号排序）
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -9,7 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <utility>     // std::pair
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -22,16 +22,8 @@
 #include "src/platform/ini_doc.h"
 #endif
 
-// ============================================================================
-// 平台无关的 INI 原语。上层 LoadClientConfig / SaveClientConfig 只用这几个函数，
-// 不再直接调 Win32 API，也不用关心编码：
-//   Windows：GetPrivateProfileStringW 等（行为与改造前逐字节一致）
-//   Linux  ：自实现解析（保留注释/未知键，原子写回，UTF-8）
-// ============================================================================
-
 namespace scholini
 {
-    // ---- 字符串小工具（cfgstr 两种底层类型都要能编） ----
 
     cfgstr TrimStr(const cfgstr& s)
     {
@@ -44,7 +36,6 @@ namespace scholini
         return s.substr(b, e - b + 1);
     }
 
-    // ASCII 小写化：只用于 udp/tcp 这类关键字判断，不引入 locale
     cfgstr LowerAscii(const cfgstr& s)
     {
         cfgstr out = s;
@@ -75,7 +66,6 @@ namespace scholini
         }
     }
 
-    // 剥掉 QSettings 写入时加的成对双引号（引号混进 PEM 正文会污染公钥）
     cfgstr StripQuotes(cfgstr s)
     {
         if (s.size() >= 2 && s.front() == CS('"') && s.back() == CS('"'))
@@ -87,15 +77,11 @@ namespace scholini
 
 #if defined(_WIN32)
 
-    // ---------------- Windows：直接用 Win32 INI API ----------------
-
     cfgstr IniGetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& def)
     {
         wchar_t buffer[4096] = { 0 };
         const DWORD n = ::GetPrivateProfileStringW(sec.c_str(), key.c_str(), def.c_str(),
                                                    buffer, 4096, path.c_str());
-        // 统一剥掉 QSettings 写入时加的成对引号：值里含逗号/空格/非 ASCII 时 Qt 会加引号，
-        // 引号混进 PEM 正文或 DNS 列表会让上层解析失败
         return StripQuotes(TrimStr(cfgstr(buffer, n)));
     }
 
@@ -116,20 +102,18 @@ namespace scholini
 
     void IniDelKey(const cfgstr& path, const cfgstr& sec, const cfgstr& key)
     {
-        // 值为 nullptr = 删除该键
         ::WritePrivateProfileStringW(sec.c_str(), key.c_str(), nullptr, path.c_str());
     }
 
     void IniDelSection(const cfgstr& path, const cfgstr& sec)
     {
-        // 节 + 键均为 nullptr = 删除整节
         ::WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, path.c_str());
     }
 
     std::vector<cfgstr> IniSections(const cfgstr& path)
     {
         std::vector<cfgstr> out;
-        std::vector<wchar_t> names(16384, L'\0');   // 双 NULL 结尾
+        std::vector<wchar_t> names(16384, L'\0');
         const UINT n = ::GetPrivateProfileSectionNamesW(names.data(),
                                                         static_cast<DWORD>(names.size()),
                                                         path.c_str());
@@ -144,14 +128,10 @@ namespace scholini
         return out;
     }
 
-#else // ---------------- Linux：自实现解析 ----------------
+#else
 
-    // INI 文档实现已抽到 src/platform/ini_doc.h（纯标准库，可单测）
     using PosixIni = scholinux::IniDoc;
 
-
-    // 每次 set/delete 都 load + save：配置不到 4KB、调用次数 <40，代价可忽略，
-    // 换来的是"任何一步失败都不会留下半截文件"
     cfgstr IniGetStr(const cfgstr& path, const cfgstr& sec, const cfgstr& key, const cfgstr& def)
     {
         PosixIni ini;
@@ -204,9 +184,8 @@ namespace scholini
 
 #endif
 
-} // namespace scholini
+}
 
-// LoadClientConfig / SaveClientConfig 内部继续无限定使用
 using namespace scholini;
 
 Config::Config(cfgstr path, cfgstr dirPath)
@@ -231,7 +210,6 @@ bool Config::CreateDir(const cfgstr& dirPath)
     return ::CreateDirectoryW(dirPath.c_str(), nullptr) != 0 ||
            ::GetLastError() == ERROR_ALREADY_EXISTS;
 #else
-    // 递归创建（~/.config 一般存在，但 XDG_CONFIG_HOME 可能是多级路径）
     struct stat st{};
     if (::stat(dirPath.c_str(), &st) == 0)
     {
@@ -263,7 +241,6 @@ bool Config::FileExists(const cfgstr& filePath)
     {
         return false;
     }
-    // A directory is not a regular file.
     return (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 #else
     struct stat st{};
@@ -288,9 +265,6 @@ bool Config::DirExists(const cfgstr& dirPath)
 
 std::string Config::ReadTextFile(const cfgstr& filePath)
 {
-    // 用 std::filesystem::path 而不是直接传 cfgstr：
-    // std::ifstream 的 wstring 重载是 MSVC 私有扩展，libstdc++（MinGW/Linux）不认，
-    // 而 filesystem::path 是 C++17 标准，三个编译器都走同一条路
     std::ifstream in(std::filesystem::path(filePath), std::ios::binary);
     if (!in)
     {
@@ -320,7 +294,6 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     }
     if (!FileExists(ini_path))
     {
-        // First run: create the INI file with the built-in defaults.
         return SaveClientConfig(outCfg);
     }
 
@@ -328,23 +301,18 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     outCfg.DebugServerIP = IniGetStr(ini_path, CS("Server"), CS("DebugServerIP"), outCfg.DebugServerIP);
     outCfg.ServerPort = IniGetInt(ini_path, CS("Server"), CS("ServerPort"), outCfg.ServerPort);
 
-    // [Server] Count=N + [ServerN] Name/IP/Port/ClientID/RegisterToken
-    // 读取方式：扫描 INI 全部节名，把所有 [ServerN] 节按编号收集
-    // 支持手动编辑造成的影响：删掉中间一节、或编号有空洞（如 Server1+Server3 缺 Server2）
-    // 时，都能正确读到；然后检测到"数量/编号与 Count 不符"就自动重排为连续编号
-    // Server1..M 并回写 Count
     outCfg.servers.clear();
-    std::vector<std::pair<int, ServerEntry>> found;   // (节编号, 内容)，按编号排序
+    std::vector<std::pair<int, ServerEntry>> found;
 
     const std::vector<cfgstr> sections = IniSections(ini_path);
 
     for (const auto& sec : sections)
     {
         if (sec.compare(0, 6, CS("Server")) != 0)
-            continue;                       // 只要 [ServerN]
+            continue;
         const cfgstr num = sec.substr(6);
         if (num.empty() || num.find_first_not_of(CS("0123456789")) != cfgstr::npos)
-            continue;                       // 跳过 [Server] 主节等
+            continue;
         const int idx = CfgToInt(num, 0);
         if (idx <= 0)
             continue;
@@ -358,9 +326,6 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
         e.ServerPubKey = StripQuotes(IniGetStr(ini_path, sec, CS("ServerPubKey"), CS("")));
         e.managed = IniGetInt(ini_path, sec, CS("Managed"), 0) != 0;
 
-        // 传输方式：0=UDP（默认）1=TCP。
-        // 必须按字符串容错解析：手工把 ini 写成 "Transport=TCP" 时不能被静默当成 0，
-        // 否则用户以为切了 TCP、实际一直走 UDP，日志里连一句提示都没有。
         {
             const cfgstr tv = LowerAscii(IniGetStr(ini_path, sec, CS("Transport"), CS("")));
             if (tv.empty() || tv == CS("0") || tv == CS("udp") || tv == CS("false") || tv == CS("no"))
@@ -382,12 +347,10 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
             found.emplace_back(idx, std::move(e));
     }
 
-    // 按节编号升序排列（保持 config.ini 里的原始顺序）
     std::sort(found.begin(), found.end(),
               [](const std::pair<int, ServerEntry>& a, const std::pair<int, ServerEntry>& b)
               { return a.first < b.first; });
 
-    // 检测是否需要"连续重排"
     bool needRebuild = false;
     const int count = IniGetInt(ini_path, CS("Server"), CS("Count"), 0);
     if (static_cast<int>(found.size()) != count)
@@ -398,7 +361,7 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     {
         for (std::size_t i = 0; i < found.size(); ++i)
         {
-            if (found[i].first != static_cast<int>(i + 1))   // 期望 Server1..N 连续
+            if (found[i].first != static_cast<int>(i + 1))
             {
                 needRebuild = true;
                 break;
@@ -406,10 +369,8 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
         }
     }
 
-    // 需要重排：把有效 [ServerN] 连续重写为 Server1..M，并删除多余旧节
     if (needRebuild)
     {
-        // 先删掉所有现有 [ServerN] 节，避免旧节编号冲突
         for (const auto& sec : sections)
         {
             if (sec.compare(0, 6, CS("Server")) != 0)
@@ -419,7 +380,6 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
                 continue;
             IniDelSection(ini_path, sec);
         }
-        // 连续写回 Server1..M
         for (std::size_t i = 0; i < found.size(); ++i)
         {
             const cfgstr sec = CS("Server") + cfg_num(static_cast<long long>(i + 1));
@@ -438,7 +398,6 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
 
     for (auto& f : found)
         outCfg.servers.push_back(std::move(f.second));
-    // 向后兼容：没有 [ServerN] 节、但 [Server] 有真实主 IP 时，把它作为默认服务器
     if (outCfg.servers.empty() && !outCfg.ServerIP.empty())
     {
         ServerEntry e;
@@ -449,10 +408,6 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
         e.RegisterToken = outCfg.RegisterToken;
         outCfg.servers.push_back(std::move(e));
     }
-    // 主字段与 servers[0] 同步（默认/活动服务器）。
-    // 身份字段（ClientID/RegisterToken/ServerPubKey）一并同步：
-    // 否则直接 start()（未走 set_server()，如 AppBridge::start()）会
-    // "连对地址、用错身份"——ClientID/RegisterToken 仍是 [Identity] 默认值。
     if (!outCfg.servers.empty())
     {
         outCfg.ServerIP = outCfg.servers[0].ServerIP;
@@ -470,18 +425,16 @@ bool Config::LoadClientConfig(ClientConfig& outCfg)
     outCfg.Metric = static_cast<uint8_t>(
         IniGetInt(ini_path, CS("Network"), CS("Metric"), outCfg.Metric));
 
-    // [Routing] 分流配置（缺失时保持默认 full，旧配置文件无需迁移）
     outCfg.RoutingMode = IniGetStr(ini_path, CS("Routing"), CS("Mode"), outCfg.RoutingMode);
     outCfg.ChinaIPList = IniGetStr(ini_path, CS("Routing"), CS("ChinaIPList"), outCfg.ChinaIPList);
     outCfg.BypassSubnets = IniGetStr(ini_path, CS("Routing"), CS("BypassSubnets"), outCfg.BypassSubnets);
+    outCfg.IntranetSubnets = IniGetStr(ini_path, CS("Routing"), CS("IntranetSubnets"), outCfg.IntranetSubnets);
     outCfg.ProbeIP = IniGetStr(ini_path, CS("Routing"), CS("ProbeIP"), outCfg.ProbeIP);
 
-    // [Update]
     outCfg.UpdatePolicyURL = IniGetStr(ini_path, CS("Update"), CS("PolicyURL"), outCfg.UpdatePolicyURL);
     outCfg.UpdateSigURL = IniGetStr(ini_path, CS("Update"), CS("SigURL"), outCfg.UpdateSigURL);
     outCfg.ReleasePubKey = IniGetStr(ini_path, CS("Update"), CS("PublicKey"), outCfg.ReleasePubKey);
 
-    // [Service] 受管服务（缺失键保持默认 off，老配置无需迁移）
     outCfg.ServiceMode = IniGetStr(ini_path, CS("Service"), CS("Mode"), outCfg.ServiceMode);
     outCfg.ServiceURL = IniGetStr(ini_path, CS("Service"), CS("ServiceURL"), outCfg.ServiceURL);
     outCfg.ServicePubKey = IniGetStr(ini_path, CS("Service"), CS("PublicKey"), outCfg.ServicePubKey);
@@ -513,7 +466,6 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
 
     bool ok = true;
 
-    //多服务器列表：[Server] Count + [ServerN] 节（每台含各自身份）
     ok &= IniSetInt(ini_path, CS("Server"), CS("Count"), static_cast<int>(cfg.servers.size()));
     for (std::size_t i = 0; i < cfg.servers.size(); ++i)
     {
@@ -523,31 +475,27 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
         ok &= IniSetStr(ini_path, sec, CS("ServerIP"), e.ServerIP);
         ok &= IniSetInt(ini_path, sec, CS("ServerPort"), e.ServerPort);
         ok &= IniSetInt(ini_path, sec, CS("Transport"), e.transport);
-        // 每台服务器各自的认证身份 + 服务器公钥
         ok &= IniSetStr(ini_path, sec, CS("ClientID"), e.ClientID);
         ok &= IniSetStr(ini_path, sec, CS("RegisterToken"), e.RegisterToken);
         ok &= IniSetStr(ini_path, sec, CS("ServerPubKey"), e.ServerPubKey);
     }
 
-    //[Network]
     ok &= IniSetStr(ini_path, CS("Network"), CS("VirtualIP"), cfg.VirtualIP);
     ok &= IniSetInt(ini_path, CS("Network"), CS("VirtualPrefix"), cfg.VirtualPrefix);
     ok &= IniSetStr(ini_path, CS("Network"), CS("DNS"), cfg.DNS);
     ok &= IniSetInt(ini_path, CS("Network"), CS("MTU"), static_cast<int>(cfg.MTU));
     ok &= IniSetInt(ini_path, CS("Network"), CS("Metric"), cfg.Metric);
 
-    // [Routing]
     ok &= IniSetStr(ini_path, CS("Routing"), CS("Mode"), cfg.RoutingMode);
     ok &= IniSetStr(ini_path, CS("Routing"), CS("ChinaIPList"), cfg.ChinaIPList);
     ok &= IniSetStr(ini_path, CS("Routing"), CS("BypassSubnets"), cfg.BypassSubnets);
+    ok &= IniSetStr(ini_path, CS("Routing"), CS("IntranetSubnets"), cfg.IntranetSubnets);
     ok &= IniSetStr(ini_path, CS("Routing"), CS("ProbeIP"), cfg.ProbeIP);
 
-    // [Update]
     ok &= IniSetStr(ini_path, CS("Update"), CS("PolicyURL"), cfg.UpdatePolicyURL);
     ok &= IniSetStr(ini_path, CS("Update"), CS("SigURL"), cfg.UpdateSigURL);
     ok &= IniSetStr(ini_path, CS("Update"), CS("PublicKey"), cfg.ReleasePubKey);
 
-    // [Service]
     ok &= IniSetStr(ini_path, CS("Service"), CS("Mode"), cfg.ServiceMode);
     ok &= IniSetStr(ini_path, CS("Service"), CS("ServiceURL"), cfg.ServiceURL);
     ok &= IniSetStr(ini_path, CS("Service"), CS("PublicKey"), cfg.ServicePubKey);
@@ -560,15 +508,12 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
     ok &= IniSetStr(ini_path, CS("Service"), CS("UsedBytes"), cfg.ServiceUsedBytes);
     ok &= IniSetStr(ini_path, CS("Service"), CS("ManagedServers"), cfg.ServiceManagedServers);
 
-    // 多服务器模式下信息已由 [ServerN] 承载，主节/身份节的旧键清掉
     IniDelKey(ini_path, CS("Server"), CS("ServerIP"));
     IniDelKey(ini_path, CS("Server"), CS("DebugServerIP"));
     IniDelKey(ini_path, CS("Server"), CS("ServerPort"));
     IniDelKey(ini_path, CS("Identity"), CS("ClientID"));
     IniDelKey(ini_path, CS("Identity"), CS("RegisterToken"));
 
-    // 删除服务器后清理残留的旧 [ServerN] 节：
-    // 例如从 3 台删到 2 台，[Server3] 仍留在 ini 里，下次 Count 会拿到脏数据。
     {
         const std::vector<cfgstr> sections = IniSections(ini_path);
         const std::size_t maxOk = cfg.servers.size();
@@ -576,7 +521,6 @@ bool Config::SaveClientConfig(const ClientConfig& cfg)
         {
             if (sec.compare(0, 6, CS("Server")) != 0)
                 continue;
-            // 仅处理形如 Server<数字> 的节；跳过 Server 主节本身
             const cfgstr num = sec.substr(6);
             if (num.empty() || num.find_first_not_of(CS("0123456789")) != cfgstr::npos)
                 continue;

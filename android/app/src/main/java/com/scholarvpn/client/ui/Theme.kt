@@ -9,11 +9,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 
-/**
- * 品牌主题：靛紫配色（明/暗跟随系统），全局大圆角。
- * 不启用 Material You 动态取色——VPN 应用保持品牌一致性优先。
- */
-
 private val LightColors = lightColorScheme(
     primary = Color(0xFF4B54C8),
     onPrimary = Color(0xFFFFFFFF),

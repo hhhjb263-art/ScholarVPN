@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-ScholarVPN 假服务端（调试用）：完整走一遍三阶段握手，把手机发出的每一帧
-原始字节落盘，供与 C++ 实现逐字段比对。
-用法: python fake_server.py  （监听 127.0.0.1:4444，配合 adb reverse tcp:443 tcp:4444）
-"""
 import socket, struct, hmac, hashlib, os, sys, threading, time
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -32,7 +27,6 @@ def hkdf_expand(prk, info, n):
 
 def hdr(ver, t, plen, seq):
     return MAGIC + struct.pack(">BBHI", ver & 0xFF, t & 0xFF, plen, seq & 0xFFFFFFFF)
-    # 注意：version/type 相邻两个 uint8，用 >BB 打包；payload_len 用 >H（大端）
 
 def parse_hdr(b):
     if b[:4] != MAGIC: raise ValueError("magic 不匹配: %s" % b[:4].hex())
@@ -75,7 +69,6 @@ def main():
     c.settimeout(15)
 
     srv_seq = 0
-    # ---- 阶段1：auth_hello ----
     ver, t, plen, seq, payload, h = recv_frame(c)
     nonceC = payload
     log("[分析] auth_hello: nonceC=%s" % nonceC.hex())
@@ -84,21 +77,19 @@ def main():
     hello = nonceS + x_pub_raw + sig
     send_frame(c, T_SRV_HELLO, hello, srv_seq); srv_seq += 1
 
-    # ---- 阶段2：auth_client_hello（★ 关键比对点）----
     ver, t, plen, seq, payload, h = recv_frame(c)
     log("[分析] client_hello 帧头: ver=%d(期望2) type=%d(期望10) plen=%d(期望32) seq=%d" % (ver, t, plen, seq))
     dhCliPub = payload
     log("[分析] dhCliPub=%s" % dhCliPub.hex())
     shared = x_priv.exchange(X25519PublicKey.from_public_bytes(dhCliPub))
     log("[分析] shared=%s" % shared.hex())
-    prk = hmacsha(nonceC + nonceS, shared)          # HKDF-Extract(salt=nonceC||nonceS, ikm=shared)
-    key_s2c = hkdf_expand(prk, "rx", 32)            # 服务端发送
-    key_c2s = hkdf_expand(prk, "tx", 32)            # 服务端接收
+    prk = hmacsha(nonceC + nonceS, shared)
+    key_s2c = hkdf_expand(prk, "rx", 32)
+    key_c2s = hkdf_expand(prk, "tx", 32)
     log("[分析] key_s2c=%s" % key_s2c.hex())
     log("[分析] key_c2s=%s" % key_c2s.hex())
 
     aes_c2s = AESGCM(key_c2s)
-    # ---- 阶段3：identity（密文）----
     ver, t, plen, seq, payload, h = recv_frame(c)
     log("[分析] identity 帧: ver=%d type=%d plen=%d seq=%d" % (ver, t, plen, seq))
     nonce, ct = payload[:NONCE], payload[NONCE:]
@@ -121,20 +112,16 @@ def main():
         log("[分析]           idLen=%d clientId=%s" % (idlen, p[129:129+idlen].decode()))
         sig = p[129+idlen:]
         log("[分析]           sig=%s (%d 字节)" % (sig.hex()[:32] + "...", len(sig)))
-        # 用报文携带的 cliPub 验签（对齐服务端 handle_identity 第 3 步）
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
             Ed25519PublicKey.from_public_bytes(p[96:128]).verify(sig, p[:129+idlen])
             log("[分析] cli 签名验证: 通过")
         except Exception as e:
             log("[分析] cli 签名验证: 失败 %s" % e)
-        # 服务端重建 payload 时用的 client_id 是会话里的 clientId（登录模式）/
-        # 报文里的（注册模式）——对比见服务端 handle_identity
     except Exception as e:
         log("[分析] identity 解密失败: %s" % e)
         log("[分析] ★★★ 若走到这里，说明手机的会话密钥派生/封装与服务端不一致 ★★★")
 
-    # ---- 回 identity_ok，让手机走完握手（建立 tun 后立即停）----
     vip = bytes([10, 8, 0, 50]) + bytes([24])
     inner = bytes([T_ID_OK]) + vip
     nonce = os.urandom(NONCE)

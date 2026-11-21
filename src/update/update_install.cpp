@@ -58,11 +58,11 @@ std::string narrow_ansi(const wchar_t* s)
     return out;
 }
 
-} // namespace
+}
 
 bool install_package(const QString& pkgPath, QString& error)
 {
-    return launch_installer(pkgPath, error);   // Windows：Inno 静默派发
+    return launch_installer(pkgPath, error);
 }
 
 bool launch_installer(const QString& exePath, QString& error)
@@ -73,7 +73,6 @@ bool launch_installer(const QString& exePath, QString& error)
         return false;
     }
 
-    // 存在性先确认：否则 ShellExecute 会走"打开方式"对话框，用户看到的是怪异提示
     const DWORD attr = ::GetFileAttributesW(reinterpret_cast<const wchar_t*>(exePath.utf16()));
     if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
     {
@@ -81,8 +80,6 @@ bool launch_installer(const QString& exePath, QString& error)
         return false;
     }
 
-    // /CLOSEAPPLICATIONS：让 Inno 关掉仍占用文件的进程（含本程序）
-    // /NORESTART：绝不自动重启系统；/SUPPRESSMSGBOXES：静默失败不弹框
     const std::wstring file = exePath.toStdWString();
     const std::wstring params = L"/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS";
 
@@ -108,22 +105,18 @@ bool launch_installer(const QString& exePath, QString& error)
     return true;
 }
 
-} // namespace update
+}
 
-#else // ---------------------------- POSIX ----------------------------
+#else
 
 namespace update {
 
-// Linux 安装：tar.gz -> 解包 -> pkexec 执行 install-linux.sh
-// （polkit 弹认证框；安装脚本会把 vpn_client 装到 /opt/scholarvpn 并
-//   更新 /usr/local/bin 启动器与桌面入口——即「取代旧版」）。
-// 阻塞直到认证+安装完成（在下载线程里调用，GUI 只显示状态）。
 static bool install_tarball(const QString& pkgPath, QString& error)
 {
     const QFileInfo fi(pkgPath);
     const QString extractDir = fi.absolutePath() + QStringLiteral("/.scholarvpn-extract");
 
-    QDir(extractDir).removeRecursively();   // 清掉上次残留
+    QDir(extractDir).removeRecursively();
     if (!QDir().mkpath(extractDir))
     {
         error = QStringLiteral("无法创建解包目录");
@@ -146,8 +139,6 @@ static bool install_tarball(const QString& pkgPath, QString& error)
         return false;
     }
 
-    // pkexec：polkit 认证框（用户输入密码）——com.scholarvpn.client.policy
-    // 已随程序安装，认证框显示中文说明
     const int rc = QProcess::execute(QStringLiteral("pkexec"),
         {QStringLiteral("bash"), installSh, bin});
     QDir(extractDir).removeRecursively();
@@ -164,14 +155,12 @@ bool install_package(const QString& pkgPath, QString& error)
     return install_tarball(pkgPath, error);
 }
 
-bool launch_installer(const QString& /*exePath*/, QString& error)
+bool launch_installer(const QString&, QString& error)
 {
     error = QStringLiteral("Linux 使用 tar.gz 安装包（install_package 入口）");
     return false;
 }
 
-
-
-} // namespace update
+}
 
 #endif

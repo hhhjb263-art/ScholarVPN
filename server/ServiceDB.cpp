@@ -1,6 +1,3 @@
-// ============================================================================
-// server/ServiceDB.cpp —— 受管服务数据库访问（SQL 全部在本文件）
-// ============================================================================
 #include "ServiceDB.h"
 
 #include <sqlite3.h>
@@ -18,7 +15,7 @@ bool ServiceDB::open(const std::string& path)
         close();
         return false;
     }
-    sqlite3_busy_timeout(m_db, 3000);   // broker/webadmin 同库并发写
+    sqlite3_busy_timeout(m_db, 3000);
     char* err = nullptr;
     sqlite3_exec(m_db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, &err);
     sqlite3_free(err);
@@ -39,6 +36,7 @@ ServiceDB::~ServiceDB()
     close();
 }
 
+// 读取设备授权记录（状态/有效期/配额），服务端准入判定全部基于它
 TrialInfo ServiceDB::get_trial(const std::string& client_id)
 {
     TrialInfo t;
@@ -115,7 +113,6 @@ void ServiceDB::flush()
         }
     }
     for (const auto& kv : audit) {
-        // key = day \x1f client_id \x1f domain
         const size_t p1 = kv.first.find('\x1f');
         const size_t p2 = (p1 == std::string::npos) ? std::string::npos
                                                     : kv.first.find('\x1f', p1 + 1);
@@ -146,13 +143,12 @@ void ServiceDB::load_blacklist_locked()
 {
     const auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - m_blacklistAt).count() < 60)
-        return;   // 60s 内用缓存
+        return;
     m_blacklistAt = now;
     m_blacklist.clear();
     m_blIps.clear();
     m_blMachines.clear();
     sqlite3_stmt* st = nullptr;
-    // type 列是后加的（迁移默认 domain）——列不存在时按全域名处理
     if (sqlite3_prepare_v2(m_db,
                            "SELECT domain, type FROM blacklist"
                            " ORDER BY rowid LIMIT 100000",
@@ -188,10 +184,8 @@ bool ServiceDB::domain_blocked(const std::string& domain)
     load_blacklist_locked();
     if (m_blacklist.empty())
         return false;
-    // 空列表守卫只看域名类型；ip/machine 各自在自己入口判断
     if (m_blacklist.count(domain) != 0)
         return true;
-    // 子域后缀匹配：a.example.com 命中 example.com（通配与裸域语义一致）
     for (const auto& e : m_blacklist) {
         if (domain.size() > e.size() + 1 &&
             domain.compare(domain.size() - e.size(), e.size(), e) == 0 &&
@@ -215,6 +209,7 @@ bool ServiceDB::ip_blocked(std::uint32_t dst_host_order)
     return !m_blIps.empty() && m_blIps.count(ip) != 0;
 }
 
+// 机器黑名单拦截，优先于试用状态判断
 bool ServiceDB::machine_blocked(const std::string& client_id)
 {
     if (m_db == nullptr || client_id.empty())
@@ -224,11 +219,6 @@ bool ServiceDB::machine_blocked(const std::string& client_id)
     return !m_blMachines.empty() && m_blMachines.count(client_id) != 0;
 }
 
-// ---------------------------------------------------------------------------
-// 域名提取：DNS QNAME / TLS SNI（全部带边界检查，畸形即放弃）
-// ---------------------------------------------------------------------------
-
-// DNS QNAME：IHL → UDP 头（8）→ dst port 53 → 头 12 字节 → QDCOUNT>=1 → 标签序列
 static bool extract_dns_name(const unsigned char* pkt, size_t len,
                              size_t l4, std::string& out)
 {
@@ -245,7 +235,7 @@ static bool extract_dns_name(const unsigned char* pkt, size_t len,
         return false;
     size_t p = dns + 12;
     std::string name;
-    for (int guard = 0; guard < 16; ++guard) {   // 标签数上限，防畸形包打满循环
+    for (int guard = 0; guard < 16; ++guard) {
         if (p >= len)
             return false;
         const uint8_t l = pkt[p];
@@ -266,8 +256,6 @@ static bool extract_dns_name(const unsigned char* pkt, size_t len,
     return true;
 }
 
-// TLS SNI：TCP 载荷必须以 TLS 握手记录（0x16 0x03）开头且内层是 ClientHello(0x01)。
-// 应用数据记录（0x17）直接跳过——SNI 只出现在每条流的第一包。
 static bool extract_sni(const unsigned char* pkt, size_t len,
                         size_t l4, std::string& out)
 {
@@ -280,10 +268,9 @@ static bool extract_sni(const unsigned char* pkt, size_t len,
     const size_t tlen = len - (l4 + doff);
     if (tlen < 5 || t[0] != 0x16 || t[1] != 0x03)
         return false;
-    size_t hs = 5;   // TLS 记录头
+    size_t hs = 5;
     if (hs + 4 > tlen || t[hs] != 0x01)
-        return false;   // 非 ClientHello
-    // ClientHello：handshake_len(3) 后 = version(2) random(32) session_id...
+        return false;
     size_t p = hs + 4 + 2 + 32;
     if (p + 1 > tlen)
         return false;
@@ -308,8 +295,7 @@ static bool extract_sni(const unsigned char* pkt, size_t len,
         p += 4;
         if (el > extEnd - p)
             break;
-        if (et == 0x0000 && el >= 5) {   // server_name 扩展
-            // server_name_list: list_len(2) name_type(1)=0 host_len(2) host
+        if (et == 0x0000 && el >= 5) {
             if (t[p + 2] == 0) {
                 const uint16_t hl = static_cast<uint16_t>((t[p + 3] << 8) | t[p + 4]);
                 if (hl > 0 && el >= 5u + hl && p + 5 + hl <= extEnd) {
@@ -345,4 +331,4 @@ bool extract_domain(const unsigned char* pkt, size_t len, std::string& out)
     return false;
 }
 
-} // namespace service
+}

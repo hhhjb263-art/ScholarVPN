@@ -26,15 +26,12 @@ std::string trim(const std::string& s)
     return s.substr(b, e - b + 1);
 }
 
-// 服务公钥（SPKI DER 的 base64 单行）→ PEM（OpenSSL 只吃 PEM）
-// 与 AppBridge::check_update 对 config.ini ServerPubKey 的处理同语义
 std::string pubkey_b64_to_pem(const std::string& b64)
 {
     if (b64.find("BEGIN") != std::string::npos)
     {
-        return b64;   // 已是完整 PEM
+        return b64;
     }
-    // 重新按 64 列折行
     std::string compact;
     for (char c : b64)
     {
@@ -69,7 +66,6 @@ bool is_hex64(const std::string& s)
     return true;
 }
 
-// 名字统一小写后取头
 std::string header_get(const std::map<std::string, std::string>& headers,
                        const char* name)
 {
@@ -77,7 +73,7 @@ std::string header_get(const std::map<std::string, std::string>& headers,
     return (it == headers.end()) ? std::string() : it->second;
 }
 
-} // namespace
+}
 
 Credentials parse_credentials(const std::string& iniText)
 {
@@ -123,7 +119,6 @@ Credentials parse_credentials(const std::string& iniText)
     c.limit_kind = get("limit_kind");
     c.remaining = get_u64("remaining");
     c.used_bytes = get_u64("used_bytes");
-    // client_id 缺失 = broker 返回了不完整凭据，视为无效
     c.valid = !c.client_id.empty();
     if (!c.valid)
     {
@@ -137,7 +132,6 @@ Verdict evaluate(const Credentials& c, std::uint64_t nowUnix)
     Verdict v;
     if (!c.valid)
     {
-        // 拉不到/解析不了 ≠ 违规：放行（与更新系统"查不到→放行"同语义）
         v.blocked = false;
         v.reason = c.error.empty() ? "服务状态未知" : c.error;
         return v;
@@ -154,7 +148,6 @@ Verdict evaluate(const Credentials& c, std::uint64_t nowUnix)
         v.reason = "该设备的授权已被服务方取消，请联系服务方";
         return v;
     }
-    // 服务器已选定限制维度并算好剩余量：remaining=0 即超限（统一文案）
     if (!c.limit_kind.empty() && c.limit_kind != "none")
     {
         if (c.remaining == 0)
@@ -164,7 +157,6 @@ Verdict evaluate(const Credentials& c, std::uint64_t nowUnix)
         }
         return v;
     }
-    // 旧 broker 兼容：无新字段时按原始字段判定（文案统一）
     if (c.expire_at != 0 && nowUnix >= c.expire_at)
     {
         v.blocked = true;
@@ -184,7 +176,6 @@ Verdict evaluate(const Credentials& c, std::uint64_t nowUnix)
 bool verify_signature(const std::string& body, const std::string& sigBase64,
                       const std::string& pubKeyBase64)
 {
-    // base64 解码（签名是 64 字节 Ed25519；与 update_checker 同规则，容忍换行空白）
     std::vector<std::uint8_t> sig;
     {
         std::uint32_t buf = 0;
@@ -236,22 +227,17 @@ bool verify_signature(const std::string& body, const std::string& sigBase64,
 
 namespace {
 
-// 签名头缺失/验签失败统一报错文案：绝不使用未验签的内容
 Credentials checked_credentials(const update::FetchResult& r,
                                 const std::string& pubKeyBase64)
 {
     Credentials c;
     if (!r.ok)
     {
-        // broker 对未登记指纹返回 404 unknown fp——这不是故障，是「尚未申请试用」：
-        // 机器码规则升级/新设备首次使用都会走到这里。识别为空状态（非错误），
-        // UI 据此显示「尚未申请试用」并引导点「申请试用」，而不是吓人的网络失败。
         if (r.status == 404 && r.body.find("unknown fp") != std::string::npos)
         {
             c.error.clear();
             return c;
         }
-        // 429 = 触发同 IP 防刷限频（24h 上限）：给可执行的人话提示
         if (r.status == 429)
         {
             c.error = "申请过于频繁：同一 IP 24 小时内限 3 次，"
@@ -276,7 +262,7 @@ Credentials checked_credentials(const update::FetchResult& r,
     return c;
 }
 
-} // namespace
+}
 
 Credentials register_trial(const std::string& url, const std::string& pubKeyBase64,
                            const MachineInfo& info, int timeoutMs)
@@ -290,7 +276,6 @@ Credentials register_trial(const std::string& url, const std::string& pubKeyBase
     {
         q += '&';
     }
-    // 查询参数只含非隐私硬件事实与哈希；percent 编码最简手写（空格/保留字）
     auto enc = [](const std::string& s) {
         std::string out;
         char b[4];
@@ -314,7 +299,7 @@ Credentials register_trial(const std::string& url, const std::string& pubKeyBase
     q += "&ram=" + std::to_string(info.ram_mb);
     if (!info.mac_hash.empty())
     {
-        q += "&mac=" + enc(info.mac_hash);   // 已是哈希，非明文 MAC
+        q += "&mac=" + enc(info.mac_hash);
     }
     return checked_credentials(update::fetch_text(q, timeoutMs), pubKeyBase64);
 }
@@ -338,7 +323,6 @@ bool split_addr(const std::string& addr, std::string& ip, int& port)
     {
         return false;
     }
-    // 简单 IPv4/域名校验：非空且无空白
     if (ip.empty() || ip.find(' ') != std::string::npos)
     {
         return false;
@@ -374,7 +358,6 @@ std::vector<ManagedServer> fetch_server_list(const std::string& listUrl,
         return {};
     }
 
-    // 解析：serverN / pubkeyN / remarkN
     std::map<int, ManagedServer> byIdx;
     std::size_t pos = 0;
     while (pos <= ini.body.size())
@@ -397,7 +380,6 @@ std::vector<ManagedServer> fetch_server_list(const std::string& listUrl,
         }
         const std::string key = trim(line.substr(0, eq));
         const std::string val = trim(line.substr(eq + 1));
-        // key 形如 server1 / pubkey2 / remark3
         std::size_t i = 0;
         while (i < key.size() && !std::isdigit(static_cast<unsigned char>(key[i])))
         {
@@ -435,7 +417,7 @@ std::vector<ManagedServer> fetch_server_list(const std::string& listUrl,
         int port = 0;
         if (srv.addr.empty() || !split_addr(srv.addr, ip, port))
         {
-            continue;   // 坏行跳过，不让一条脏数据废掉整份列表
+            continue;
         }
         out.push_back(srv);
     }
@@ -446,4 +428,4 @@ std::vector<ManagedServer> fetch_server_list(const std::string& listUrl,
     return out;
 }
 
-} // namespace service
+}

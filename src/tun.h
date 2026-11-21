@@ -6,10 +6,6 @@
 #if defined(_WIN32)
 
 #include "wintun.h"
-/*
-*	使用 wintun.h 官方声明的函数类型。
-	详见third_party/wintun-0.14.1/wintun/include/wintun.h源码
-*/
 class WintunTun : public ITunDevice {
 public:
 	WintunTun() = default;
@@ -25,8 +21,6 @@ public:
 	tun_id_t get_interface_id() const override;
 	bool is_ready() const override;
 	uint64_t receive_count() const;
-	// 读等待事件句柄（WintunGetReadWaitEvent）：环形缓冲空时 WaitForSingleObject
-	// 等它，有包到达立即唤醒——替代读循环固定 sleep 轮询；不可用时返回 nullptr
 	tun_event_t read_wait_event() const override;
 protected:
 	void cleanup_resource() override;
@@ -34,7 +28,7 @@ private:
 	bool load_wintun_api();
 	bool open_or_create_adapter(const std::wstring& TunName, const std::wstring& tunnelType);
 	bool fetch_adapter_luid();
-	void reset_api_pointers() noexcept; // 无需抛出异常
+	void reset_api_pointers() noexcept;
 private:
 	HMODULE m_hDll = nullptr;
 	WINTUN_ADAPTER_HANDLE m_hAdapter = nullptr;
@@ -58,19 +52,11 @@ private:
 	mutable std::atomic<uint64_t> m_recv_count{ 0 };
 };
 
-#else // ---------------------------- Linux ----------------------------
+#else
 
 #include <string>
 #include <vector>
 
-// ============================================================================
-// Linux：/dev/net/tun + ioctl(TUNSETIFF, IFF_TUN | IFF_NO_PI)
-//
-//   - IFF_NO_PI：内核不追加 4 字节协议头，读到的就是裸 IP 包（与 Wintun 一致）
-//   - 非阻塞 fd + poll()：读循环无包时等 fd（read_wait_event 直接返回 fd）
-//   - 设备随 fd 关闭自动消失：不像 Wintun 是持久适配器，但"重连换 IP"仍需
-//     显式 flush 地址（见 AdapterConfigLinux::clear_IPv4_addresses）
-// ============================================================================
 class LinuxTun : public ITunDevice {
 public:
 	LinuxTun() = default;
@@ -98,5 +84,4 @@ private:
 
 #endif
 
-// 平台工厂：ClientApp 只认这个，不再直接写 WintunTun / LinuxTun
 std::unique_ptr<ITunDevice> create_tun_device();

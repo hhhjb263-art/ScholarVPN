@@ -1,12 +1,3 @@
-// ============================================================================
-// AdminWire.h —— 中转通道的极简线协议（vpn_controller ↔ admin_agent）
-// ----------------------------------------------------------------------------
-// 帧格式：[4 字节大端长度][JSON 载荷]，单帧上限 64KB。
-// 只处理"扁平对象、值为字符串或整数"的 JSON——通道消息全是这个形状，
-// 因此不引入任何 JSON 库，与项目零依赖风格一致（计划书 3.5）。
-// 传输：支持明文 TCP（兼容旧部署）与 OpenSSL TLS（生产推荐）。
-//       TLS 只负责传输层认证/加密；agent 的 Ed25519 指纹白名单准入不变。
-// ============================================================================
 #pragma once
 
 #include <algorithm>
@@ -14,7 +5,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdint>
-#include <cstdlib>     // strtoll
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -33,10 +24,9 @@
 
 namespace wire {
 
-constexpr size_t kMaxFrame = 64 * 1024;   // 单帧上限：装得下 1000 个令牌的 JSON
-constexpr int    kTimeoutMs = 5000;       // 收发默认超时
+constexpr size_t kMaxFrame = 64 * 1024;
+constexpr int kTimeoutMs = 5000;
 
-// ---------------------------------------------------------------- JSON 生成
 inline std::string escape(const std::string& s)
 {
     std::string out;
@@ -54,7 +44,6 @@ inline std::string escape(const std::string& s)
     return out;
 }
 
-// 极简构造器：wire::Json().str("type","hello").num("id",1).done()
 class Json {
 public:
     Json& str(const std::string& k, const std::string& v)
@@ -77,8 +66,6 @@ private:
     bool first_ = true;
 };
 
-// ---------------------------------------------------------------- JSON 解析
-// 定位 "key" 冒号之后的第一个非空白字符；找不到返回 npos
 inline size_t find_value(const std::string& obj, const std::string& key)
 {
     const std::string pat = "\"" + key + "\"";
@@ -93,7 +80,6 @@ inline size_t find_value(const std::string& obj, const std::string& key)
     return i;
 }
 
-// 取字符串字段（值须为 "..."，含转义还原）。成功返回 true。
 inline bool get_string(const std::string& obj, const std::string& key, std::string& out)
 {
     size_t i = find_value(obj, key);
@@ -112,16 +98,15 @@ inline bool get_string(const std::string& obj, const std::string& key, std::stri
                 case '"':  v += '"';  break;
                 case '\\': v += '\\'; break;
                 case '/':  v += '/';  break;
-                default:   v += e;    break;   // 其他转义原样保留
+                default: v += e; break;
             }
         } else {
             v += c;
         }
     }
-    return false;   // 引号没闭合
+    return false;
 }
 
-// 取整数字段。成功返回 true。
 inline bool get_int(const std::string& obj, const std::string& key, long long& out)
 {
     const size_t i = find_value(obj, key);
@@ -133,8 +118,6 @@ inline bool get_int(const std::string& obj, const std::string& key, long long& o
     return true;
 }
 
-// ---------------------------------------------------------------- 分帧
-// 写一帧（阻塞、处理部分写）。@return false = 连接已坏
 inline bool send_frame(int fd, const std::string& payload)
 {
     if (payload.size() > kMaxFrame) return false;
@@ -158,19 +141,17 @@ inline bool send_frame(int fd, const std::string& payload)
     return true;
 }
 
-// 读缓冲：把 recv 到的字节喂进来，按 4 字节长度前缀逐帧取出
 class Framer {
 public:
     void feed(const char* data, size_t n) { buf_.append(data, n); }
 
-    // 缓冲里凑齐一帧则取到 out 并返回 true；否则返回 false（继续喂）
     bool next(std::string& out)
     {
         if (buf_.size() < 4) return false;
         const uint8_t* h = reinterpret_cast<const uint8_t*>(buf_.data());
         const uint32_t len = (uint32_t(h[0]) << 24) | (uint32_t(h[1]) << 16) |
                              (uint32_t(h[2]) << 8)  |  uint32_t(h[3]);
-        if (len > kMaxFrame) { bad_ = true; return false; }   // 超限：调用方应断开
+        if (len > kMaxFrame) { bad_ = true; return false; }
         if (buf_.size() < 4 + len) return false;
         out.assign(buf_, 4, len);
         buf_.erase(0, 4 + len);
@@ -184,8 +165,6 @@ private:
     bool bad_ = false;
 };
 
-// ---------------------------------------------------------------- TLS 上下文
-// 只用 OpenSSL 的公开 API；不实现任何密码学算法、不生成证书。
 inline std::string tls_error()
 {
     std::string out;
@@ -199,7 +178,6 @@ inline std::string tls_error()
     return out.empty() ? std::string("unknown TLS error") : out;
 }
 
-// 服务端证书/私钥（PEM）。cert 用 fullchain.pem，key 用 privkey.pem。
 inline SSL_CTX* make_server_ctx(const std::string& cert, const std::string& key,
                                 std::string& err)
 {
@@ -225,8 +203,6 @@ inline SSL_CTX* make_server_ctx(const std::string& cert, const std::string& key,
     return ctx;
 }
 
-// 客户端信任根：ca_file 非空时只信任该 PEM（自签/私有 CA 用）；
-// 为空时使用系统 CA 仓库（Let's Encrypt 等公共 CA 用）。
 inline SSL_CTX* make_client_ctx(const std::string& ca_file, std::string& err)
 {
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
@@ -249,9 +225,6 @@ inline SSL_CTX* make_client_ctx(const std::string& ca_file, std::string& err)
     return ctx;
 }
 
-// ---------------------------------------------------------------- 连接（TCP / TLS）
-// 一个连接对象同时支持明文 TCP 与 TLS。socket 全程非阻塞：
-// 超时由每次 poll 的 deadline 控制，避免慢对端把管理线程卡死。
 class Conn {
 public:
     Conn() = default;
@@ -278,21 +251,17 @@ public:
     int fd() const { return fd_; }
     bool is_tls() const { return ssl_ != nullptr; }
 
-    // 接管一个已 accept 的 fd（所有权转移给 Conn）
     void adopt_fd(int fd)
     {
         close();
         fd_ = fd;
     }
 
-    // 域名/IP 解析 + 非阻塞 connect。失败时 err 给出可读原因。
     bool connect_tcp(const std::string& host, uint16_t port, int timeout_ms,
                      std::string& err)
     {
         close();
         addrinfo hints{};
-        // 服务端（vpn_controller/admin_server）只监听 AF_INET；
-        // 这里强制 IPv4，避免双栈域名先解析到不可达的 IPv6 时把 5s 超时耗光。
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
@@ -359,8 +328,6 @@ public:
         return false;
     }
 
-    // TLS 客户端握手：校验证书链 + 主机名/IP（SSL_VERIFY_PEER）。
-    // server_name 是证书里的名字（通常是域名），不是连接地址。
     bool enable_tls_client(SSL_CTX* ctx, const std::string& server_name,
                            int timeout_ms, std::string& err)
     {
@@ -431,8 +398,6 @@ public:
         return true;
     }
 
-    // TLS 服务端握手（证书由 SSL_CTX 提供；不要求客户端证书，
-    // agent 身份仍由现有的 Ed25519 challenge/hello 白名单校验）。
     bool enable_tls_server(SSL_CTX* ctx, int timeout_ms, std::string& err)
     {
         if (fd_ < 0 || ctx == nullptr) { err = "TLS 配置无效"; return false; }
@@ -484,7 +449,6 @@ public:
                send_all(payload.data(), payload.size(), kTimeoutMs);
     }
 
-    // 收一帧：1=完整帧 0=超时 -1=连接坏（语义与下方 int fd 兼容接口一致）
     int recv_frame(Framer& fr, std::string& frame, int timeout_ms)
     {
         if (fd_ < 0) return -1;
@@ -540,7 +504,7 @@ public:
     void close()
     {
         if (ssl_ != nullptr) {
-            SSL_shutdown(ssl_);      // 尽力发送 close_notify；非阻塞，失败不重试
+            SSL_shutdown(ssl_);
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
@@ -558,7 +522,6 @@ private:
         return d > 0 ? static_cast<int>(d) : 0;
     }
 
-    // @return >0=就绪 0=超时 <0=错误
     int wait_fd(int fd, short events, int timeout_ms)
     {
         pollfd p{};
@@ -620,13 +583,6 @@ private:
     SSL* ssl_ = nullptr;
 };
 
-// ---------------------------------------------------------------- 收帧
-// 收一帧：1=取到完整帧 0=timeout_ms 内没凑齐 -1=连接坏。
-// 必须循环读而不是单次 recv：send_frame 的长度头(4B)与载荷是两个 send，
-// TCP 可能分两段到达——只拿到半帧时不能当成连接故障，否则握手会随
-// 分片时序随机失败（表现为 agent 连上瞬间断开、退避重连的死循环）。
-// 另外对端"发完就关"（reject 后 close）时 revents 会带 POLLHUP：
-// 不能见 HUP 就返回 -1，要把已到达的字节读出来；recv 返回 0 才算断开。
 inline int recv_frame(int fd, Framer& fr, std::string& frame, int timeout_ms)
 {
     if (fr.next(frame)) return 1;
@@ -650,7 +606,7 @@ inline int recv_frame(int fd, Framer& fr, std::string& frame, int timeout_ms)
 
         char buf[4096];
         const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n == 0) return -1;   // 对端关闭（缓冲数据已读完）
+        if (n == 0) return -1;
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             return -1;
@@ -661,4 +617,4 @@ inline int recv_frame(int fd, Framer& fr, std::string& frame, int timeout_ms)
     }
 }
 
-}  // namespace wire
+}

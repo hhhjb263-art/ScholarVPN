@@ -1,6 +1,15 @@
 # ScholarVPN
 
-自研 UDP/TCP 双传输隧道 + 三阶段身份认证的教学级 VPN 实现。Windows / Linux 客户端共用同一套 Qt 界面，服务端为 Linux。
+自研 UDP/TCP 双传输隧道 + 三阶段身份认证。Windows / Linux 桌面端共用同一套 Qt 界面，移动端为 Android（Kotlin + Jetpack Compose），服务端为 Linux。
+
+当前版本：**1.7.1**
+
+| 端 | 技术栈 | 说明 |
+|---|---|---|
+| Windows | C++20 + Qt 6 + Wintun | 需管理员权限建网卡 / 改路由 |
+| Linux | C++17 + Qt 6 + `/dev/net/tun` | 通过 `pkexec` 提权 |
+| Android | Kotlin + Compose + `VpnService` | minSdk 29 / targetSdk 35 |
+| 服务端 | C++17 + epoll（TCP）+ TUN | Linux，同端口 UDP/TCP 双栈 |
 
 ---
 
@@ -16,29 +25,58 @@
 
 > 若无法确保使用方式合法合规，请勿使用本项目。
 
+## 功能特性
+
+- **双传输**：UDP 为主，运营商丢 UDP 时可切 TCP（服务端同端口双栈，一个端口同时服务两种传输）；
+- **三阶段认证**：服务器身份签名（防中间人）→ X25519 密钥交换 → 客户端身份准入（注册 / 登录）；
+- **流量分流**：`full`（全流量走隧道）/ `split`（国内直连、其余走隧道）/ `intranet`（只有指定内网网段走隧道）；
+- **内网访问**：客户端只把 `192.168.x` 等指定网段送进隧道，其余照常走本地网络；服务端按白名单强控；
+- **多服务器**：配置文件内多张卡片，GUI 内切换，断线自动重连（指数退避）；
+- **DNS 防泄漏**：隧道建立后接管系统 DNS，断开时还原；分流模式下国内域名走国内上游；
+- **应用内更新**：更新策略由**后台托管**（受管模式自动从 `{ServiceURL}/svc/update-policy.ini` 拉取），
+  清单 Ed25519 验签 + 安装包 SHA-256 校验，支持提示 / 强制更新；
+- **受管授权**（可选，默认关闭）：客户端可自动领取试用凭据与服务器列表，由服务端统一发号与计费；
+- **用户协议门禁**：首次启动全屏展示，勾选同意后方可使用。
+
 ## 架构
 
 ![架构：客户端 ↔ 服务端双传输与三阶段认证](docs/images/architecture.svg)
 
-客户端创建虚拟网卡（**Windows 用 Wintun，Linux 用 `/dev/net/tun`**），把本机流量封装进自定义报文发往服务器；服务端从 TUN 转发到真实网络，回程反向封装。默认 UDP，运营商丢 UDP 时可切换 TCP（服务端同端口双栈，`--transport` 控制）。
+客户端创建虚拟网卡，把本机流量封装进自定义报文发往服务器；服务端从 TUN 转发到真实网络，回程反向封装。默认 UDP，需要时切换 TCP（服务端 `--transport` 控制）。
 
 客户端传输层以 `UDP` 为基类（认证 / AES-256-GCM / 心跳 / 队列全在基类），`TCP` 子类只覆写建连、发送、分帧接收三个钩子与协议版本字节（`v_udp=1` / `v_tcp=2`，错传报文在版本校验处丢弃）。全程非阻塞 socket + poll，无 sleep 轮询；服务端 TCP 为单线程 epoll。
 
-GUI 与业务逻辑两端完全共用，平台差异收敛在 `src/platform/` 与各文件的 `#if defined(_WIN32)` 分支：
+平台差异收敛在 `src/platform/` 与各文件的 `#if defined(_WIN32)` 分支，Android 完全独立实现同一套线协议：
 
-| 关注点 | Windows | Linux |
-|---|---|---|
-| 虚拟网卡 | Wintun（持久适配器） | `/dev/net/tun` + `IFF_TUN\|IFF_NO_PI` |
-| 地址 / 路由 | IP Helper + `netsh` | `ip addr` / `ip route`（默认路由用 `0.0.0.0/1` + `128.0.0.0/1` 拆分，不覆盖系统 default） |
-| DNS 防泄漏 | 备份非 TUN 网卡 DNS + 黑洞 | 优先 `resolvectl`，否则备份并改写 `/etc/resolv.conf` |
-| 身份私钥 | DPAPI 加密 | 明文 + `0600` 权限 |
+| 关注点 | Windows | Linux | Android |
+|---|---|---|---|
+| 虚拟网卡 | Wintun（持久适配器） | `/dev/net/tun` + `IFF_TUN\|IFF_NO_PI` | `VpnService.Builder` |
+| 地址 / 路由 | IP Helper + `netsh` | `ip addr` / `ip route`（`0.0.0.0/1` + `128.0.0.0/1` 拆分） | `addAddress` / `addRoute` 由系统托管 |
+| DNS 防泄漏 | 备份非 TUN 网卡 DNS + 黑洞 | 优先 `resolvectl`，否则改写 `/etc/resolv.conf` | `addDnsServer` + 路由强制走隧道 |
+| 身份私钥 | DPAPI 加密 | 明文 + `0600` 权限 | Keystore 主密钥 + EncryptedSharedPreferences |
+
+## 仓库结构
+
+```
+src/            客户端共享代码（GUI、传输、路由、DNS、更新、受管服务）
+server/         服务端（传输层、TUN 转发、授权库、管理通道）
+android/        Android 客户端
+tests/          各模块测试与诊断工具
+scripts/        版本号同步、分流数据生成、Linux 安装脚本
+docs/           架构图、协议说明、部署文档；routing/ 下是分流网段数据
+third_party/    内置依赖（OpenSSL、Wintun）
+```
+
+> **后台管理面板与发号后端不在本仓库。** 它们部署在服务器本地（`/opt`），已在 `.gitignore` 中排除，
+> 本仓库只包含客户端与服务端的数据面实现。仓库里的 `tools/` 仅保留辅助脚本。
 
 ## 协议与加密
 
 - **双传输**：自定义报文头（魔数 / 版本 / 类型 / 序号），版本字节即传输标识；线格式属实现细节，不展开；
-- **三阶段认证**：服务器身份签名校验（防中间人）+ 客户端身份准入（注册/登录）；**认证通过前服务端不转发任何流量**；
-- **加密**：OpenSSL 标准算法，会话密钥支持前向安全，数据面 AES-256-GCM；
-- **心跳保活**：周期心跳，失联自动重连（指数退避）。
+- **三阶段认证**：服务器身份签名校验 + 客户端身份准入；**认证通过前服务端不转发任何流量**；
+- **加密**：OpenSSL 标准算法（X25519 + HKDF 派生双向会话密钥），数据面 AES-256-GCM，支持前向安全；
+- **重放防护**：收端滑动窗口，未通过 GCM 验证的报文不推进窗口；
+- **心跳保活**：周期心跳，失联自动重连。
 
 ## 配置
 
@@ -72,9 +110,23 @@ VirtualPrefix=24
 DNS=8.8.8.8,1.1.1.1
 MTU=1400
 Metric=5
+
+[Routing]
+Mode=full                  # full | split | intranet
+ChinaIPList=builtin        # builtin=用 exe 同目录的 chnroute.txt（构建时自动拷贝）
+IntranetSubnets=           # intranet 模式：经隧道访问的网段，逗号分隔，如 192.168.10.0/24
+BypassSubnets=             # split 模式：额外不走隧道的网段（当前版本保留字段）
+
+[Update]
+PolicyURL=                 # 更新策略地址，留空则不检查更新
+
+[Service]
+Mode=off                   # off=手工填服务器  managed=自动领取凭据与服务器列表
 ```
 
 > 多服务器按 `[ServerN]` 连接；**Debug** 构建在无任何 `[ServerN]` 时回退到 `192.168.1.12`（本地测试），**Release** 回退为空。
+>
+> `split` 模式下 DNS 默认使用国内上游（`223.5.5.5` / `119.29.29.29`），避免隧道异常时全量断网；GUI 底部的「全局」/「智能分流」按钮可直接切换（连接中不可切换）。分流网段数据在 `docs/routing/chnroute.txt`，构建时自动拷到输出目录。
 
 ## 依赖
 
@@ -96,7 +148,13 @@ Metric=5
 | 内核 TUN | `/dev/net/tun`（容器需 `--device /dev/net/tun`） |
 | iproute2 + polkit | 路由操作用 `ip`；桌面提权用 `pkexec` |
 
-> Linux 端不使用 `third_party/` 的预编译产物，全部链接系统库。
+**Android**
+
+| 依赖 | 说明 |
+|---|---|
+| Android SDK 35 + Build Tools | `minSdk 29` |
+| JDK 17 + Gradle Wrapper | 仓库自带 `gradlew` |
+| AndroidX（Compose、Security-Crypto） | 依赖由 Gradle 自动下载 |
 
 **服务端（Linux）**：CMake ≥ 3.16 + C++17 编译器、pthread、OpenSSL（X25519 / HKDF / AES-256-GCM）。
 
@@ -106,7 +164,7 @@ Metric=5
 
 ### 客户端（Windows）
 
-用 VS 2022 打开 `VPN_.sln`，选 x64 + Debug/Release 生成即可；构建后自动拷贝 `libcrypto-3-x64.dll`、`wintun.dll`、`style.qss`、Qt6 DLL 与 `platforms` 插件到输出目录。命令行：
+用 VS 2022 打开 `VPN_.sln`，选 x64 + Debug/Release 生成即可；构建后自动拷贝 `libcrypto-3-x64.dll`、`wintun.dll`、`style.qss`、`chnroute.txt`、Qt6 DLL 与 `platforms` 插件到输出目录。命令行：
 
 ```powershell
 msbuild VPN_.sln /p:Configuration=Debug /p:Platform=x64
@@ -132,6 +190,15 @@ sudo ./scripts/linux/install-linux.sh build-client/vpn_client
 
 > GNOME Wayland 下 root 进程连不上 wayland compositor，必须走 XWayland（`QT_QPA_PLATFORM=xcb` + Mutter 的 XWayland cookie）；启动器 `scripts/linux/scholarvpn-gui` 已自动处理。无 polkit 的发行版直接 `sudo` 运行。
 
+### Android
+
+```bash
+cd android
+./gradlew :app:assembleRelease      # 产物：app/build/outputs/apk/release/
+```
+
+签名读取 `android/keystore.properties`（`storeFile` / `storePassword` / `keyAlias` / `keyPassword`）；文件缺失时自动回退 debug 签名。
+
 ### 服务端（Linux）
 
 ```bash
@@ -140,7 +207,7 @@ cmake -S . -B build && cmake --build build
 sudo ./build/vpn_server -a 10.8.0.1 -p 51820
 ```
 
-常用参数：`-a/--addr`（隧道内网 IP）、`-p/--port`、`--max-clients`（默认 64，自动分配虚拟 IP）、`--transport both|udp|tcp`（默认 both 双栈）、`-k/--key`（默认 `keys/server_sig.key`）、`-g/--gen-token [n]`（生成一次性注册令牌）、`--quiet`。
+常用参数：`-l/--listen`、`-a/--addr`（隧道内网 IP）、`-p/--port`、`-n/--name`（TUN 网卡名）、`--prefix`、`--mtu`、`--max-clients`（默认 64）、`--transport both|udp|tcp`（默认双栈）、`-k/--key`、`-g/--gen-token [n]`（生成一次性注册令牌）、`--default-route`、`--quiet`。
 
 **一键部署**（兼容 Debian/Ubuntu/CentOS/RHEL/Fedora/Arch/OpenWrt，自动选 iptables / nftables 并放行端口）：
 
@@ -152,7 +219,7 @@ sudo ./start.sh install    # 装 systemd 服务（推荐）
 sudo ./start.sh status|logs|doctor|uninstall
 ```
 
-关键项可用环境变量覆盖：`TUN_IP`、`TUN_PREFIX`、`TUN_MTU`、`VPN_PORT`、`LISTEN_IP`、`KEY_PATH`、`MAX_CLIENTS`、`QUIET`。`install` 会把当前配置固化到 `/etc/default/vpn-server`，改完 `systemctl restart vpn-server` 生效。日志按天轮转在 `logs/`。
+关键项可用环境变量覆盖：`TUN_IP`、`TUN_PREFIX`、`TUN_MTU`、`VPN_PORT`、`LISTEN_IP`、`KEY_PATH`、`MAX_CLIENTS`、`TRANSPORT`、`QUIET`、`INTRANET_ALLOW`、`INTRANET_ENFORCE`。`install` 会把当前配置固化到 `/etc/default/vpn-server`，改完 `systemctl restart vpn-server` 生效。日志按天轮转在 `logs/`。
 
 首次启动自动生成 `keys/server_sig.key` / `server_sig.pub`，把公钥硬编码进客户端 `kServerSigPubPem`（防中间人）。密钥与准入数据库说明见 `server/keys/README.txt`。
 
@@ -166,13 +233,26 @@ sudo ./build/vpn_server -a 10.8.0.1 -p 51820 --max-clients 100
 
 服务端按 **Session** 隔离每个客户端（源 IP+端口），认证后自动分配虚拟 IP；**同一 Ed25519 公钥重复登录会踢掉旧会话**；`--max-clients` 限制并发，未认证/失联会话按超时清理。
 
-### 身份认证与注册
+## 身份认证与注册
+
+客户端身份是本机生成的 Ed25519 密钥（不是 `ClientID` 字符串）。服务端只认公钥：
 
 ```bash
 sudo ./build/vpn_server --gen-token 5      # 输出 register_token: <64位hex>，写入 keys/register_tokens.txt
 ```
 
-客户端把令牌填入服务器的 **RegisterToken** 字段后首次连接即完成注册（令牌一次性，成功后自动清空转登录模式）；已注册公钥存 `keys/registered_clients.txt`。**私钥/令牌/注册表不得提交 Git**（`keys/*` 已忽略）。
+客户端把令牌填入服务器的 **RegisterToken** 字段后首次连接即完成注册，服务端把公钥写入 `keys/registered_clients.txt`；令牌一次性，成功后客户端自动清空并转为登录模式。
+
+**两种准入口径**：
+
+| 模式 | 行为 |
+|---|---|
+| 自助试用 | 客户端自动领取令牌，首次连接即注册，受有效期 / 配额约束 |
+| 人工审批 | 管理员在后台通过后，客户端下次同步自动领到注册令牌并完成注册 |
+
+> 私钥 / 令牌 / 注册表**不得提交 Git**（`keys/*` 已忽略）。
+>
+> 若客户端提示 `身份未注册`，说明公钥尚未写入服务端登记表：让客户端重新同步一次（或在 GUI 点「申请」）即可自动补注册。
 
 ## 使用
 
@@ -184,7 +264,9 @@ sudo ./build/vpn_server --gen-token 5      # 输出 register_token: <64位hex>�
 
 **Linux**：从应用菜单启动（首次弹一次 `pkexec` 认证）或 `sudo ./build-client/vpn_client`。密钥在 `~/.config/scholarvpn/keys/`，`client.id.enc` 权限 `0600`。
 
-> 两端 `keys/` 独立：双系统会被服务端视为**两台设备**，需各自注册。
+**Android**：安装 APK 后首次启动会弹出用户协议，勾选同意后方可使用；随后按「+」添加服务器，或开启受管模式自动获取。
+
+> 三端 `keys/` 各自独立：同一台机器装双系统会被服务端视为**两台设备**，需分别注册。
 
 ### 添加服务器
 
@@ -206,13 +288,81 @@ sudo ./build/vpn_server --gen-token 5      # 输出 register_token: <64位hex>�
 - 底部「⇄ Switch Server」展开服务器列表，点任一卡片即切换（连接中需先断开）；
 - 卡片右上「编辑」可改字段并写回 `config.ini`，编辑窗口内「删除」二次确认后移除。
 
+### Android 端差异
+
+- 打开应用即自动同步凭据与服务器列表（无需手动点按钮），取到后点「连接」即可；
+- 隧道内 DNS 固定 `8.8.8.8` / `1.1.1.1`，并由系统路由强制走隧道；
+- 支持系统「始终开启的 VPN」：断开会立即被系统拉起，需到系统设置里关闭该选项才能真正停止。
+
+## 内网访问
+
+把隧道当作进入某个私有网络的入口：**只有指定网段走隧道，其余流量照常走本地网络**（不是全局代理）。
+适合"从外网访问公司/家里的 NAS、路由器、内网服务器"这类场景。
+
+### 客户端
+
+| 端 | 配置方式 |
+|---|---|
+| Windows / Linux | GUI 底部点「内网访问」，填入网段（逗号分隔）后自动切换；也可直接改 `config.ini` |
+| Android | 「编辑服务器」→ 高级选项 → 「内网网段」填写后保存 |
+
+```ini
+[Routing]
+Mode=intranet
+IntranetSubnets=192.168.10.0/24,10.20.0.0/16
+```
+
+行为约定：
+
+- **仅自建服务器可用**：卡片若由服务方下发（受管），客户端禁用内网模式并按全局模式连接，
+  Android 上该输入框直接不显示——内网访问不向第三方申请的设备开放；
+- 只把 `IntranetSubnets` 里的网段指向隧道，**不接管默认路由**，其余流量（含公网）仍走物理网卡；
+- **不修改系统 DNS**，公网解析不受影响（内网域名需自行配置内网 DNS，或用 IP 直接访问）；
+- 网段填错或为空时不注入任何路由（失败即关闭，不会退化成全局代理）；
+- 拒绝 `0.0.0.0/0`——那等于全局代理，请用 `full` 模式。
+
+### 服务端
+
+服务端必须能把流量送到目标内网，并显式放行：
+
+```bash
+# 只允许客户端访问这两个私网段，其余私网目的地址一律丢弃（默认行为）
+sudo INTRANET_ALLOW="192.168.10.0/24,10.20.0.0/16" ./start.sh
+
+# 安装为服务时固化到 /etc/default/vpn-server
+sudo INTRANET_ALLOW="192.168.10.0/24" ./start.sh install
+```
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `INTRANET_ALLOW` | 空 | 允许客户端访问的私网网段，逗号分隔；为空表示不允许任何私网 |
+| `INTRANET_ENFORCE` | `1` | `1`=未在白名单内的私网目的地址直接丢弃；`0`=保留旧行为（不限制） |
+
+> **安全提示**：默认 `INTRANET_ENFORCE=1`，即客户端无法访问服务器侧任何私网段，除非你显式列进
+> `INTRANET_ALLOW`。公网流量不受影响，原有的"全局代理"用法不变。
+>
+> 白名单是**服务端级**的（所有拿到凭据的设备共享同一份）。若需要按设备区分，可在此基础上叠加
+> `ServiceDB` 的黑名单/审计能力，或等后续的按用户 ACL。
+>
+> **不要把"对外发号"和"开放内网"部署在同一台服务器上**：客户端会拒绝受管设备使用内网模式，但
+> 服务端防火墙只认源网段、不认设备身份，被改造过的客户端仍可能访问 `INTRANET_ALLOW` 里的网段。
+> 需要严格隔离时，把内网入口单独部署一台仅供自建卡片使用的服务器。
+
+### 已知限制
+
+- 内网路由目前**由客户端本地配置**，协议尚未支持服务端下发（route push）；
+- 多网卡服务器若内网不在默认出口网卡上，`start.sh` 已补通用转发与 NAT；特殊拓扑仍建议手动核对
+  `iptables -t nat -L POSTROUTING -n -v`。
+
 ## 待完善
 
-- **智能分流**：国内直连 / 国外走隧道，避免全局代理；
 - **日志窗口与流量统计**：GUI 内查看日志、累计流量与限速；
 - **开机自启**：开机启动并自动连接（托盘/最小化已实现）；
 - **Linux 权限模型**：目前整个 GUI 以 root 运行；更规范的是普通用户 GUI + polkit helper 只负责 tun/路由/DNS；
-- **Linux 桌面细节**：GNOME 默认不显示桌面图标（需 `desktop-icons-ng`）；托盘依赖 `libappindicator`。
+- **Linux 桌面细节**：GNOME 默认不显示桌面图标（需 `desktop-icons-ng`）；托盘依赖 `libappindicator`；
+- **分流数据更新**：`chnroute.txt` 目前靠脚本重新生成（`scripts/gen_chnroute.py`），尚无自动更新通道；
+- **内网路由下发（route push）**：目前内网网段需在客户端本地配置，协议尚无服务端下发通道；
+- **按设备的内网 ACL**：内网白名单目前是服务端级，尚不能按 client_id 区分。
 
 ## 许可证
 

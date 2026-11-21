@@ -13,7 +13,7 @@ bool is_comment(const std::string& line)
     return !line.empty() && (line[0] == '#' || line[0] == ';');
 }
 
-} // namespace
+}
 
 void parse_text(const std::string& text, std::vector<cidr::Cidr>& out, Stats* stats)
 {
@@ -31,7 +31,6 @@ void parse_text(const std::string& text, std::vector<cidr::Cidr>& out, Stats* st
         std::string line = text.substr(pos, nl - pos);
         pos = nl + 1;
 
-        // 去掉 CR（Windows 换行）与首尾空白
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
         {
             line.pop_back();
@@ -44,7 +43,7 @@ void parse_text(const std::string& text, std::vector<cidr::Cidr>& out, Stats* st
 
         if (line.empty())
         {
-            continue;   // 空行不计入任何统计
+            continue;
         }
         ++st.lines;
 
@@ -57,7 +56,7 @@ void parse_text(const std::string& text, std::vector<cidr::Cidr>& out, Stats* st
         cidr::Cidr c{};
         if (!cidr::parse(line, c))
         {
-            ++st.malformed;   // 脏数据：计数但不中断
+            ++st.malformed;
             continue;
         }
         cidr::normalize(c);
@@ -101,4 +100,4 @@ void sort_unique(std::vector<cidr::Cidr>& list)
                list.end());
 }
 
-} // namespace iplist
+}

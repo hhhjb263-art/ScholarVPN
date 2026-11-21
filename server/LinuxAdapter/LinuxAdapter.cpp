@@ -41,18 +41,16 @@ bool LinuxAdapter::fill_route(rtentry &rt, const std::string &dest, int prefix, 
         return false;
     }
 
-    if(prefix < 0 || prefix >32 ) 
+    if(prefix < 0 || prefix >32 )
         return false;
     struct sockaddr_in *mask = reinterpret_cast<struct sockaddr_in *>(&rt.rt_genmask);
     mask->sin_family = AF_INET;
     uint32_t num_mask = prefix == 0 ? 0U : (0xFFFFFFFFU << (32U - static_cast<uint32_t>(prefix)));
     mask->sin_addr.s_addr = htonl(num_mask);
 
-    // 出口网卡索引
     strncpy(rt.rt_dev,dev.c_str(),ALTIFNAMSIZ -1);
     rt.rt_dev[ALTIFNAMSIZ -1] = '\0';
 
-    // plain network route: RTF_HOST only for /32 host routes
     rt.rt_flags = RTF_UP;
     if(prefix == 32)
         rt.rt_flags |= RTF_HOST;
@@ -105,7 +103,7 @@ bool LinuxAdapter::set_address(const std::string &dev, const std::string &ip, in
         fprintf(stderr, "invalid ip: %s\n", ip.c_str());
         return false;
     }
-    std::memcpy(&ifr.ifr_addr,&addr,sizeof(addr));   
+    std::memcpy(&ifr.ifr_addr,&addr,sizeof(addr));
 
     if(ioctl(m_sock,SIOCSIFADDR,&ifr) < 0){
         fprintf(stderr, "set ip %s failed: %s\n", ip.c_str(), strerror(errno));
@@ -152,11 +150,11 @@ bool LinuxAdapter::set_up(const std::string &dev)
 {
     if(!is_valid())
         return false;
-    
+
     struct ifreq ifr{};
     strncpy(ifr.ifr_name,dev.c_str(),IFNAMSIZ -1);
     ifr.ifr_name[IFNAMSIZ -1] = '\0';
-    
+
     if(ioctl(m_sock,SIOCGIFFLAGS,&ifr) < 0){
         fprintf(stderr, "set up %s failed: %s\n", dev.c_str(), strerror(errno));
         return false;
@@ -200,7 +198,6 @@ bool LinuxAdapter::route_add(const std::string &dest, int prefix, const std::str
     if(!fill_route(rt,dest,prefix,dev)){
         return false;
     }
-    // add to route
     if(ioctl(m_sock,SIOCADDRT,&rt) < 0){
         fprintf(stderr, "SIOCADDRT add %s/%d failed: %s\n", dest.c_str(), prefix, strerror(errno));
         return false;

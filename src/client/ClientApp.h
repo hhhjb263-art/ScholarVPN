@@ -39,11 +39,6 @@
 #pragma comment(lib, "Crypt32.lib")
 #endif
 
-// 客户端核心逻辑封装（纯 C++，无 Qt）：
-//   init()  → 一次性初始化（config / 身份密钥 / 网卡 / 路由）
-//   start() → 启动 ReconnectManager + 两条桥接线程（立即返回）
-//   stop()  → 停止隧道 / 清路由 / join 线程（可重复调用，线程安全）
-// 回调在内部 worker 线程触发，UI 侧需自行切线程（如 QMetaObject::invokeMethod）。
 class ClientApp {
 public:
     using StateCallback = std::function<void(ConnState)>;
@@ -54,41 +49,35 @@ public:
 	ClientApp();
 	~ClientApp();
 
-	bool init();            // 一次性初始化：config/身份/网卡/路由
-	bool start();           // 启动 ReconnectManager + 桥接线程
-	void stop();            
+	bool init();
+	bool start();
+	void stop();
 
-	// 分流模式（全局设置）。
-	// 约定：持久化由 GUI 负责（写 config.ini 的 [Routing] Mode 单键），
-	// 这里只维护运行时状态——避免 GUI 保存整份配置时把卡片刚改的 Transport 覆盖回去。
 	bool routing_split() const;
 	void set_routing_split(bool split);
+	bool routing_intranet() const;
+	void apply_intranet_routing();
+	// 受管服务器一律按 full 处理：内网访问只对自建卡片开放
+	bool intranet_active() const { return routing_intranet() && !m_serverManaged; }
+	bool server_managed() const { return m_serverManaged; }
+	cfgstr routing_mode() const;
+	void set_routing_mode(const cfgstr& mode);
 
-	// 强制更新时禁止连接（界面禁用之外的第二道闸门）
 	void set_update_blocked(bool blocked) { m_updateBlocked.store(blocked); }
 	bool update_blocked() const { return m_updateBlocked.load(); }
 
-	// 受管服务判定不允许使用（试用到期/超量/被拒）时置位：start() 直接拒绝连接。
-	// 与强制更新闸门同一设计：界面禁用之外堵住托盘/命令行绕过路径。
 	void set_service_blocked(bool blocked) { m_serviceBlocked.store(blocked); }
 	bool service_blocked() const { return m_serviceBlocked.load(); }
 
-	// 当前进程是否已提权（管理员）。创建 Wintun 网卡 / 改路由 / 改 DNS 都需要，
-	// 因此普通用户（免 UAC）启动时返回 false，init() 会失败、连接功能不可用。
 	static bool is_elevated();
 
-	// 多服务器：在 init() 之后、start() 之前调用，
-	// 切换目标服务器及其各自的认证身份（ClientID/RegisterToken）
 	void set_server(const ServerEntry& entry);
 	ConnState state() const;
-	std::string assigned_ip() const;   // 服务端分配的虚拟 IP（连接后）
-	std::string server_ip() const { return m_remote; }   // 当前连接的目标服务器 IP
+	std::string assigned_ip() const;
+	std::string server_ip() const { return m_remote; }
 	std::string client_id() const;
 	uint64_t tx_bytes() const { return m_txBytes.load(); }
 	uint64_t rx_bytes() const { return m_rxBytes.load(); }
-
-	// 测试用：模拟一次断线，触发状态机自动重连
-	//void force_reconnect();
 
     void set_state_callback(StateCallback cb);
 	void set_connected_callback(ConnectedCallback cb);
@@ -97,61 +86,48 @@ public:
 
 private:
 	void emit_log(const char* fmt, ...);
-	void save_config();                
-	void tun_to_udp_loop();             
-	void udp_to_tun_loop();        
+	void save_config();
+	void tun_to_udp_loop();
+	void udp_to_tun_loop();
 
-	// 流量分流：Mode=split 时把国内网段指向物理出口。
-	// 必须在 add_default_route() 之前调用（否则国内流量会先被隧道抢走一次）。
 	void apply_split_routing();
 
-	// 实际使用的 DNS 列表：分流模式用国内 DNS（走直连），全局模式用配置值
 	cfgstr effective_dns() const;
 
 	ClientConfig m_cfg;
-	cfgstr m_configPath;                // config.ini 完整路径（Windows=wstring / Linux=UTF-8）
+	cfgstr m_configPath;
 	cfgstr m_configDir;
 
 	std::shared_ptr<EVP_PKEY> m_ed25519Priv;
 	std::string m_serverSigPubPem;
-	std::string m_builtinServerSigPubPem;   // 内置硬编码公钥备份（切换未配公钥的服务器时恢复，防公钥串台）
-	Transport m_transport{ Transport::UDP };   // 当前服务器条目的传输方式（UDP 默认 / TCP）
-	std::string m_remote;       // 解析后的服务器 IP（UDP / 路由只用 IP）
-	std::string m_serverHost;   // 配置原文，可能是域名；每次 start() 重新解析
-	std::atomic<bool> m_updateBlocked{ false };   // 强制更新时禁止连接
-	std::atomic<bool> m_serviceBlocked{ false };  // 受管服务判定不允许使用时禁止连接
+	std::string m_builtinServerSigPubPem;
+	Transport m_transport{ Transport::UDP };
+	std::string m_remote;
+	std::string m_serverHost;
+	std::atomic<bool> m_updateBlocked{ false };
+	std::atomic<bool> m_serviceBlocked{ false };
 
 	uint16_t m_port = 0;
 
-	// 以下的成员持有保证生命周期
-	std::unique_ptr<ITunDevice> m_tun;   // Win: WintunTun / Linux: LinuxTun（create_tun_device）
+	std::unique_ptr<ITunDevice> m_tun;
 	std::unique_ptr<AdapterConfig> m_adapter;
 	std::unique_ptr<RouteManager> m_route;
 	std::unique_ptr<ReconnectManager> m_mgr;
-	DnsLeakGuard m_dnsGuard;              // 防 DNS 泄漏（清物理网卡 DNS + 断线恢复）
-	DnsProxy m_dnsProxy;                  // P3：本地 DNS 代理（分流模式按域名选上游）
-	// 桥接线程
+	DnsLeakGuard m_dnsGuard;
+	DnsProxy m_dnsProxy;
 	std::thread m_threadTunToUdp;
 	std::thread m_threadUdpToTun;
-	// 回调
 	StateCallback m_onState;
 	ConnectedCallback m_onConnect;
 	LogCallback m_onLog;
 	TokenRejectedCallback m_onTokenRejected;
-	// 统计
 	std::atomic<bool> m_running{ false };
-	// 上行闸门：服务端通告的虚拟 IP 还没落到网卡上之前，禁止把 TUN 包送上隧道。
-	// 否则"源地址=旧 IP"的包会被服务端源地址防伪整片丢弃（认证成功却一个包都
-	// 上不去，表现为网速几十 K / 隧道内 TCP 连不上）。握手成功 -> 改网卡地址
-	// -> 置 true 放行，见 start() 的 connected 回调。
 	std::atomic<bool> m_tunIpReady{ false };
+	std::atomic<bool> m_intranetApplied{ false };
+	bool m_serverManaged = false;
 	std::atomic<ConnState> m_state{ ConnState::Stopped };
 	std::atomic<uint64_t> m_txBytes{ 0 }, m_rxBytes{ 0 };
 	std::atomic<uint64_t> m_txPkts{ 0 }, m_rxPkts{ 0 };
-	// 本地丢弃的非 IPv4 报文计数（Wintun 网卡上的 IPv6 链路本地控制报文等）：
-	// 隧道只承载 IPv4，这类报文不该上行（服务端必拒），限流日志用
 	std::atomic<uint32_t> m_nonIpv4Dropped{ 0 };
-	// 源地址与本会话虚拟 IP 不符而被本地丢弃的上行报文计数：
-	// 这类包服务端必按"冒用源地址"丢弃，本地先拦下（限流日志用）
 	std::atomic<uint32_t> m_srcMismatchDropped{ 0 };
 };

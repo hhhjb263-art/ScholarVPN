@@ -1,12 +1,3 @@
-// ============================================================================
-// tests/diag_split_readonly.cpp —— 分流状态只读诊断【不需要管理员】
-//
-// 只读系统路由表，不修改任何东西。用法：
-//   1. 客户端连接成功（选「智能分流」）
-//   2. 双击本程序（任意权限都可）
-// 输出：国内段路由是否真的进了路由表、metric 是否低于隧道、隧道默认路由是否存在。
-// ============================================================================
-
 #include "platform/iplist.h"
 
 #include <cstdint>
@@ -19,8 +10,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-// netioapi.h 里 PMIB_IPFORWARD_TABLE2 / GetIpForwardTable2 在
-// `#if (NTDDI_VERSION >= NTDDI_VISTA)` 内，不显式抬高版本就取不到声明
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
@@ -28,10 +17,10 @@
 #define NTDDI_VERSION 0x0A000000
 #endif
 #include <winsock2.h>
-#include <ws2tcpip.h>   // SOCKADDR_INET 等类型是 MIB_IPFORWARD_ROW2 的前提
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
-#include <netioapi.h>   // PMIB_IPFORWARD_TABLE2 / GetIpForwardTable2
+#include <netioapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #endif
@@ -47,7 +36,7 @@ std::string ip_str(uint32_t net_order)
     return buf;
 }
 
-} // namespace
+}
 
 int main()
 {
@@ -83,7 +72,6 @@ int main()
         return 3;
     }
 
-    // 建立"国内段"索引：addr 主机序 + prefix
     int splitHits = 0;
     int tunnelDefault = 0;
     std::string tunnelDev;
@@ -103,7 +91,6 @@ int main()
         const uint32_t net = ::ntohl(r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr);
         const uint8_t p = static_cast<uint8_t>(r.DestinationPrefix.PrefixLength);
 
-        // 隧道的两条半路由
         if ((net == 0u && p == 1) || (net == 0x80000000u && p == 1))
         {
             ++tunnelDefault;

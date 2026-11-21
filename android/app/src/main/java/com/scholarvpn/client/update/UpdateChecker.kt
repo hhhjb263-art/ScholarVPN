@@ -1,5 +1,7 @@
 package com.scholarvpn.client.update
 
+import com.scholarvpn.client.service.ServiceClient
+import com.scholarvpn.client.service.ServiceEndpoints
 import java.net.HttpURLConnection
 import java.net.URL
 import java.io.File
@@ -7,16 +9,14 @@ import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-/**
- * Android 端更新检查——对应桌面端 docs/客户端更新策略.md 的 android 平台字段
- * （android_url / android_sha256 / android_size，latest 为通用字段）。
- *
- * 策略是 Ed25519 签名的静态 ini（https://scholarvpn.homes:8444/update-policy.ini），
- * Android 侧不做 Ed25519 验签（APK 由系统包管理器校验签名，替换安装包
- * 无法通过 Android 的签名一致性检查），只校验 APK 的 SHA-256 与大小。
- */
 object UpdateChecker {
-    const val POLICY_URL = "https://scholarvpn.homes:8444/update-policy.ini"
+    // 更新清单由后台托管：地址从受管服务地址派生，不再写死
+    val POLICY_URL: String =
+        ServiceEndpoints.BASE_URL.trimEnd('/') + "/svc/update-policy.ini"
+
+    // 离线发布密钥的公钥，用于校验清单签名（与受管服务密钥是两把不同的钥匙）
+    private const val RELEASE_PUB_B64 =
+        "MCowBQYDK2VwAyEAc0EJCcbif2w8vPpeutGT+o7bqTFTdOoRSdrDuOJ4xj4="
 
     data class Policy(
         val latest: String,
@@ -26,11 +26,23 @@ object UpdateChecker {
         val size: Long,
     )
 
-    /** 拉取并解析策略，失败抛异常 */
     suspend fun fetchPolicy(): Policy = withContext(Dispatchers.IO) {
-        val kv = parseIni(httpGet(POLICY_URL))
-        val url = kv["android_url"]
-            ?: throw IllegalStateException("策略缺少 android_url 字段")
+        val bodyBytes = try {
+            httpGetBytes(POLICY_URL)
+        } catch (e: IllegalStateException) {
+            // 后台尚未发布策略：按"无更新"处理，不打扰用户
+            if (e.message?.contains("404") == true) {
+                return@withContext Policy(latest = "", notes = "", url = "", sha256 = "", size = 0L)
+            }
+            throw e
+        }
+        val sig = httpGet(POLICY_URL + ".sig").trim()
+        if (!ServiceClient.verifySignature(bodyBytes, sig, RELEASE_PUB_B64)) {
+            throw IllegalStateException("更新策略签名验证失败")
+        }
+        val kv = parseIni(String(bodyBytes, Charsets.UTF_8))
+        // 两端共用同一份清单；缺 android_url 只在"确实有新版本"时才算问题
+        val url = kv["android_url"] ?: ""
         Policy(
             latest = kv["latest"] ?: "",
             notes = kv["notes"] ?: "",
@@ -40,17 +52,11 @@ object UpdateChecker {
         )
     }
 
-    /**
-     * 包哈希比较（2026-11-02 需求 5）：已装包与服务器包不同 = 有新包。
-     * 版本号（minimum 闸门/大更新）之外，非强制的更新提示以包差异为准——
-     * 同版本号重发的修复包也能触发提示。
-     */
     fun hasNewPackage(installedSha: String, policySha: String): Boolean {
         return installedSha.isNotEmpty() && policySha.isNotEmpty() &&
                !installedSha.equals(policySha, ignoreCase = true)
     }
 
-    /** 数值版本比较：latest > current 才是有新版本（x.y.z 逐段比较） */
     fun isNewer(latest: String, current: String): Boolean {
         val l = latest.split(".").map { it.trim().toIntOrNull() ?: 0 }
         val c = current.split(".").map { it.trim().toIntOrNull() ?: 0 }
@@ -62,10 +68,6 @@ object UpdateChecker {
         return false
     }
 
-    /**
-     * 下载 APK 到 dest：流式写盘 + 边下边算 SHA-256，
-     * 哈希/大小不符立即删除文件并抛异常（对应桌面端 download_file 语义）
-     */
     suspend fun downloadApk(
         url: String,
         expectedSha256: String,
@@ -116,6 +118,20 @@ object UpdateChecker {
         }
     }
 
+    private fun httpGetBytes(url: String): ByteArray {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 5000
+        conn.readTimeout = 10000
+        try {
+            if (conn.responseCode !in 200..299) {
+                throw IllegalStateException("HTTP ${conn.responseCode}")
+            }
+            return conn.inputStream.use { it.readBytes() }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     private fun httpGet(url: String): String {
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = 5000
@@ -130,7 +146,6 @@ object UpdateChecker {
         }
     }
 
-    /** 简易 ini 解析（key = value，# 注释行跳过）——与桌面端 parse_policy 同语义 */
     private fun parseIni(text: String): Map<String, String> =
         text.lineSequence()
             .filter { it.isNotBlank() && !it.trimStart().startsWith("#") && '=' in it }

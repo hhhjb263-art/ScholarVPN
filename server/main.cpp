@@ -7,13 +7,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
-#include <sys/stat.h>   // umask
-#include <fcntl.h>      // open
-#include <sys/file.h>   // flock
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <system_error>
-#include <unistd.h>   // pause()
+#include <unistd.h>
 
-// 全局：信号处理只置位标志，主线程负责优雅停止
 static volatile std::sig_atomic_t g_stop = 0;
 
 static void handle_signal(int sig)
@@ -130,8 +129,6 @@ static bool parse_args(int argc, char *argv[], VpnCore::Config &cfg)
 
 int main(int argc, char *argv[])
 {
-    // 收紧文件创建权限：server_sig.key / register_tokens.txt /
-    // registered_clients.txt / 日志等一律 0600，本机其他用户不可读
     ::umask(077);
 
     VpnCore::Config cfg;
@@ -139,13 +136,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // 管理员操作：生成一次性注册令牌（vpn_server --gen-token [n]）
     if(cfg.gen_tokens > 0){
-        // 令牌目录必须与运行时 UDP::m_keys_dir 一致：
-        // 运行时 m_keys_dir = parent(key_sig_path)（VpnCore.cpp），
-        // 所以这里也写到 parent(key_sig_path)，而不是硬编码相对路径 "keys/"——
-        // 否则 systemd/start.sh 部署（cwd 不是脚本目录）或 -k 自定义路径时，
-        // 令牌写到别处，服务端验证永远找不到 → 客户端"注册令牌无效"死循环。
         std::error_code ec;
         std::filesystem::path keys_dir = std::filesystem::path(cfg.key_sig_path).parent_path();
         if(keys_dir.empty()){
@@ -153,9 +144,6 @@ int main(int argc, char *argv[])
         }
         std::filesystem::create_directories(keys_dir, ec);
         const std::string tokens_path = (keys_dir / "register_tokens.txt").string();
-        // 与服务端消费令牌（file_remove_line 的原子替换）跨进程互斥：
-        // 双方都 flock <tokens>.lock，令牌文件本体只会被原子的
-        // rename 替换，追加/替换并发不会互相丢失数据
         const std::string lock_path = tokens_path + ".lock";
         const int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
         if (lock_fd < 0) {
@@ -213,7 +201,6 @@ int main(int argc, char *argv[])
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    // 阻塞等待信号
     while(!g_stop){
         pause();
     }

@@ -1,24 +1,23 @@
-
 #include "ServerAdminClient.h"
 #include <iostream>
 #include <cstring>
 #include <cerrno>
 #include <cstdio>
-#include <cstdlib>        // atoi / getenv
+#include <cstdlib>
 #include <filesystem>
 #include <system_error>
 #include <vector>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/file.h>     // flock
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include<fstream>
 namespace {
-constexpr int kTimeoutMs = 5000;          // 连接/收发共用 5 秒超时
-constexpr int kMaxEvents = 16;            // 一次 epoll_wait 最多取回的事件数
+constexpr int kTimeoutMs = 5000;
+constexpr int kMaxEvents = 16;
 }
 
 ServerAdmin::~ServerAdmin(){
@@ -26,16 +25,16 @@ ServerAdmin::~ServerAdmin(){
         close(m_fd);
         m_fd = -1;
     }
-    if(epfd >= 0){                        // epfd 也是描述符，一样要还
+    if(epfd >= 0){
         close(epfd);
         epfd = -1;
     }
 }
 
 bool ServerAdmin::start(const std::string& IP, int Port){
-    m_ip = IP;                            // 记下目标，buildRequest 拼 Host 头要用
+    m_ip = IP;
     m_port = Port;
-    if(epfd >= 0){                        // 重复调用 start 时先关旧 epfd，不泄漏
+    if(epfd >= 0){
         close(epfd);
         epfd = -1;
     }
@@ -62,12 +61,11 @@ bool ServerAdmin::start(const std::string& IP, int Port){
         m_fd = -1;
         return false;
     }
-    // 非阻塞 connect + epoll 等待可写，IP 不可达时最多等 kTimeoutMs
     int flags = fcntl(m_fd, F_GETFL, 0);
     fcntl(m_fd, F_SETFL, flags | O_NONBLOCK);
     struct epoll_event ev{};
-    ev.events = EPOLLOUT;                 // "可写" = 连接完成
-    ev.data.fd = m_fd;                    // 统一用 data.fd，别和 data.ptr 混用
+    ev.events = EPOLLOUT;
+    ev.data.fd = m_fd;
     if(epoll_ctl(epfd, EPOLL_CTL_ADD, m_fd, &ev) < 0){
         std::cout << "epoll add failed: " << strerror(errno) << std::endl;
         close(m_fd);
@@ -81,10 +79,10 @@ bool ServerAdmin::start(const std::string& IP, int Port){
         m_fd = -1;
         return false;
     }
-    if(con < 0){                          // 连接进行中，等它完成
+    if(con < 0){
         struct epoll_event events[kMaxEvents];
         int n = 0;
-        while(true){                      // EINTR（被信号打断）就重新等，别的结果才往下走
+        while(true){
             n = epoll_wait(epfd, events, kMaxEvents, kTimeoutMs);
             if(n < 0 && errno == EINTR) continue;
             break;
@@ -102,16 +100,16 @@ bool ServerAdmin::start(const std::string& IP, int Port){
             m_fd = -1;
             return false;
         }
-        for(int i = 0; i < n; ++i){       // 逐个处理本轮取回的事件
+        for(int i = 0; i < n; ++i){
             if(events[i].events & (EPOLLERR | EPOLLHUP)){
                 std::cout << "socket error during connect" << std::endl;
-                epoll_ctl(epfd, EPOLL_CTL_DEL, m_fd, nullptr);   // DEL 才允许传 nullptr
+                epoll_ctl(epfd, EPOLL_CTL_DEL, m_fd, nullptr);
                 close(m_fd);
                 m_fd = -1;
                 return false;
             }
             if(events[i].events & EPOLLOUT){
-                int err = 0;              // 可写不代表成功，真实结果要从 SO_ERROR 拿
+                int err = 0;
                 socklen_t len = sizeof(err);
                 getsockopt(m_fd, SOL_SOCKET, SO_ERROR, &err, &len);
                 if(err != 0){
@@ -125,7 +123,7 @@ bool ServerAdmin::start(const std::string& IP, int Port){
         }
     }
     isconnect = true;
-    return true;                          // 保持非阻塞，后面 sendMsg 的事件循环要用
+    return true;
 }
 
 bool ServerAdmin::sendMsg(const std::string& msg)
@@ -136,13 +134,13 @@ bool ServerAdmin::sendMsg(const std::string& msg)
     }
     sendbuf += msg;
     struct epoll_event ev{};
-    ev.events = EPOLLOUT | EPOLLIN;       // 既要发也要收
+    ev.events = EPOLLOUT | EPOLLIN;
     ev.data.fd = m_fd;
     if(epoll_ctl(epfd, EPOLL_CTL_MOD, m_fd, &ev) < 0){
         std::cout << "epoll_ctl failed: " << strerror(errno) << std::endl;
         return false;
     }
-    while(true){                          // 事件循环：等事件 → 发 → 发完改听读 → 收到对端关闭为止
+    while(true){
         struct epoll_event events[kMaxEvents];
         int n = epoll_wait(epfd, events, kMaxEvents, kTimeoutMs);
         if(n == 0){
@@ -150,7 +148,7 @@ bool ServerAdmin::sendMsg(const std::string& msg)
                 std::cout << "对端 " << kTimeoutMs / 1000
                           << " 秒未关闭连接，结束接收（收到 "
                           << recvbuf.size() << " 字节）" << std::endl;
-                return true;              // 数据都发完了，对端不关连接不算失败
+                return true;
             }
             std::cout << "send is failed: 发送超时" << std::endl;
             return false;
@@ -160,7 +158,7 @@ bool ServerAdmin::sendMsg(const std::string& msg)
             std::cout << "epoll_wait failed: " << strerror(errno) << std::endl;
             return false;
         }
-        for(int i = 0; i < n; ++i){       // 逐个处理本轮取回的事件
+        for(int i = 0; i < n; ++i){
             if(events[i].events & EPOLLERR){
                 std::cout << "socket error during send" << std::endl;
                 return false;
@@ -169,14 +167,14 @@ bool ServerAdmin::sendMsg(const std::string& msg)
                 ssize_t ns = send(m_fd, sendbuf.data(), sendbuf.size(), MSG_NOSIGNAL);
                 if(ns < 0){
                     if(errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-                        continue;         // 缓冲区满/被打断不是失败，跳过本事件等下一轮
+                        continue;
                     std::cout << "send error: " << strerror(errno) << std::endl;
                     return false;
                 }
-                sendbuf.erase(0, static_cast<size_t>(ns));   // 删掉已发出的部分
+                sendbuf.erase(0, static_cast<size_t>(ns));
                 if(sendbuf.empty()){
                     struct epoll_event ev2{};
-                    ev2.events = EPOLLIN;     // 发完了，只关心读——MOD 的正确用法
+                    ev2.events = EPOLLIN;
                     ev2.data.fd = m_fd;
                     epoll_ctl(epfd, EPOLL_CTL_MOD, m_fd, &ev2);
                 }
@@ -184,7 +182,7 @@ bool ServerAdmin::sendMsg(const std::string& msg)
             if(events[i].events & EPOLLIN){
                 char tmp[4096];
                 ssize_t nr = recv(m_fd, tmp, sizeof(tmp), 0);
-                if(nr == 0){                  // 对端关闭连接 = 本轮回合结束
+                if(nr == 0){
                     return true;
                 }
                 if(nr < 0){
@@ -194,7 +192,7 @@ bool ServerAdmin::sendMsg(const std::string& msg)
                     return false;
                 }
                 recvbuf.append(tmp, static_cast<size_t>(nr));
-                if(recvbuf.size() > 8192){  // 响应上限 8KB，防对端失控回海量数据
+                if(recvbuf.size() > 8192){
                     std::cout << "recvbuf 超过 8KB，疑似非 HTTP 服务或响应异常" << std::endl;
                     return false;
                 }
@@ -239,7 +237,7 @@ std::vector<std::string> ServerAdmin::applyToken(int count, std::string* err)
         return {};
     };
 
-    if (count < 1 || count > 1000) {          // 数量上限与 CLI --gen-token 一致
+    if (count < 1 || count > 1000) {
         return fail("count 超出范围（1-1000）: " + std::to_string(count));
     }
 
@@ -262,7 +260,7 @@ std::vector<std::string> ServerAdmin::applyToken(int count, std::string* err)
         return fail(msg);
     }
 
-    FILE* f = fopen(tokens_path.string().c_str(), "a");   // 追加模式，每行一个令牌
+    FILE* f = fopen(tokens_path.string().c_str(), "a");
     if (f == nullptr) {
         const std::string msg = "无法写入 " + tokens_path.string() + ": " + strerror(errno);
         flock(lock_fd, LOCK_UN);
@@ -293,12 +291,11 @@ std::string ServerAdmin::buildRequest(const std::string& method, const std::stri
     if(!body.empty()){
         req += "Content-Type: application/json\r\n";
     }
-    // Content-Length 一律 body.size()——字节数不是字符数，中文 UTF-8 别手数；GET/DELETE 发 0 也带上
     req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     if(!admin_token.empty()){
         req += "Authorization: Bearer " + admin_token + "\r\n";
     }
-    req += "Connection: close\r\n";       // 必带：服务端回完就关，sendMsg 的 recv==0 才能立刻结束
+    req += "Connection: close\r\n";
     req += "\r\n";
     req += body;
     return req;
@@ -311,7 +308,7 @@ bool ServerAdmin::parseResponse(const std::string& raw, HttpResponse& out)
     out.headers.clear();
     out.body.clear();
 
-    size_t header_end = raw.find("\r\n\r\n");     // 之前是头、之后是 body
+    size_t header_end = raw.find("\r\n\r\n");
     if(header_end == std::string::npos){
         std::cout << "响应头不完整（没找到 \\r\\n\\r\\n）" << std::endl;
         return false;
@@ -322,11 +319,11 @@ bool ServerAdmin::parseResponse(const std::string& raw, HttpResponse& out)
         return false;
     }
     std::string line1 = raw.substr(0, line1_end);
-    if(line1.rfind("HTTP/", 0) != 0){     // 对端不是 HTTP（比如裸 TCP 测试服务），报错不死等
+    if(line1.rfind("HTTP/", 0) != 0){
         std::cout << "非 HTTP 响应: " << line1 << std::endl;
         return false;
     }
-    size_t sp1 = line1.find(' ');         // "HTTP/1.1 200 OK" 按空格切三段
+    size_t sp1 = line1.find(' ');
     size_t sp2 = line1.find(' ', sp1 + 1);
     if(sp1 == std::string::npos){
         std::cout << "状态行格式不对: " << line1 << std::endl;
@@ -338,7 +335,7 @@ bool ServerAdmin::parseResponse(const std::string& raw, HttpResponse& out)
         out.reason = line1.substr(sp2 + 1);
     }
 
-    size_t pos = line1_end + 2;           // 逐行切 headers，key 统一转小写（HTTP 头大小写不敏感）
+    size_t pos = line1_end + 2;
     while(pos < header_end){
         size_t line_end = raw.find("\r\n", pos);
         if(line_end == std::string::npos){
@@ -366,7 +363,7 @@ bool ServerAdmin::parseResponse(const std::string& raw, HttpResponse& out)
         return false;
     }
 
-    out.body = raw.substr(body_start);    // Connection: close 下收到对端关闭为止，后面全是 body
+    out.body = raw.substr(body_start);
     return true;
 }
 
@@ -378,9 +375,9 @@ HttpResponse ServerAdmin::sendRequest(const std::string& method, const std::stri
         std::cout << "未连接，先调用 start()" << std::endl;
         return resp;
     }
-    sendbuf.clear();                      // 一回合一条短连接，清掉上回残留
+    sendbuf.clear();
     recvbuf.clear();
-    if(!sendMsg(buildRequest(method, path, body))){   
+    if(!sendMsg(buildRequest(method, path, body))){
         return resp;
     }
     parseResponse(recvbuf, resp);
@@ -423,20 +420,20 @@ int main(int argc, char* argv[])
     }
 
     ServerAdmin admin;
-    const char* env = std::getenv("ADMIN_TOKEN"); // 令牌走环境变量，不进 shell history
+    const char* env = std::getenv("ADMIN_TOKEN");
     if(env != nullptr){
         admin.set_admin_token(env);
     }
-    std::string host = "127.0.0.1";               // 默认对接本机 AdminServer
+    std::string host = "127.0.0.1";
     int port = 18080;
-    if(const char* h = std::getenv("ADMIN_HOST")) host = h;   // 调试时可换目标
+    if(const char* h = std::getenv("ADMIN_HOST")) host = h;
     if(const char* p = std::getenv("ADMIN_PORT")) port = atoi(p);
     if(!admin.start(host, port)){
         return 1;
     }
     HttpResponse resp = admin.sendRequest(method, path, body);
     if(resp.status == 0){
-        return 1;                         // 没拿到状态码，失败原因已在内部分别打印
+        return 1;
     }
     std::cout << "HTTP " << resp.status;
     if(!resp.reason.empty()){

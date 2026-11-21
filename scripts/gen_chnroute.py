@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
-# ============================================================================
-# scripts/gen_chnroute.py —— 生成客户端内置的国内 IPv4 网段列表
-#
-# 用法：
-#   python scripts/gen_chnroute.py --in all_cn.txt --out docs/routing/chnroute.txt
-#   python scripts/gen_chnroute.py --url https://ispip.clang.cn/all_cn.txt --out ...
-#
-# 为什么要聚合：
-#   上游列表通常已按 /24 拆得很碎，且存在重叠。合并成最小 CIDR 集合后，
-#   客户端注入的路由条目能少 20%~40%，直接决定连接时那段等待的长度。
-#
-# 算法：CIDR → 闭区间 → 合并重叠/相邻 → 贪心拆回最小 CIDR 集合。
-# 纯标准库，无第三方依赖。
-# ============================================================================
 
 import argparse
 import datetime
 import ipaddress
 import sys
 import urllib.request
-
 
 def load_lines(path, url):
     if path:
@@ -29,9 +14,7 @@ def load_lines(path, url):
     with urllib.request.urlopen(req, timeout=40) as resp:
         return resp.read().decode("utf-8", errors="replace").splitlines()
 
-
 def parse_ranges(lines):
-    """返回 [(start, end)]，跳过空行/注释/坏行并计数。"""
     ranges = []
     bad = 0
     for raw in lines:
@@ -49,9 +32,7 @@ def parse_ranges(lines):
         ranges.append((int(net.network_address), int(net.broadcast_address)))
     return ranges, bad
 
-
 def merge_ranges(ranges):
-    """合并重叠与首尾相接的区间。"""
     ranges.sort()
     merged = []
     for start, end in ranges:
@@ -61,12 +42,9 @@ def merge_ranges(ranges):
             merged.append((start, end))
     return merged
 
-
 def range_to_cidrs(start, end):
-    """把闭区间拆成最小数量的 CIDR（贪心：每次取起点对齐的最大块）。"""
     out = []
     while start <= end:
-        # 起点对齐决定最大可用块大小；0.0.0.0 特殊处理为 2^32
         max_size = (start & -start) if start else (1 << 32)
         while start + max_size - 1 > end:
             max_size >>= 1
@@ -74,7 +52,6 @@ def range_to_cidrs(start, end):
         out.append(ipaddress.ip_network((start, prefix)))
         start += max_size
     return out
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -115,7 +92,6 @@ def main():
     print(f"  原始 {len(ranges)} 条 → 聚合后 {len(cidrs)} 条（{len(merged)} 个区间）")
     print(f"  坏行 {bad}，覆盖地址 {total_addrs}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

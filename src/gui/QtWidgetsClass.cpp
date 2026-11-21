@@ -1,8 +1,9 @@
 #include "QtWidgetsClass.h"
-#include "QtCfg.h"   // toQString / fromQString（cfgstr <-> QString 的唯一桥）
-#include "util/utf.h"   // to_cfgstr / narrow（受管服务卡片合并写回 cfgstr 用）
+#include "QtCfg.h"
+#include "util/utf.h"
 #include "CenteredComboBox.h"
-#include "version.h"   // SCHOLARVPN_VER_STRING   // 只重写绘制、不改行为的居中下拉框
+#include "version.h"
+#include "platform/cidr.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QScrollArea>
@@ -12,6 +13,8 @@
 #include <QDialog>
 #include <QCheckBox>
 #include <QMessageBox>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QTimer>
 #include <QDir>
 #include <QListWidget>
@@ -22,10 +25,9 @@
 #include <QStyle>
 #include <QDateTime>
 
-using namespace scholini;   // config.ini 的 INI 原语
+using namespace scholini;
 
 namespace {
-// 受管服务用量显示的字节格式化（主页用量条与设置页共用语义）
 std::string svc_fmt_bytes(unsigned long long n)
 {
     char buf[32] = { 0 };
@@ -37,21 +39,18 @@ std::string svc_fmt_bytes(unsigned long long n)
         std::snprintf(buf, sizeof(buf), "%llu B", n);
     return buf;
 }
-} // namespace
+}
 #include<QComboBox>
-#include <QApplication>  
-#include <QAction>       
-#include <QCoreApplication> 
+#include <QApplication>
+#include <QAction>
+#include <QCoreApplication>
 #include <QIcon>
-
-
 
 QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	: QWidget(parent)
 {
 	ui.setupUi(this);
 
-	
 	this->setFixedSize(430, 750);
 	this->setWindowTitle("ScholarVPN");
 
@@ -111,9 +110,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	}
 	)");
 
-
-	// 设置按钮（齿轮）：打开设置子页面（含「通用」栏 / 开机自启动）。
-	// 放品牌左侧，与右侧"添加服务器"按钮对称，样式保持一致。
 	QPushButton* btn_setting = new QPushButton(QStringLiteral("⚙"), this);
 	btn_setting->setFixedSize(34, 34);
 	btn_setting->setCursor(Qt::PointingHandCursor);
@@ -172,27 +168,24 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	m_cardLayout = new QVBoxLayout(m_cardContainer);
 	m_cardLayout->setSpacing(12);
 	m_cardLayout->setContentsMargins(4, 4, 4, 4);
-	m_cardLayout->addStretch();            // 卡片靠顶部排布
+	m_cardLayout->addStretch();
 
 	m_scroll->setWidget(m_cardContainer);
 
-	
 	m_diaCard = new QWidget(this);
-	m_diaCard->setGeometry(this->rect());     // 铺满主窗口
+	m_diaCard->setGeometry(this->rect());
 	m_diaCard->hide();
 
 	auto* overlayLay = new QVBoxLayout(m_diaCard);
 	overlayLay->setContentsMargins(0, 0, 0, 0);
 	overlayLay->setSpacing(0);
 
-	// 顶部 200px 半透明区：透出底下的主页面；
 	m_glassTop = new QWidget;
 	m_glassTop->setFixedHeight(200);
 	m_glassTop->setStyleSheet("background-color: rgba(15, 23, 42, 135);");
-	m_glassTop->installEventFilter(this);     // 点击半透明区收起
+	m_glassTop->installEventFilter(this);
 	m_glassTop->setCursor(Qt::PointingHandCursor);
 
-	// 半透明区里的摘要卡
 	m_glassCard = new QFrame(m_glassTop);
 	m_glassCard->setObjectName("glassCard");
 	m_glassCard->setStyleSheet(R"(
@@ -227,13 +220,11 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	glassLay->addWidget(m_glassVip);
 	glassLay->addWidget(m_glassState);
 
-	// 半透明
 	auto* glassTopLay = new QVBoxLayout(m_glassTop);
 	glassTopLay->setContentsMargins(16, 48, 16, 16);
 	glassTopLay->addWidget(m_glassCard);
 	glassTopLay->addStretch();
 
-	// 下方
 	QWidget* panel = new QWidget;
 	panel->setStyleSheet(R"(
 	QWidget#switchPanel{
@@ -288,7 +279,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	overlayLay->addWidget(m_glassTop);
 	overlayLay->addWidget(panel, 1);
 
-	// 显示当前选择的服务器
 	m_homeCard = new QFrame(this);
 	m_homeCard->setFixedHeight(176);
 	m_homeCard->setObjectName("serverCard");
@@ -302,13 +292,11 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	)");
 	m_homeCard->hide();
 
-	// 连接状态色条（卡片左缘，随状态变色：蓝=空闲 绿=已连 橙=连接中 红=错误）
 	m_homeAccent = new QFrame(m_homeCard);
 	m_homeAccent->setGeometry(0, 24, 4, 128);
 	m_homeAccent->setStyleSheet("background-color:#3b82f6; border-top-left-radius:16px;"
 	                            "border-bottom-left-radius:16px;");
 
-	// 服务器头像圈：名称首字母 + 蓝青渐变底（与 Switch 卡片同款）
 	m_homeAvatar = new QLabel(m_homeCard);
 	m_homeAvatar->setGeometry(20, 20, 48, 48);
 	m_homeAvatar->setAlignment(Qt::AlignCenter);
@@ -327,7 +315,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	m_homeName->setGeometry(82, 20, 240, 26);
 	m_homeName->setStyleSheet("background:transparent; font-size:13pt; font-weight:bold; color:#1f2937;");
 
-	// 受管服务的「受管服务」小徽标（仅受管卡片显示）
 	m_homeTag = new QLabel(m_homeCard);
 	m_homeTag->setGeometry(82, 52, 64, 20);
 	m_homeTag->setAlignment(Qt::AlignCenter);
@@ -349,7 +336,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	m_homeVip->setText("内网IP: --");
 	m_homeVip->setStyleSheet("background:transparent; font-family:Consolas,'Courier New',monospace; font-size:10pt; color:#6b7280;");
 
-	// 受管服务用量：细进度条 + 文字（仅受管卡片显示）
 	m_homeUsageBar = new QProgressBar(m_homeCard);
 	m_homeUsageBar->setGeometry(24, 76, 358, 6);
 	m_homeUsageBar->setTextVisible(false);
@@ -385,15 +371,11 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	QPushButton:hover{ border:1px solid #3b82f6; color:#2563eb; }
 	)");
 
-	// 当前显示的服务器
 	connect(m_homeBtn, &QPushButton::clicked, this, [this]() {
 		if (m_selectedCard < 0 || m_selectedCard >= (int)m_cardServers.size())
 			return;
 		const ServerEntry entry = m_cardServers[m_selectedCard];
 		if (m_state == ConnState::Stopped) {
-			// 免 UAC 启动：普通用户可运行本程序（界面/托盘可用），但建立连接需要
-			// 管理员权限（建 Wintun 网卡 / 改路由 / 改 DNS）。这里先拦截并明确告知，
-			// 否则初始化在后台失败、日志又没接到界面上，用户只看到"点了没反应"。
 			if (!ClientApp::is_elevated()) {
 				QMessageBox::information(this, QStringLiteral("需要管理员权限"),
 					QStringLiteral("建立 VPN 需要创建虚拟网卡、修改路由与 DNS，这些操作需要管理员权限。\n\n"
@@ -401,28 +383,22 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 				return;
 			}
 			m_activeCard = m_selectedCard;
-			// 必须投递到 bridge 所在线程（moveToThread 只作用于信号槽连接，直接调用
-			// 会在 GUI 线程同步执行 init()/建网卡/restore() 等重型操作 → 界面卡死无响应）
-			// 注意：lambda 里不能碰任何 QWidget（setEnabled 等）——它跑在 bridge 工作线程！
 			QMetaObject::invokeMethod(m_bridge, [this, entry]() {
 				m_bridge->connect_to_server(entry);
 			}, Qt::QueuedConnection);
 		} else {
-			// 断开同样投递到 bridge 线程，避免 stop() 同步执行卡 GUI
 			QMetaObject::invokeMethod(m_bridge, [this]() {
 				m_bridge->stop();
 			}, Qt::QueuedConnection);
 		}
 	});
-	// 编辑
 	connect(m_homeEditBtn, &QPushButton::clicked, this, [this]() {
 		if (m_selectedCard < 0 || m_selectedCard >= (int)m_cardServers.size())
 			return;
-		m_activeCard = m_selectedCard;   // edit_card 按 m_activeCard 取配置
+		m_activeCard = m_selectedCard;
 		edit_card();
 	});
 
-	// 添加服务器
 	m_homeHint = new QLabel("当前无服务器\n\n点击右上角「 + 添加服务器 」创建你的第一个配置", this);
 	m_homeHint->setAlignment(Qt::AlignCenter);
 	m_homeHint->setStyleSheet("color:#a0a8ba; font-size:10pt; background:transparent;");
@@ -432,7 +408,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	homeArea->setSpacing(10);
 	homeArea->addWidget(m_homeCard, 0, Qt::AlignTop);
 
-	// 速度折线图（原生自绘）
 	m_speedChart = new SpeedChart(this);
 	homeArea->addWidget(m_speedChart, 0, Qt::AlignTop);
 
@@ -458,15 +433,11 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		if (s == ConnState::Stopped || s == ConnState::Reconnecting)
 			m_homeVip->setText("内网IP: --");
 		m_btnSwitch->setEnabled(s == ConnState::Stopped);
-		// 分流模式是"下次连接生效"的全局设置：连接中禁用，
-		// 避免 GUI 线程与 worker 线程同时改路由表
 		const bool stopped = (s == ConnState::Stopped);
-		if (m_btnGlobal) m_btnGlobal->setEnabled(stopped);
-		if (m_btnSplit) m_btnSplit->setEnabled(stopped);
+		refresh_mode_buttons();
 		update_home_btn();
 		update_glass_card();
 
-		// 重连达到上限（Error）：弹窗告知，用户手动重连
 		if (s == ConnState::Error) {
 			QMessageBox::warning(this, QStringLiteral("连接失败"),
 				QStringLiteral("连接服务器 [%1] 失败：已连续 5 次尝试未成功，已停止自动重连。\n\n"
@@ -478,9 +449,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		}
 	});
 
-	// 服务端拒绝注册令牌（无效/已使用）：清掉当前卡片的令牌，转登录模式。
-	// 否则令牌留在 m_cardServers / config.ini 里，下次连接又被 set_server 灌回去 → deny 1 死循环。
-	// （若公钥其实已注册成功，清掉令牌后下次连接即以登录模式通过）
 	connect(m_bridge, &AppBridge::tokenRejected, this, [this]() {
 		if (m_selectedCard < 0 || m_selectedCard >= (int)m_cardServers.size())
 			return;
@@ -516,14 +484,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		show_switch_dialog();
 	});
 
-	// ---- 分流模式切换：全局 / 智能 ----
-	// 全局：所有流量走隧道（原有行为，默认）
-	// 智能：国内 IP 段走物理网卡，其余走隧道（依赖 exe 目录下的 chnroute.txt）
-	//
-	// 持久化只写 [Routing] Mode 这一个键，不调 ClientApp::save_config()——
-	// 那会把整份配置写回，可能覆盖用户在卡片上刚改的 Transport。
-	// 两个选项合成一个分段控件（胶囊）：与 Switch Server 同宽居中，
-	// 选中项白底蓝字，视觉上是一个整体而不是两个悬空小按钮
 	QFrame* seg = new QFrame(this);
 	seg->setGeometry(105, 680, 220, 34);
 	seg->setStyleSheet(QStringLiteral(
@@ -552,39 +512,84 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 	m_btnSplit->setStyleSheet(segBtnStyle);
 	m_btnSplit->setToolTip(QStringLiteral("国内 IP 直连，其余走隧道"));
 
+	m_btnIntranet = new QPushButton(QStringLiteral("内网访问"), seg);
+	m_btnIntranet->setCursor(Qt::PointingHandCursor);
+	m_btnIntranet->setCheckable(true);
+	m_btnIntranet->setAutoExclusive(true);
+	m_btnIntranet->setStyleSheet(segBtnStyle);
+	m_btnIntranet->setToolTip(QStringLiteral("只让指定内网网段走隧道，其余流量走本地网络"));
+
 	segLay->addWidget(m_btnGlobal);
 	segLay->addWidget(m_btnSplit);
+	segLay->addWidget(m_btnIntranet);
 
-	// 初始状态以 config.ini 为准：ClientApp 在首次连接时才加载配置，
-	// 这里如果读内存会拿到默认值，导致重启后按钮显示与实际不符。
 	{
 		const cfgstr modeIni = cfg_path_join(cfg_app_dir(), CS("config.ini"));
-		const bool split = (IniGetStr(modeIni, CS("Routing"), CS("Mode"), CS("full"))
-		                    == CS("split"));
+		const cfgstr mode = IniGetStr(modeIni, CS("Routing"), CS("Mode"), CS("full"));
+		const bool split = (mode == CS("split"));
+		const bool intra = (mode == CS("intranet"));
 		m_btnSplit->setChecked(split);
-		m_btnGlobal->setChecked(!split);
-		m_bridge->set_routing_split(split);   // 同步给运行时，避免第一次连接用旧值
+		m_btnIntranet->setChecked(intra);
+		m_btnGlobal->setChecked(!split && !intra);
+		m_bridge->set_routing_mode(QString::fromStdString(cfg_to_utf8(mode)));
 	}
 
-	auto apply_mode = [this](bool split) {
+	auto sync_mode_buttons = [this]() {
 		const cfgstr modeIni = cfg_path_join(cfg_app_dir(), CS("config.ini"));
-		IniSetStr(modeIni, CS("Routing"), CS("Mode"),
-		          split ? CS("split") : CS("full"));
-		m_bridge->set_routing_split(split);   // 只改内存，下次连接生效
-		qDebug() << "routing mode ->" << (split ? "split" : "full");
+		const cfgstr mode = IniGetStr(modeIni, CS("Routing"), CS("Mode"), CS("full"));
+		m_btnGlobal->setChecked(mode == CS("full"));
+		m_btnSplit->setChecked(mode == CS("split"));
+		m_btnIntranet->setChecked(mode == CS("intranet"));
 	};
-	connect(m_btnGlobal, &QPushButton::clicked, this, [apply_mode]() { apply_mode(false); });
-	connect(m_btnSplit, &QPushButton::clicked, this, [apply_mode]() { apply_mode(true); });
 
-	// 受管服务用量条（自建模式隐藏）：剩余时长 + 已用/配额，随 serviceChecked 刷新
+	auto apply_mode = [this](const QString& mode) {
+		const cfgstr modeIni = cfg_path_join(cfg_app_dir(), CS("config.ini"));
+		IniSetStr(modeIni, CS("Routing"), CS("Mode"), cfg_from_utf8(mode.toStdString()));
+		m_bridge->set_routing_mode(mode);
+		qDebug() << "routing mode ->" << mode;
+	};
+	connect(m_btnGlobal, &QPushButton::clicked, this,
+		[apply_mode]() { apply_mode(QStringLiteral("full")); });
+	connect(m_btnSplit, &QPushButton::clicked, this,
+		[apply_mode]() { apply_mode(QStringLiteral("split")); });
+	connect(m_btnIntranet, &QPushButton::clicked, this,
+		[this, apply_mode, sync_mode_buttons]() {
+			const cfgstr modeIni = cfg_path_join(cfg_app_dir(), CS("config.ini"));
+			const cfgstr cur = IniGetStr(modeIni, CS("Routing"), CS("IntranetSubnets"), CS(""));
+			bool ok = false;
+			const QString text = QInputDialog::getText(this, QStringLiteral("内网访问"),
+				QStringLiteral("经隧道访问的内网网段（逗号分隔）：\n"
+				               "例如 192.168.10.0/24,10.20.0.0/16\n"
+				               "留空 = 不注入任何路由，所有流量仍走本地网络。"),
+				QLineEdit::Normal, QString::fromStdString(cfg_to_utf8(cur)), &ok);
+			if (!ok) {
+				sync_mode_buttons();
+				return;
+			}
+			const QString trimmed = text.trimmed();
+			for (const QString& part : trimmed.split(QRegularExpression("[,;\\s]+"),
+			                                         Qt::SkipEmptyParts)) {
+				cidr::Cidr probe{};
+				if (!cidr::parse(part.toStdString(), probe) || probe.prefix == 0) {
+					QMessageBox::warning(this, QStringLiteral("内网访问"),
+						QStringLiteral("网段格式不正确：%1\n\n"
+							"请填写 a.b.c.d/前缀 形式，例如 192.168.10.0/24。\n"
+							"为保证安全，不接受 0.0.0.0/0（那等于全局代理）。").arg(part));
+					sync_mode_buttons();
+					return;
+				}
+			}
+			IniSetStr(modeIni, CS("Routing"), CS("IntranetSubnets"),
+			          cfg_from_utf8(trimmed.toStdString()));
+			apply_mode(QStringLiteral("intranet"));
+		});
+
 	m_svcInfo = new QLabel(this);
 	m_svcInfo->setGeometry(16, 716, 398, 24);
 	m_svcInfo->setAlignment(Qt::AlignCenter);
 	m_svcInfo->setStyleSheet("color:#8b94a6; font-size:9pt; background:transparent;");
 	m_svcInfo->hide();
 
-	// 启动时后台查一次：由服务端策略决定强制 / 可选 / 无需更新。
-	// 结果的界面表现在全部在设置【关于】页。
 	QTimer::singleShot(0, this, [this]() { m_bridge->check_update(); });
 
 	connect(m_bridge, &AppBridge::updateChecked, this,
@@ -594,23 +599,17 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 			m_updateSha256 = sha256;
 			m_updateLatest = latest;
 			m_updateSize = size;
-			// 包哈希比较（2026-11-02 需求 5）：已装包与服务器包一致 = 已是最新，
-			// 与版本号无关（同版本重发的修复包也能触发提示）。版本号（minimum）
-			// 只用于强制更新判定（大更新必须升级），非强制的提示以包差异为准。
 			const cfgstr iniPathU = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 			const QString installedSha = toQString(
 				IniGetStr(iniPathU, CS("Update"), CS("InstalledSha"), CS("")));
 			if (!installedSha.isEmpty() && installedSha == sha256 && action == 1)
 			{
-				action = 0;   // optional → none：包一致，视为已是最新
+				action = 0;
 			}
-			// 界面表现在全部在设置【关于】页（开着才同步）
 			if (m_setting)
 			{
 				m_setting->applyUpdateInfo(status, action, latest, notes, err, url, sha256, size);
 			}
-			// 全局约束：验签失败 / 强制 → 禁连接 + 阻塞弹窗
-			//（Setting 无 Q_OBJECT 不能自己弹阻塞框，且它可能根本没开）
 			const bool sigBad = (status == 1);
 			const bool forced = (status == 0 && action == 2);
 			if (!sigBad && !forced)
@@ -638,9 +637,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 			m_updateBox = &box;
 			m_boxBtn = primary;
 
-			// 循环 exec：点「立即更新」后弹窗不关闭，进度直接显示在按钮上；
-			// 下载失败回到弹窗（按钮变「下载失败，点此重试」），用户可反复重试；
-			// 成功或点「退出」才离开。
 			for (;;)
 			{
 				box.exec();
@@ -661,11 +657,9 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 					m_bridge->download_and_install(m_updateUrl, m_updateSha256,
 					                               m_updateSize, m_updateLatest);
 				}
-				// 下载中再次 exec：进度经 downloadProgress 显示在 primary 上
 			}
 		});
 
-	// 下载进度：强制弹窗开着时显示在弹窗按钮上，否则显示在设置【关于】页
 	connect(m_bridge, &AppBridge::downloadProgress, this, [this](int pct) {
 		const QString t = pct >= 0 ? QStringLiteral("下载中 %1%").arg(pct)
 		                           : QStringLiteral("下载中...");
@@ -684,18 +678,14 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		m_lastDownloadOk = ok;
 		if (ok)
 		{
-			// 记录已装包哈希：下次检查按包差异判断（不再只看版本号）
 			{
 				const cfgstr iniPathS = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 				IniSetStr(iniPathS, CS("Update"), CS("InstalledSha"),
 				          cfg_from_utf8(m_updateSha256.toStdString()));
 			}
 #if defined(_WIN32)
-			// Windows：Inno 已派发，/CLOSEAPPLICATIONS 会关掉本进程——主动退出让出文件锁
 			qApp->quit();
 #else
-			// Linux：pkexec 已把新版装到 /opt（文件替换不需要退出），
-			// 提示用户手动重启即用上新版
 			if (m_boxBtn)
 			{
 				m_boxBtn->setText(QStringLiteral("安装完成，请重新启动 ScholarVPN"));
@@ -719,17 +709,14 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		}
 	});
 
-	// ---- 受管服务（受管试用 / 状态同步 / 列表自动填卡）----
-	// 启动时同步一次：仅 Mode=managed 时发起（off = 自建，与旧行为完全一致）
 	QTimer::singleShot(0, this, [this]() {
 		const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 		if (IniGetStr(iniPath, CS("Service"), CS("Mode"), CS("")) == CS("managed"))
 		{
-			m_bridge->check_service();      // 状态/凭据同步
-			m_bridge->apply_server_list();  // 列表同步：服务方改钥/改址后启动即跟进
+			m_bridge->check_service();
+			m_bridge->apply_server_list();
 		}
 	});
-	// 受管模式：每 5 分钟同步一次用量（服务端每 30s 才落库一次，别更勤）
 	{
 		auto* svcTimer = new QTimer(this);
 		svcTimer->setInterval(5 * 60 * 1000);
@@ -749,7 +736,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		       qulonglong expireAt, qulonglong quotaBytes, qulonglong usedBytes,
 		       const QString& err) {
 			m_svcCheckPending = false;
-			// 状态落盘（fp/凭据由 broker 返回为准；查失败不动已有值）
 			if (err.isEmpty() && !fp.isEmpty())
 			{
 				const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
@@ -763,10 +749,8 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 				IniSetStr(iniPath, CS("Service"), CS("UsedBytes"),
 				          cfg_from_utf8(std::to_string(usedBytes)));
 			}
-			// 闸门：blocked 才禁连接（同步失败=查不到→放行，与更新系统同语义）
 			m_bridge->set_service_blocked(blocked == 1);
 
-			// 主页用量条：受管模式显示剩余时长/流量（自建模式隐藏）
 			{
 				const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 				const bool managed = IniGetStr(iniPath, CS("Service"), CS("Mode"), CS(""))
@@ -817,7 +801,7 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 						text = QStringLiteral("受管服务 · 尚未申请试用");
 					}
 					if (m_homeUsageBar)
-						update_home_usage();   // 主页卡片用量条同步
+						update_home_usage();
 				}
 				if (text.isEmpty())
 				{
@@ -830,24 +814,22 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 				}
 			}
 
-			// 设置【服务】页开着就同步显示
 			if (m_setting)
 			{
 				m_setting->applyServiceInfo(blocked, reason, fp, clientId, status,
 				                            expireAt, quotaBytes, usedBytes, err);
 			}
 
-			// 阻塞弹窗已开着：刷新结果直接更新/关闭它，绝不再叠新弹窗
 			if (m_svcBox)
 			{
 				if (blocked != 1)
 				{
-					m_svcBox->accept();   // 已放行：关闭弹窗
+					m_svcBox->accept();
 					m_svcBox = nullptr;
 				}
 				else
 				{
-					m_svcBox->setText(reason);   // 仍被锁：原地更新原因
+					m_svcBox->setText(reason);
 				}
 				return;
 			}
@@ -873,7 +855,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 				}
 				return;
 			}
-			// 凭据落盘（token 为一次性注册令牌，与 RegisterToken 同级敏感）
 			const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 			IniSetStr(iniPath, CS("Service"), CS("Fp"), fromQString(fp));
 			IniSetStr(iniPath, CS("Service"), CS("ClientID"), fromQString(clientId));
@@ -883,7 +864,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 			          cfg_from_utf8(std::to_string(expireAt)));
 			IniSetStr(iniPath, CS("Service"), CS("QuotaBytes"),
 			          cfg_from_utf8(std::to_string(quotaBytes)));
-			// 注册成功 → 自动拉服务器列表（serviceServers 里填卡）
 			m_bridge->apply_server_list();
 		});
 
@@ -900,7 +880,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 			apply_managed_servers(count);
 		});
 
-	// 模式切换：切回自建时撤掉受管卡片（切到受管的填卡由 apply_server_list 异步完成）
 	connect(m_bridge, &AppBridge::serviceModeChanged, this, [this](int managed) {
 		if (managed == 0)
 		{
@@ -908,8 +887,6 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		}
 	});
 
-	// 受管模式下「+」新增不生效（服务器由服务方统一下发）：按钮保留，
-	// 点击弹窗说明原因并可直达设置页；自建模式行为不变
 	connect(btn_add, &QPushButton::clicked, this, [this]() {
 		const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 		if (IniGetStr(iniPath, CS("Service"), CS("Mode"), CS("")) != CS("managed")) {
@@ -925,19 +902,18 @@ QtWidgetsClass::QtWidgetsClass(QWidget* parent)
 		box.addButton(QStringLiteral("知道了"), QMessageBox::AcceptRole);
 		box.exec();
 		if (box.clickedButton() == go) {
-			Setting dlg(this, m_bridge, 1);   // 直达「服务」页
+			Setting dlg(this, m_bridge, 1);
 			m_setting = &dlg;
 			dlg.exec();
 			m_setting = nullptr;
 		}
 	});
 
-	// 每秒采样一次流量 → update_speed() 计算速率推入折线图
 	auto* speedTimer = new QTimer(this);
 	connect(speedTimer, &QTimer::timeout, this, &QtWidgetsClass::update_speed);
 	speedTimer->start(1000);
 
-	Read_iniFile();   // 读 config，为每台服务器建卡
+	Read_iniFile();
 	createtray();
 
 }
@@ -963,17 +939,15 @@ void QtWidgetsClass::clear_cards()
 	m_cardServers.clear();
 }
 
-// 读取 config.ini，为每台已配置的服务器建一张卡片
 void QtWidgetsClass::Read_iniFile()
 {
 	delete m_cfg;
 	m_cfg = new Config(cfg_path_join(cfg_app_dir(), CS("config.ini")),
 		cfg_app_dir());
 	ClientConfig cc;
-	clear_cards();   // 先清旧卡
+	clear_cards();
 
 	if (m_cfg->LoadClientConfig(cc)) {
-		// 主服务器 IP（Debug 优先 DebugServerIP，用于兼容旧字段）
 #ifdef _DEBUG
 		m_serverIp = toQString(cc.DebugServerIP.empty() ? cc.ServerIP : cc.DebugServerIP);
 #else
@@ -985,11 +959,11 @@ void QtWidgetsClass::Read_iniFile()
 		m_serverIp = QStringLiteral("--");
 	}
 
-	// 主页面只显示一张卡：选择优先于最新（从未选择过 → 显示最新添加的一张）
 	if (m_selectedCard < 0 || m_selectedCard >= (int)m_cardServers.size())
 		m_selectedCard = m_cardServers.isEmpty() ? -1 : (int)m_cardServers.size() - 1;
 	show_home_card(m_selectedCard);
 	update_dia_highlight();
+	refresh_mode_buttons();
 }
 
 void QtWidgetsClass::write_edit()
@@ -1022,11 +996,10 @@ void QtWidgetsClass::write_edit()
 	QLineEdit* input_token = new QLineEdit;
 	input_token->setPlaceholderText("首次需注册令牌");
 
-	// 服务器身份公钥（多服务器各自独立验签；可选，留空则使用内置公钥）
 	QLabel* pubkey_label = new QLabel("服务器公钥(可选,留空则使用内置公钥): ");
 	QPlainTextEdit* input_pubkey = new QPlainTextEdit;
 	input_pubkey->setPlaceholderText("粘贴该服务器 server_sig.pub 完整内容（含 BEGIN/END 行）");
-	input_pubkey->setFixedHeight(130); 
+	input_pubkey->setFixedHeight(130);
 
 	QString edit_Style = R"(
 QLineEdit{
@@ -1043,7 +1016,6 @@ QLineEdit:focus{border:1px solid #0078d4;}
 	input_id->setStyleSheet(edit_Style);
 	input_token->setStyleSheet(edit_Style);
 
-	// Win11风格 QPlainTextEdit
 	input_pubkey->setStyleSheet(R"(
 QPlainTextEdit{
 	border:1px solid #dcdcdc;
@@ -1116,14 +1088,12 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	lay->addStretch();
 	lay->addLayout(btnLayout);
 
-	// 公钥校验前移到确认时（与编辑服务器一致）：非法留在对话框提示，不静默清空
 	connect(btn_OK, &QPushButton::clicked, &dia, [&]() {
-		// 端口校验：1-65535
 		bool portOk = false;
 		const int port = input_port->text().trimmed().toInt(&portOk);
 		if (!portOk || port < 1 || port > 65535) {
 			QMessageBox::warning(&dia, "提示", "端口无效：应为 1-65535 的数字");
-			return;   // 留在对话框
+			return;
 		}
 
 		QString pk = input_pubkey->toPlainText();
@@ -1148,7 +1118,7 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	const QString newIp = input_ip->text().trimmed();
 	const QString newId = input_id->text().trimmed();
 	const QString newTok = input_token->text().trimmed();
-	const QString newName = input_name->text().trimmed();   // 空 = 用默认 computer+N
+	const QString newName = input_name->text().trimmed();
 	if (newIp.isEmpty()) {
 		QMessageBox::warning(this, "提示", "服务器 IP 不能为空");
 		return;
@@ -1173,7 +1143,6 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	if (pubkeyB64.length() != 60)
 		pubkeyB64.clear();
 
-	// 追加到 [ServerN] 节（真正多服务器，含各自身份）
 	const cfgstr inipath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 	const int count = IniGetInt(inipath, CS("Server"), CS("Count"), 0);
 	const int idx = count + 1;
@@ -1188,10 +1157,9 @@ QPushButton:pressed{background-color:#d8d8d8;}
 	IniSetInt(inipath, CS("Server"), CS("Count"), idx);
 
 	Read_iniFile();
-	
+
 }
 
-// dia 中的可选卡片：头像 + 名称 + IP，点击整卡选中（无连接/编辑按钮，操作都在主页面卡片上）
 void QtWidgetsClass::create_card(const ServerEntry& entry)
 {
 	const QString name = entry.Name.empty()
@@ -1219,7 +1187,6 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	}
 	)");
 
-	// 头像：服务器名首字母，圆形渐变底
 	QLabel* avatar = new QLabel(card);
 	avatar->setGeometry(16, 24, 48, 48);
 	avatar->setAlignment(Qt::AlignCenter);
@@ -1235,26 +1202,23 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	)");
 
 	QLabel* lab_name = new QLabel(card);
-	lab_name->setGeometry(78, 22, 210, 26);   // 右侧留出传输下拉框的位置
+	lab_name->setGeometry(78, 22, 210, 26);
 	lab_name->setText(name);
 	lab_name->setStyleSheet("background:transparent; font-size:11pt; font-weight:bold; color:#1f2937;");
 
 	QLabel* lab_ip = new QLabel(card);
 	lab_ip->setGeometry(78, 54, 210, 22);
-	// 受管卡片不显示 IP/端口（服务方地址不暴露给使用者），改显官方标识（青色）
 	lab_ip->setText(entry.managed ? QStringLiteral("官方服务 · 服务方下发") : ("IP: " + ip));
 	lab_ip->setStyleSheet(entry.managed
 	    ? "background:transparent; font-size:9pt; color:#0891b2;"
 	    : "background:transparent; font-family:Consolas,'Courier New',monospace; font-size:9pt; color:#6b7280;");
 
-	// 在线状态圆点：该服务器正处于已连接状态时显示（update_dia_highlight 维护）
 	QLabel* dot = new QLabel(card);
 	dot->setGeometry(286, 26, 8, 8);
 	dot->setStyleSheet("background-color:#3fb950; border-radius:4px;");
 	dot->hide();
 	m_cardDots.append(dot);
 
-	// 传输方式下拉框：UDP / TCP（userData = ServerEntry.transport，0=UDP 1=TCP）
 	QComboBox* box_sock = new CenteredComboBox(card);
 	box_sock->setGeometry(entry.managed ? 296 : 278, 20, 92, 24);
 	box_sock->setCursor(Qt::PointingHandCursor);
@@ -1289,7 +1253,6 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	}
 	)");
 	const int sockIdx = static_cast<int>(m_cards.size());
-	// 选择即持久化：写入该服务器的 Transport 配置并同步内存（连接时生效）
 	connect(box_sock, &QComboBox::currentIndexChanged, this, [this, sockIdx, box_sock](int index) {
 		if (sockIdx < 0 || sockIdx >= (int)m_cardServers.size())
 			return;
@@ -1298,7 +1261,7 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 		IniSetInt(inipath, CS("Server") + cfg_num(sockIdx + 1),
 		          CS("Transport"), m_cardServers[sockIdx].transport);
 	});
-	card->installEventFilter(this);   // 整卡可点 → 选中
+	card->installEventFilter(this);
 
 	m_cardLayout->insertWidget(m_cardLayout->count() - 1, card);
 
@@ -1306,19 +1269,45 @@ void QtWidgetsClass::create_card(const ServerEntry& entry)
 	m_cardServers.append(entry);
 }
 
-// dia 中点击某张卡片：设为当前选择 → 主页面更新 → 高亮 → 收起弹窗
 void QtWidgetsClass::select_card(int index)
 {
 	if (index < 0 || index >= (int)m_cardServers.size())
 		return;
 	m_selectedCard = index;
+	refresh_mode_buttons();
 	update_dia_highlight();
 	show_home_card(index);
 	if (m_diaCard)
 		m_diaCard->hide();
 }
 
-// 刷新 dia 列表的选中高亮（当前主页面显示的卡片描边标蓝）
+// 受管服务器（服务方下发）不开放内网访问：卡片切换与连接状态变化时刷新
+void QtWidgetsClass::refresh_mode_buttons()
+{
+	if (!m_btnGlobal || !m_btnSplit || !m_btnIntranet) {
+		return;
+	}
+	const bool stopped = (m_state == ConnState::Stopped);
+	const bool hasSel = (m_selectedCard >= 0 &&
+	                     m_selectedCard < static_cast<int>(m_cardServers.size()));
+	const bool managed = hasSel && m_cardServers.at(m_selectedCard).managed;
+
+	m_btnGlobal->setEnabled(stopped);
+	m_btnSplit->setEnabled(stopped);
+	m_btnIntranet->setEnabled(stopped && !managed);
+	m_btnIntranet->setToolTip(managed
+		? QStringLiteral("受管服务器（由服务方下发）不支持内网访问")
+		: QStringLiteral("只让指定内网网段走隧道，其余流量走本地网络"));
+
+	if (managed && m_btnIntranet->isChecked()) {
+		// 选中的是受管卡片：内网模式退回全局，避免下次连接一条路由都没有
+		m_btnGlobal->setChecked(true);
+		const cfgstr modeIni = cfg_path_join(cfg_app_dir(), CS("config.ini"));
+		IniSetStr(modeIni, CS("Routing"), CS("Mode"), CS("full"));
+		m_bridge->set_routing_mode(QStringLiteral("full"));
+	}
+}
+
 void QtWidgetsClass::update_dia_highlight()
 {
 	const bool online = (m_state == ConnState::Connected);
@@ -1327,13 +1316,11 @@ void QtWidgetsClass::update_dia_highlight()
 		m_cards[i]->style()->unpolish(m_cards[i]);
 		m_cards[i]->style()->polish(m_cards[i]);
 	}
-	// 在线圆点：只标当前已连接的那台服务器
 	for (int i = 0; i < m_cardDots.size() && i < m_cards.size(); ++i) {
 		m_cardDots[i]->setVisible(online && i == m_activeCard);
 	}
 }
 
-// 半透明区摘要卡
 void QtWidgetsClass::update_glass_card()
 {
 	if (m_selectedCard < 0 || m_selectedCard >= (int)m_cardServers.size()) {
@@ -1348,11 +1335,9 @@ void QtWidgetsClass::update_glass_card()
 	m_glassIp->setText(e.managed ? QStringLiteral("受管服务")
 	                             : ("IP: " + toQString(e.ServerIP)));
 
-	// 内网 IP：与主页面卡片一致（已连接时显示服务端分配的虚拟 IP）
 	const QString vip = m_homeVip->text();
 	m_glassVip->setText(vip == "内网IP: --" ? "内网IP: --" : vip);
 
-	// 连接状态文字与颜色
 	QString stateText;
 	QString stateColor;
 	switch (m_state) {
@@ -1368,7 +1353,6 @@ void QtWidgetsClass::update_glass_card()
 	m_glassCard->show();
 }
 
-// 主页面显示指定服务器的卡片（连接 + 编辑）
 void QtWidgetsClass::show_home_card(int index)
 {
 	if (index < 0 || index >= (int)m_cardServers.size()) {
@@ -1383,10 +1367,7 @@ void QtWidgetsClass::show_home_card(int index)
 	m_homeName->setText(name);
 	m_homeAvatar->setText(name.left(1).toUpper());
 	m_homeVip->setText("内网IP: --");
-	// 受管卡片不显示「管理」：服务器与身份均由服务方下发，编辑会破坏受管语义
 	m_homeEditBtn->setVisible(!e.managed);
-	// 受管卡片：不显示 IP 等服务方地址信息，显示受管徽标 + 用量进度；
-	// 服务器更换走 Switch 按钮（Switch 卡片只显示地名）
 	m_homeTag->setVisible(e.managed);
 	m_homeUsageBar->setVisible(e.managed);
 	m_homeUsageText->setVisible(e.managed);
@@ -1399,17 +1380,14 @@ void QtWidgetsClass::show_home_card(int index)
 	update_home_btn();
 	m_homeCard->show();
 	m_homeHint->hide();
-	update_glass_card();     // 覆盖层摘要卡跟随显示同一台服务器
+	update_glass_card();
 }
 
-// 受管服务的用量行/进度条（读最近一次同步进 config 的 [Service] 数据；
-// 数据源由 serviceChecked 每 5 分钟/手动刷新写入，这里只做展示）
 void QtWidgetsClass::update_home_usage()
 {
 	const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 	const std::string status = narrow(IniGetStr(iniPath, CS("Service"), CS("Status"), CS("")));
 	if (status != "trial") {
-		// 正式用户显示"已授权"，无进度条；非受管数据则整体隐藏
 		if (status == "approved") {
 			const unsigned long long used = std::strtoull(narrow(
 				IniGetStr(iniPath, CS("Service"), CS("UsedBytes"), CS("0"))).c_str(), nullptr, 10);
@@ -1446,7 +1424,6 @@ void QtWidgetsClass::update_home_usage()
 	                                  QString::fromStdString(svc_fmt_bytes(quota))));
 }
 
-// 按当前连接状态刷新主页面"连接/断开"按钮（三态：蓝=连接 橙=连接中 红=断开）
 void QtWidgetsClass::update_home_btn()
 {
 	QString text;
@@ -1461,7 +1438,6 @@ void QtWidgetsClass::update_home_btn()
 		text = "断  开";
 		grad = "stop:0 #f05252,stop:1 #dc2626";
 	}
-	// 左缘状态色条与按钮同色系（空闲蓝/连接中橙/已连绿/错误红）
 	QString accent = "#3b82f6";
 	if (m_state == ConnState::Connected)        accent = "#10b981";
 	else if (m_state == ConnState::Connecting)  accent = "#f5a623";
@@ -1487,7 +1463,6 @@ void QtWidgetsClass::update_home_btn()
 	)").arg(grad));
 }
 
-// 整卡点击选中
 bool QtWidgetsClass::eventFilter(QObject* obj, QEvent* ev)
 {
 	if (ev->type() == QEvent::MouseButtonRelease) {
@@ -1507,7 +1482,6 @@ void QtWidgetsClass::show_switch_dialog()
 	if (!m_diaCard)
 		return;
 	Read_iniFile();
-	// 覆盖层是主窗口子控件：显示时同步尺寸并抬到最顶（盖过 Switch 按钮等绝对定位控件）
 	if (m_diaCard->isHidden()) {
 		m_diaCard->setGeometry(this->rect());
 		m_diaCard->show();
@@ -1517,7 +1491,6 @@ void QtWidgetsClass::show_switch_dialog()
 	}
 }
 
-// 主窗口尺寸变化：覆盖层跟随铺满
 void QtWidgetsClass::resizeEvent(QResizeEvent* ev)
 {
 	QWidget::resizeEvent(ev);
@@ -1534,16 +1507,13 @@ void QtWidgetsClass::createtray()
 
 	m_trayicon = new QSystemTrayIcon(this);
 
-	// 托盘图标：优先 Qt 资源，其次相对路径查找（基准为 exe 所在目录），
-	// 最后回退系统标准图标。
-	// 注意：本工程没有 .qrc，":/source/icon.ico" 实际取不到
 	QIcon trayIcon(":/source/icon.ico");
 	if (trayIcon.isNull()) {
 		const QString dir = QCoreApplication::applicationDirPath();
 		const QString candidates[] = {
-			dir + "/icon.ico",                    // 相对 exe 目录：PostBuild 拷贝来的 icon.ico
-			dir + "/source/icon.ico",             // 相对 exe 目录：exe 旁若有 source 子目录
-			QStringLiteral("source/icon.ico")     // 相对当前工作目录（VS 调试时 cwd = 工程根）
+			dir + "/icon.ico",
+			dir + "/source/icon.ico",
+			QStringLiteral("source/icon.ico")
 		};
 		for (const QString& p : candidates) {
 			QIcon candidate(p);
@@ -1554,7 +1524,7 @@ void QtWidgetsClass::createtray()
 		qDebug() << "托盘图标加载失败（无 .qrc 且未找到 icon.ico），使用系统默认图标";
 		trayIcon = style()->standardIcon(QStyle::SP_ComputerIcon);
 	}
-	m_trayicon->setIcon(trayIcon);           
+	m_trayicon->setIcon(trayIcon);
 	m_trayicon->setToolTip("ScholarVPN");
 
 	m_menu = new QMenu(this);
@@ -1579,7 +1549,7 @@ void QtWidgetsClass::createtray()
 	connect(m_actionQuit, &QAction::triggered, qApp, &QApplication::quit);
 	connect(m_trayicon, &QSystemTrayIcon::activated, this,
 		[this](QSystemTrayIcon::ActivationReason reason) {
-			if (reason == QSystemTrayIcon::DoubleClick) //左键单击
+			if (reason == QSystemTrayIcon::DoubleClick)
 			{
 				this->showNormal();
 				this->raise();
@@ -1587,8 +1557,7 @@ void QtWidgetsClass::createtray()
 			}
 		});
 	m_trayicon->show();
-}	
-
+}
 
 void QtWidgetsClass::closeEvent(QCloseEvent* event)
 {
@@ -1596,7 +1565,7 @@ void QtWidgetsClass::closeEvent(QCloseEvent* event)
 	{
 		hide();
 		m_trayicon->showMessage("提示", "程序最小化到托盘，右键托盘图标操作");
-		event->ignore(); // 忽略关闭事件，不退出
+		event->ignore();
 	}
 	else
 	{
@@ -1761,19 +1730,15 @@ QPushButton:hover{background-color:#FF0000;}
 	lay->addStretch();
 	lay->addLayout(btnLayout);
 
-	// 公钥校验前移到确认时：非法直接提示并留在对话框，而不是静默清空后写空串
 	connect(btn_OK, &QPushButton::clicked, &dia, [&]() {
-		// 端口校验：1-65535
 		bool portOk = false;
 		const int port = edit_port->text().trimmed().toInt(&portOk);
 		if (!portOk || port < 1 || port > 65535) {
 			QMessageBox::warning(&dia, "提示", "端口无效：应为 1-65535 的数字");
-			return;   // 留在对话框
+			return;
 		}
 
 		QString pk = input_pubkey->toPlainText();
-		// 稳健归一化：先去空白，再按标记词剥离 PEM 头尾（容忍横线缺失/数量不定），
-		// base64 字母表不含 '-'，最后清掉所有连字符即可
 		pk.remove(QRegularExpression("\\s"));
 		pk.remove(QRegularExpression("-+BEGIN[^-]*?-+"));
 		pk.remove(QRegularExpression("-*END[^-]*?-+"));
@@ -1783,7 +1748,7 @@ QPushButton:hover{background-color:#FF0000;}
 				QString("服务器公钥格式无效：应为 60 位 base64（server_sig.pub 的正文行），当前为 %1 位。\n"
 					"注意：不要复制 registered_clients.txt 里的 hex 或客户端日志整段；\n"
 					"留空 = 使用内置公钥。").arg(pk.size()));
-			return;   // 不关闭，让用户修改
+			return;
 		}
 		dia.accept();
 	});
@@ -1797,12 +1762,11 @@ QPushButton:hover{background-color:#FF0000;}
 		if (msg == QMessageBox::Yes) {
 			const cfgstr inipath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
 			IniDelSection(inipath, CS("Server") + cfg_num(m_selectedCard + 1));
-			// 显式维护 Count，不依赖 Read_iniFile 的重排兜底
 			const int cnt = IniGetInt(inipath, CS("Server"), CS("Count"), 0);
 			IniSetInt(inipath, CS("Server"), CS("Count"), qMax(0, cnt - 1));
 			m_selectedCard = -1;
 			Read_iniFile();
-			dia.reject();   // 以“取消”语义关闭：避免 exec 返回 Accepted 后落入下方保存分支，把旧值写回别的节
+			dia.reject();
 		}
 	});
 	if (dia.exec() != QDialog::Accepted)
@@ -1811,7 +1775,7 @@ QPushButton:hover{background-color:#FF0000;}
 	const QString newIP = edit_ip->text().trimmed();
 	const QString newID = edit_ID->text().trimmed();
 	const QString newToken = edit_token->text().trimmed();
-	const QString newName = edit_name->text().trimmed();   // 空 = 用默认 computer+N
+	const QString newName = edit_name->text().trimmed();
 
 	if (newIP.isEmpty()) {
 		QMessageBox::warning(this, "提示", "服务器 IP 不能为空");
@@ -1853,14 +1817,13 @@ QPushButton:hover{background-color:#FF0000;}
 	Read_iniFile();
 }
 
-// 每秒采样：累计字节差值 → 速率（字节/秒），推入折线图（rx=下载 tx=上传）
 void QtWidgetsClass::update_speed()
 {
 	if (!m_bridge)
 		return;
 	const uint64_t rx = m_bridge->rx_bytes();
 	const uint64_t tx = m_bridge->tx_bytes();
-	if (m_speedFirst) {          // 首次采样没有增量基准，速率为 0
+	if (m_speedFirst) {
 		m_speedFirst = false;
 	}
 	else if (m_speedChart) {
@@ -1870,17 +1833,12 @@ void QtWidgetsClass::update_speed()
 	m_txLast = tx;
 }
 
-
 namespace {
 
-
-// 开机自启动：用 QSettings 写当前用户注册表 Run 键（HKCU，无需管理员权限）。
-// 值 = "<exe 完整路径>"，用户登录时由系统拉起。
 const QString kRunKey =
 	QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const QString kRunValue = QStringLiteral("ScholarVPN");
 
-// 带引号的 exe 路径（防路径含空格）
 QString autostart_command()
 {
 	return QLatin1Char('"')
@@ -1894,7 +1852,6 @@ bool autostart_is_enabled()
 	const QString value = reg.value(kRunValue).toString();
 	if (value.isEmpty())
 		return false;
-	// 用 exe 路径判定：程序挪过位置则视为未启用（重新勾选会写入新路径）
 	return value.contains(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()),
 		Qt::CaseInsensitive);
 }
@@ -1910,15 +1867,8 @@ bool autostart_set(bool enable)
 	return reg.status() == QSettings::NoError;
 }
 
-} // namespace
+}
 
-// ===========================================================================
-// 受管服务（QtWidgetsClass 侧）
-// ===========================================================================
-
-// 服务不可用阻塞弹窗：无关闭按钮 + Esc 屏蔽，只有「刷新状态」与「退出」。
-// 刷新是异步的（ActionRole 点击不关窗），结果经 serviceChecked 原地更新文本
-// 或 accept 关闭——绝不在这个弹窗之上再叠第二个弹窗。
 void QtWidgetsClass::show_service_blocked_box(const QString& reason)
 {
 	QMessageBox* box = new QMessageBox(QMessageBox::Warning,
@@ -1943,9 +1893,6 @@ void QtWidgetsClass::show_service_blocked_box(const QString& reason)
 	delete box;
 }
 
-// 把拉到的受管服务器合并进 [ServerN]：撤掉上次下发的（按 [Service]
-// ManagedServers 记录识别），追加新列表；用户自建卡片原样保留。
-// 读 [ServerN] 全部条目（countOut 返回原 Count，供写回时清理脏节）
 std::vector<ServerEntry> QtWidgetsClass::read_server_entries(const cfgstr& ini_path, int* countOut)
 {
 	const int count = IniGetInt(ini_path, CS("Server"), CS("Count"), 0);
@@ -1971,7 +1918,6 @@ std::vector<ServerEntry> QtWidgetsClass::read_server_entries(const cfgstr& ini_p
 	return list;
 }
 
-// 重写 [ServerN]：先删 [1..oldCount] 全部旧节（删中间台不残留脏节），再按序写回
 void QtWidgetsClass::write_server_entries(const cfgstr& ini_path, int oldCount,
                                           const std::vector<ServerEntry>& list)
 {
@@ -2002,7 +1948,6 @@ void QtWidgetsClass::apply_managed_servers(int count)
 
 	if (list.empty())
 	{
-		// 空列表不动作（保留现状）；失败场景已在 serviceServers 分支处理
 		if (m_setting)
 		{
 			m_setting->applyServiceServers(QStringLiteral("服务器列表为空"));
@@ -2016,7 +1961,6 @@ void QtWidgetsClass::apply_managed_servers(int count)
 	    IniGetStr(iniPath, CS("Service"), CS("ManagedServers"), CS("")))
 	    .split(QLatin1Char(','), Qt::SkipEmptyParts);
 
-	// 只保留非受管的（受管的这批整体被新列表替换）
 	std::vector<ServerEntry> keep;
 	for (const auto& e : existing)
 	{
@@ -2028,9 +1972,6 @@ void QtWidgetsClass::apply_managed_servers(int count)
 		}
 	}
 
-	// 注意：受管条目共用同一 client_id/token（配额按 client_id 计，共享 2GB 池）。
-	// 同机单服务器部署下 token 只被该服务器消费一次；将来多台托管服务器需要
-	// broker 按台发号（方案 8.3 预留），P0 先如实按单台实现。
 	const QString svcId = toQString(IniGetStr(iniPath, CS("Service"), CS("ClientID"), CS("")));
 	const QString svcToken = toQString(IniGetStr(iniPath, CS("Service"), CS("Token"), CS("")));
 	QString managedList;
@@ -2040,7 +1981,7 @@ void QtWidgetsClass::apply_managed_servers(int count)
 		int port = 0;
 		if (!service::split_addr(s.addr, ip, port))
 		{
-			continue;   // 坏行跳过
+			continue;
 		}
 		ServerEntry e;
 		e.Name = to_cfgstr(s.remark.empty() ? s.addr : s.remark);
@@ -2050,9 +1991,6 @@ void QtWidgetsClass::apply_managed_servers(int count)
 		e.RegisterToken = fromQString(svcToken);
 		e.ServerPubKey = fromQString(QString::fromStdString(s.pubkey_b64));
 		e.managed = true;
-		// 受管默认 TCP：实测移动网络 UDP 国际方向被 QoS 丢弃（握手通、数据全死）。
-		// 但用户若在卡片上手动切过传输方式，刷新列表时必须保留他的选择——
-		// 否则"切了 TCP、重启又变回 UDP"，永远测不出真实结果（已踩过）。
 		e.transport = 1;
 		{
 			const QString addr = QString::fromStdString(s.addr);
@@ -2077,7 +2015,7 @@ void QtWidgetsClass::apply_managed_servers(int count)
 	write_server_entries(iniPath, oldCount, keep);
 	IniSetStr(iniPath, CS("Service"), CS("ManagedServers"), fromQString(managedList));
 
-	m_selectedCard = -1;   // 卡片集合变了，交由 Read_iniFile 收敛选中项
+	m_selectedCard = -1;
 	Read_iniFile();
 	if (m_setting)
 	{
@@ -2088,8 +2026,6 @@ void QtWidgetsClass::apply_managed_servers(int count)
 	}
 }
 
-// 切回「自建」：把受管卡片从 [ServerN] 撤掉——自建模式不应看到也不应连服务方下发的卡。
-// ManagedServers 记录保留：切回受管后 apply_server_list 仍按它正确替换批次。
 void QtWidgetsClass::remove_managed_cards()
 {
 	const cfgstr iniPath = cfg_path_join(cfg_app_dir(), CS("config.ini"));
@@ -2098,7 +2034,7 @@ void QtWidgetsClass::remove_managed_cards()
 	    .split(QLatin1Char(','), Qt::SkipEmptyParts);
 	if (managed.isEmpty())
 	{
-		return;   // 从未下发过受管卡
+		return;
 	}
 	int oldCount = 0;
 	const std::vector<ServerEntry> existing = read_server_entries(iniPath, &oldCount);
@@ -2114,7 +2050,7 @@ void QtWidgetsClass::remove_managed_cards()
 	}
 	if (keep.size() == existing.size())
 	{
-		return;   // 列表里没有受管卡
+		return;
 	}
 	write_server_entries(iniPath, oldCount, keep);
 	m_selectedCard = -1;
@@ -2145,7 +2081,6 @@ void Setting::create_setting()
 	}
 	setFixedSize(dlgWidth, SETTING_DLG_HEIGHT);
 
-	// 窗口居中到父窗口
 	if (parentWidget())
 	{
 		this->move(parentWidget()->window()->frameGeometry().center() - this->frameGeometry().center());
@@ -2210,7 +2145,7 @@ void Setting::create_setting()
 	stack->addWidget(generalPage);
 
 	build_about_page(stack, nav);
-	build_service_page(stack, nav);   // insertWidget(1)：排在通用后、关于前
+	build_service_page(stack, nav);
 
 	connect(nav, &QListWidget::currentRowChanged, stack, &QStackedWidget::setCurrentIndex);
 	body->addWidget(nav);
@@ -2268,12 +2203,8 @@ void Setting::create_setting()
 	root->addLayout(btnRow);
 }
 
-// ---------------- 设置【关于】页 ----------------
-
 void Setting::build_about_page(QStackedWidget* stack, QListWidget* nav)
 {
-	// 注意：导航项「关于」由 create_setting 统一添加（这里只建页面），
-	// 在这里再加一次会导致左栏出现两个「关于」。
 	QWidget* page = new QWidget;
 	auto* lay = new QVBoxLayout(page);
 	lay->setContentsMargins(0, 0, 0, 0);
@@ -2309,7 +2240,7 @@ void Setting::build_about_page(QStackedWidget* stack, QListWidget* nav)
 			return;
 		}
 		m_aboutStatus->setText(QStringLiteral("检查中..."));
-		m_bridge->check_update();   // 结果经主界面转发 applyUpdateInfo
+		m_bridge->check_update();
 	});
 	cl->addWidget(m_btnCheck);
 
@@ -2322,7 +2253,7 @@ void Setting::build_about_page(QStackedWidget* stack, QListWidget* nav)
 	m_btnUpdateNow = new QPushButton(QStringLiteral("立即更新"), card);
 	m_btnUpdateNow->setCursor(Qt::PointingHandCursor);
 	m_btnUpdateNow->setFixedHeight(30);
-	m_btnUpdateNow->hide();   // 有更新时才显示
+	m_btnUpdateNow->hide();
 	m_btnUpdateNow->setStyleSheet(
 	    "QPushButton{background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
 	    "stop:0 #4f8ef7,stop:1 #2563eb);border:none;border-radius:8px;"
@@ -2354,7 +2285,6 @@ void Setting::applyUpdateInfo(int status, int action, const QString& latest,
 	m_latest = latest;
 	m_notes = notes;
 	m_size = size;
-	// 阻塞判定与主界面一致（双保险，主界面也会做同样的事）
 	if (m_bridge != nullptr)
 	{
 		m_bridge->set_update_blocked(status == 1 || (status == 0 && action == 2));
@@ -2393,7 +2323,6 @@ void Setting::applyUpdateInfo(int status, int action, const QString& latest,
 		m_btnUpdateNow->hide();
 		return;
 	}
-	// 网络失败：不打扰（未启用时 err 会说明原因）
 	if (!err.contains(QStringLiteral("未启用")))
 	{
 		m_aboutStatus->setText(QStringLiteral("检查失败：%1").arg(err));
@@ -2413,7 +2342,6 @@ void Setting::applyDownloadFinished(bool ok, const QString& err)
 {
 	if (ok)
 	{
-		// 退出由主界面统一执行（强制弹窗也在等这个信号）
 		if (m_aboutStatus != nullptr)
 		{
 			m_aboutStatus->setText(QStringLiteral("安装器已启动，程序即将退出…"));
@@ -2435,8 +2363,6 @@ void Setting::applyDownloadFinished(bool ok, const QString& err)
 	}
 }
 
-// 设置【服务】页：受管模式状态展示 + 申请试用 / 刷新状态入口。
-// 导航项「服务」由 create_setting 统一插入（row=1），页面 insertWidget(1) 对齐。
 void Setting::build_service_page(QStackedWidget* stack, QListWidget* nav)
 {
 	Q_UNUSED(nav);
@@ -2458,11 +2384,8 @@ void Setting::build_service_page(QStackedWidget* stack, QListWidget* nav)
 	    "font-size:13pt; font-weight:bold; color:#1f2937; background:transparent;");
 	cl->addWidget(title);
 
-	// 接入点随发行版内置（service_bootstrap.h），「使用服务方」恒可用；
-	// config.ini [Service] 仅作覆盖（测试/换址），不再是启用前提。
 	const bool managedNow = st_cfg_managed();
 
-	// —— 来源选择（先设初始态再连信号，避免构建页面时误触发切换）——
 	QRadioButton* rbSelf = new QRadioButton(
 	    QStringLiteral("自建服务器（自己搭建的服务端）"), card);
 	QRadioButton* rbManaged = new QRadioButton(
@@ -2492,7 +2415,6 @@ void Setting::build_service_page(QStackedWidget* stack, QListWidget* nav)
 	m_svcDetail->setWordWrap(true);
 	cl->addWidget(m_svcDetail);
 
-	// —— 受管状态区：仅「使用服务方」时显示操作按钮 ——
 	const bool svcActive = managedNow;
 	if (svcActive)
 	{
@@ -2512,7 +2434,7 @@ void Setting::build_service_page(QStackedWidget* stack, QListWidget* nav)
 			if (m_bridge == nullptr) return;
 			m_btnSvcApply->setEnabled(false);
 			m_svcStatus->setText(QStringLiteral("申请中..."));
-			m_bridge->register_service();   // 结果经主界面转发 applyServiceInfo
+			m_bridge->register_service();
 		});
 		btnRow->addWidget(m_btnSvcApply);
 		m_btnSvcRefresh = new QPushButton(QStringLiteral("刷新状态"), card);
@@ -2522,8 +2444,8 @@ void Setting::build_service_page(QStackedWidget* stack, QListWidget* nav)
 		connect(m_btnSvcRefresh, &QPushButton::clicked, this, [this]() {
 			if (m_bridge == nullptr) return;
 			m_svcStatus->setText(QStringLiteral("检查中..."));
-			m_bridge->check_service();      // 状态/凭据同步
-			m_bridge->apply_server_list();  // 服务器列表一并刷新（服务方可更新公钥/地址）
+			m_bridge->check_service();
+			m_bridge->apply_server_list();
 		});
 		btnRow->addWidget(m_btnSvcRefresh);
 		cl->addLayout(btnRow);
@@ -2541,7 +2463,7 @@ void Setting::build_service_page(QStackedWidget* stack, QListWidget* nav)
 
 	lay->addWidget(card);
 	lay->addStretch();
-	stack->insertWidget(1, page);   // 通用(0) → 服务(1) → 关于(2)
+	stack->insertWidget(1, page);
 }
 
 bool Setting::st_cfg_managed() const
@@ -2558,9 +2480,8 @@ void Setting::applyServiceInfo(int blocked, const QString& reason, const QString
 	Q_UNUSED(reason);
 	if (m_svcStatus == nullptr)
 	{
-		return;   // 服务页未构建（未配置）时无需展示
+		return;
 	}
-	// 申请结果到达：恢复按钮
 	if (m_btnSvcApply != nullptr)
 	{
 		m_btnSvcApply->setEnabled(true);
@@ -2618,12 +2539,9 @@ void Setting::applyServiceInfo(int blocked, const QString& reason, const QString
 
 	if (!clientId.isEmpty() && m_svcDetail != nullptr)
 	{
-		// 只展示账号与指纹前缀（核对用），不展示任何敏感信息；
-		// 鼠标悬停显示完整指纹（老板要求：显示不全的悬停看全部）
 		m_svcDetail->setText(QStringLiteral("账号 %1　机器指纹 %2…")
 		                         .arg(clientId, fp.left(12)));
 		m_svcDetail->setToolTip(fp);
-		// 文字可鼠标选中 → Ctrl+C 复制完整指纹（显示不全时的兜底复制途径）
 		m_svcDetail->setTextInteractionFlags(Qt::TextSelectableByMouse);
 	}
 }

@@ -1,15 +1,3 @@
-// ============================================================================
-// tests/test_probe_route.cpp —— 验证"查到物理出口"这半段（只读，不需要管理员）
-//
-// 路由注入本身要用 CreateIpForwardEntry2（需要管理员），这里只验证：
-//   - probe IP 能否解析为 SOCKADDR_INET
-//   - GetBestRoute2 能否返回物理网卡 LUID 与下一跳
-// 这两步错了，后面的注入一定是错的，而且现象很隐蔽（路由加到了 TUN 上）。
-//
-// 编译运行（MinGW）：
-//   g++ -std=c++17 tests/test_probe_route.cpp -o test_probe.exe -liphlpapi -lws2_32
-// ============================================================================
-
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -42,7 +30,7 @@ bool probe_best_route(const char* ip, MIB_IPFORWARD_ROW2& best)
     return true;
 }
 
-} // namespace
+}
 
 int main()
 {

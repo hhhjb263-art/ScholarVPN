@@ -51,7 +51,7 @@ struct UrlParts {
     std::wstring host;
     INTERNET_PORT port = INTERNET_PORT(443);
     std::wstring path = L"/";
-    std::wstring extra;   // 额外请求头（暂无）
+    std::wstring extra;
 };
 
 bool parse_url(const std::string& url, UrlParts& p)
@@ -74,7 +74,7 @@ bool parse_url(const std::string& url, UrlParts& p)
     }
     else
     {
-        return false;   // 只支持 http/https
+        return false;
     }
 
     const std::size_t slash = rest.find('/');
@@ -95,7 +95,6 @@ bool parse_url(const std::string& url, UrlParts& p)
     return !p.host.empty();
 }
 
-// 统一的句柄清理
 struct HandleGuard {
     HINTERNET h = nullptr;
     ~HandleGuard()
@@ -107,7 +106,6 @@ struct HandleGuard {
     }
 };
 
-// "Name: value" 行 → 小写名 map（受管服务验签头 X-Service-Signature 用）
 void parse_header_lines(const std::string& raw, std::map<std::string, std::string>& out)
 {
     std::size_t pos = 0;
@@ -143,8 +141,9 @@ void parse_header_lines(const std::string& raw, std::map<std::string, std::strin
     }
 }
 
-} // namespace
+}
 
+// 取回更新策略/校验文本（含代理与超时处理），供上层验签
 FetchResult fetch_text(const std::string& url, int timeoutMs)
 {
     FetchResult r;
@@ -167,7 +166,6 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
         return r;
     }
 
-    // 四个阶段分别设超时：解析、连接、发送、接收
     ::WinHttpSetTimeouts(session.h, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
 
     HandleGuard conn;
@@ -189,8 +187,6 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
         return r;
     }
 
-    // 不接受降级证书策略：保持系统默认校验即可（不设置 SECURE_PROTOCOLS，
-    // 让 WinHTTP 用当前系统的 TLS 配置，避免写死 TLS 版本在旧系统上失效）
     if (!::WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
     {
@@ -203,7 +199,6 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
         return r;
     }
 
-    // 原始响应头（状态行 + 头区，CRLF 分隔）→ 解析进 r.headers
     DWORD hdrLen = 0;
     ::WinHttpQueryHeaders(req.h, WINHTTP_QUERY_RAW_HEADERS_CRLF,
                           WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &hdrLen,
@@ -215,9 +210,6 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
                                   WINHTTP_HEADER_NAME_BY_INDEX, hdr.data(),
                                   &hdrLen, WINHTTP_NO_HEADER_INDEX))
         {
-            // 宽字符头直接转 UTF-8 再按行解析（签名头是 ASCII，转换无损）。
-            // ⚠️ n 是含结尾 NUL 的字节数，缓冲必须给足 n 字节——曾写成 n-1
-            // 导致 1 字节堆越界（Debug 堆断言崩溃/Release 静默踩坏相邻块）
             const int n = ::WideCharToMultiByte(CP_UTF8, 0, hdr.data(), -1,
                                                 nullptr, 0, nullptr, nullptr);
             if (n > 1)
@@ -225,7 +217,7 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
                 std::string raw(static_cast<std::size_t>(n), '\0');
                 ::WideCharToMultiByte(CP_UTF8, 0, hdr.data(), -1, &raw[0], n,
                                       nullptr, nullptr);
-                raw.resize(static_cast<std::size_t>(n) - 1);   // 去掉结尾 NUL
+                raw.resize(static_cast<std::size_t>(n) - 1);
                 parse_header_lines(raw, r.headers);
             }
         }
@@ -241,7 +233,6 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
         r.status = static_cast<int>(status);
     }
 
-    // 读 body（分块，直到读完）
     for (;;)
     {
         DWORD avail = 0;
@@ -310,7 +301,7 @@ bool hex_equals_ci(const std::string& a, const std::string& b)
     return true;
 }
 
-} // namespace
+}
 
 DownloadResult download_file(const std::string& url,
                              const std::string& destPath,
@@ -381,8 +372,6 @@ DownloadResult download_file(const std::string& url,
         }
     }
 
-    // Windows 上必须用 _wfopen：std::fopen 按 ANSI 解路径，
-    // 用户目录含中文（C:////Users////张三////)时直接失败，而错误信息只会说"无法写入"
     FILE* f = ::_wfopen(widen(destPath).c_str(), L"wb");
     if (f == nullptr)
     {
@@ -460,7 +449,6 @@ DownloadResult download_file(const std::string& url,
 
     if (!expectedSha256.empty() && !hex_equals_ci(r.sha256, expectedSha256))
     {
-        // 校验不过立即删掉：绝不把可疑的包留在磁盘上
         std::remove(destPath.c_str());
         r.error = "SHA-256 不匹配（期望 " + expectedSha256 + "，实际 " + r.sha256 + "）";
         return r;
@@ -477,15 +465,9 @@ DownloadResult download_file(const std::string& url,
     return r;
 }
 
-} // namespace update
+}
 
-#else // ---------------------------- POSIX ----------------------------
-
-// Linux 实现：OpenSSL TLS + 手写 HTTP/1.0 GET（Connection: close，读到 EOF）。
-// 刻意的限制（策略/安装包托管服务是我们自己的 python http.server，够用）：
-//   - 不支持 chunked（HTTP/1.0 语义下服务器不会返回）
-//   - 不跟随重定向（策略 URL 由我们控制，无重定向）
-//   - 超时作用于连接与读写（SO_RCVTIMEO/SO_SNDTIMEO）
+#else
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -500,7 +482,7 @@ DownloadResult download_file(const std::string& url,
 #include <unistd.h>
 
 #include <openssl/ssl.h>
-#include <openssl/err.h>   // ERR_get_error / ERR_error_string_n
+#include <openssl/err.h>
 
 #include <cstdio>
 #include <cstring>
@@ -509,7 +491,6 @@ DownloadResult download_file(const std::string& url,
 namespace update {
 namespace {
 
-// "Name: value" 行 → 小写名 map（与 Windows 侧同语义；受管服务验签头用）
 void parse_header_lines(const std::string& raw, std::map<std::string, std::string>& out)
 {
     std::size_t pos = 0;
@@ -622,8 +603,6 @@ bool hex_equals_ci(const std::string& a, const std::string& b)
     return true;
 }
 
-// 建立连接（TCP + 可选 TLS），返回 SSL* 或 nullptr（https=false 时 ssl 为空）。
-// fd 通过出参返回；所有资源由调用方按出参清理。
 bool connect_to(const UrlParts& parts, int timeoutMs, int& fdOut, SSL*& sslOut,
                 SSL_CTX*& ctxOut, std::string& error)
 {
@@ -650,9 +629,6 @@ bool connect_to(const UrlParts& parts, int timeoutMs, int& fdOut, SSL*& sslOut,
         {
             continue;
         }
-        // 非阻塞 connect + poll 超时：阻塞式 connect 不受 SO_SNDTIMEO 控制，
-        // IPv6 路由不通时会卡满内核超时（约 2 分钟）才回退 IPv4——
-        // 用户实测「一直检查中」的根因。
         timeval tv{};
         tv.tv_sec = timeoutMs / 1000;
         tv.tv_usec = (timeoutMs % 1000) * 1000;
@@ -672,7 +648,7 @@ bool connect_to(const UrlParts& parts, int timeoutMs, int& fdOut, SSL*& sslOut,
         {
             ::close(fd);
             fd = -1;
-            continue;   // 超时 → 立即尝试下一个地址
+            continue;
         }
         int soerr = 0;
         socklen_t slen = sizeof(soerr);
@@ -683,7 +659,7 @@ bool connect_to(const UrlParts& parts, int timeoutMs, int& fdOut, SSL*& sslOut,
             fd = -1;
             continue;
         }
-        ::fcntl(fd, F_SETFL, fl);   // 恢复阻塞模式（读写由 SO_RCVTIMEO 控制）
+        ::fcntl(fd, F_SETFL, fl);
         break;
     }
     ::freeaddrinfo(res);
@@ -710,7 +686,7 @@ bool connect_to(const UrlParts& parts, int timeoutMs, int& fdOut, SSL*& sslOut,
         return false;
     }
     SSL_set_fd(ssl, fd);
-    SSL_set_tlsext_host_name(ssl, parts.host.c_str());   // SNI
+    SSL_set_tlsext_host_name(ssl, parts.host.c_str());
     if (SSL_connect(ssl) != 1)
     {
         const unsigned long e = ERR_get_error();
@@ -723,14 +699,11 @@ bool connect_to(const UrlParts& parts, int timeoutMs, int& fdOut, SSL*& sslOut,
         error = std::string("TLS 握手失败: ") + buf;
         return false;
     }
-    // 证书校验由调用方决定策略；更新内容的可信性由 Ed25519 签名保证，
-    // TLS 层主要防传输干扰。这里保持系统默认校验关闭与 Windows 版行为一致。
     fdOut = fd;
     sslOut = ssl;
     return true;
 }
 
-// 读整个 HTTP 响应（Connection: close，读到对端关闭）
 bool read_response(int fd, SSL* ssl, std::string& raw, bool& ioOk)
 {
     char buf[16384];
@@ -741,13 +714,13 @@ bool read_response(int fd, SSL* ssl, std::string& raw, bool& ioOk)
                     : static_cast<int>(::read(fd, buf, sizeof(buf)));
         if (n <= 0)
         {
-            break;   // EOF / 超时 / 错误 —— close 语义下 EOF 即正常结束
+            break;
         }
         raw.append(buf, static_cast<std::size_t>(n));
         if (raw.size() > 512 * 1024 * 1024)
         {
             ioOk = false;
-            return false;   // 512MB 上限，防止异常响应拖垮内存
+            return false;
         }
     }
     return true;
@@ -760,7 +733,6 @@ bool parse_http_response(const std::string& raw, int& status, std::string& body)
     {
         return false;
     }
-    // 状态行: HTTP/1.1 200 OK
     const std::size_t sp1 = raw.find(' ');
     if (sp1 == std::string::npos)
     {
@@ -771,7 +743,6 @@ bool parse_http_response(const std::string& raw, int& status, std::string& body)
     return true;
 }
 
-// 统一的传输抽象：https 走 SSL_read/write，http 走 read/write
 struct Conn {
     int fd = -1;
     SSL* ssl = nullptr;
@@ -805,7 +776,7 @@ struct Conn {
     }
 };
 
-} // namespace
+}
 
 FetchResult fetch_text(const std::string& url, int timeoutMs)
 {
@@ -849,7 +820,6 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
     std::string body;
     if (!parse_http_response(raw, status, body))
     {
-        // 诊断：dump 前 120 字节（可读 + hex），看 TLS 层到底读到了什么
         std::string head = raw.substr(0, 120);
         std::string hex;
         for (unsigned char c : head)
@@ -864,7 +834,6 @@ FetchResult fetch_text(const std::string& url, int timeoutMs)
         return r;
     }
     {
-        // 头区单独解析进 r.headers（body 之前的部分）
         const std::size_t hdrEnd = raw.find("\r\n\r\n");
         if (hdrEnd != std::string::npos)
         {
@@ -922,7 +891,6 @@ DownloadResult download_file(const std::string& url,
         return r;
     }
 
-    // 读到头部结束，取状态码，把 body 直接写文件
     std::string raw;
     {
         char buf[16384];
@@ -964,7 +932,6 @@ DownloadResult download_file(const std::string& url,
             r.error = "HTTP 状态码 " + std::to_string(status);
             return r;
         }
-        // 头之后的 body 立即落盘
         FILE* f = std::fopen(destPath.c_str(), "wb");
         if (f == nullptr)
         {
@@ -1057,6 +1024,6 @@ DownloadResult download_file(const std::string& url,
     }
 }
 
-} // namespace update
+}
 
-#endif   // _WIN32
+#endif

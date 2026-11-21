@@ -1,18 +1,3 @@
-// ============================================================================
-// tests/test_service_client.cpp —— 受管服务客户端纯逻辑的离线测试（不联网）
-//
-// 覆盖：凭据 INI 解析 / 闸门判定（到期/超量/拒绝/放行）/ 响应签名验签
-// （现场生成 Ed25519 密钥对签名，篡改与换钥必须被拒——与 test_checker 同思路）。
-//
-// 编译运行（MSVC，需 OpenSSL）：
-//   cl /nologo /MD /DNDEBUG /std:c++20 /EHsc /utf-8 /Zc:__cplusplus /I. /Isrc ^
-//      /Ithird_party\openssl\include ^
-//      tests\test_service_client.cpp src\service\service_client.cpp ^
-//      src\service\machine_id.cpp src\update\update_fetcher.cpp Crypt.cpp ^
-//      /link /LIBPATH:third_party\openssl\lib libcrypto.lib ws2_32.lib
-//      iphlpapi.lib advapi32.lib winhttp.lib
-// ============================================================================
-
 #include "service/service_client.h"
 #include "Crypt.h"
 
@@ -21,7 +6,7 @@
 #include <vector>
 
 #include <openssl/evp.h>
-#include <openssl/pem.h>   // PEM_read_bio_PrivateKey
+#include <openssl/pem.h>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -47,7 +32,6 @@ void check(bool ok, const char* what)
     std::printf("  FAIL  %s\n", what);
 }
 
-// 服务公钥 PEM → SPKI DER base64 单行（verify_signature 的输入格式）
 std::string pem_to_der_b64(const std::string& pem)
 {
     std::string b64body;
@@ -71,7 +55,6 @@ std::string pem_to_der_b64(const std::string& pem)
         }
         b64body += line;
     }
-    // base64 → DER → base64（重编码，顺便验证剥头尾的正确性）
     std::vector<std::uint8_t> der;
     std::uint32_t buf = 0;
     int bits = 0;
@@ -122,7 +105,6 @@ std::string pem_to_der_b64(const std::string& pem)
     return out;
 }
 
-// 私钥 PEM → EVP_PKEY（签测试响应用）
 EVP_PKEY* load_priv(const std::string& pem)
 {
     BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
@@ -135,7 +117,7 @@ std::string sign_b64(EVP_PKEY* priv, const std::string& data)
 {
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     std::vector<std::uint8_t> sig(64);
-    std::size_t sigLen = sig.size();   // 入参必须=缓冲区长度（Ed25519 恒 64）
+    std::size_t sigLen = sig.size();
     const int ok = EVP_DigestSignInit(ctx, nullptr, nullptr, nullptr, priv) == 1
                    && EVP_DigestSign(ctx, sig.data(), &sigLen,
                                      reinterpret_cast<const std::uint8_t*>(data.data()),
@@ -143,7 +125,7 @@ std::string sign_b64(EVP_PKEY* priv, const std::string& data)
     EVP_MD_CTX_free(ctx);
     if (!ok || sigLen != 64)
     {
-        return {};   // 签名失败：返回空串让下游按"空签名"失败
+        return {};
     }
     static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
@@ -159,7 +141,6 @@ std::string sign_b64(EVP_PKEY* priv, const std::string& data)
     }
     if (i + 1 == sigLen)
     {
-        // 尾部剩 1 字节：2 个字符 + "=="（64 字节签名 = 21 组 + 1 字节余数）
         const std::uint32_t n = static_cast<std::uint32_t>(sig[i]) << 16;
         out += T[(n >> 18) & 63];
         out += T[(n >> 12) & 63];
@@ -168,7 +149,7 @@ std::string sign_b64(EVP_PKEY* priv, const std::string& data)
     return out;
 }
 
-} // namespace
+}
 
 int main()
 {
@@ -196,35 +177,28 @@ int main()
 
     std::printf("== 闸门判定 ==\n");
 
-    const std::uint64_t NOW = 1789000100;   // 早于 c1.expire_at（试用中）
-    // 试用中、未超量 → 放行
+    const std::uint64_t NOW = 1789000100;
     check(service::evaluate(c1, NOW).blocked == false, "试用中放行");
-    // 到期 → 阻断
     service::Credentials c2 = c1;
-    c2.expire_at = 1789000000;   // < NOW
+    c2.expire_at = 1789000000;
     check(service::evaluate(c2, NOW).blocked == true, "试用到期阻断");
-    // 超量 → 阻断
     service::Credentials c3 = c1;
     c3.used_bytes = c3.quota_bytes;
     check(service::evaluate(c3, NOW).blocked == true, "配额耗尽阻断");
-    // rejected → 阻断
     service::Credentials c4 = c1;
     c4.status = "rejected";
     check(service::evaluate(c4, NOW).blocked == true, "rejected 阻断");
-    // 正式（expire=quota=0）→ 放行
     service::Credentials c5 = c1;
     c5.status = "approved";
     c5.expire_at = 0;
     c5.quota_bytes = 0;
     check(service::evaluate(c5, NOW).blocked == false, "approved 放行");
-    // 同步失败（invalid）→ 不阻断（查不到→放行）
     service::Credentials c6;
     c6.error = "网络失败";
     check(service::evaluate(c6, NOW).blocked == false, "同步失败放行");
 
     std::printf("== 响应签名验签 ==\n");
 
-    // 现场生成 service 密钥对（与 broker README 同流程）
     const std::string dir = ".";
     const std::string privPath = "test_service_priv.tmp";
     const std::string pubPath = "test_service_pub.tmp";
@@ -256,7 +230,6 @@ int main()
         "used_bytes = 0\nissued = 1789000000\n";
     const std::string sig = sign_b64(priv, body1);
 
-    // 对照组：PEM 直连链路（排除 pem_to_der_b64/pubkey 包装的问题）
     {
         EVP_PKEY* pubDirect = load_ed25519_public_key_pem(pubPem);
         std::vector<std::uint8_t> sigRaw;

@@ -45,7 +45,6 @@ void PacketQueue::shutdown()
     }
     m_condition.notify_all();
 }
-// 服务器 ->  tun ->  push（） ->  隧道  
 bool PacketQueue::push(packet_buffer &&buf)
 {
     {
@@ -68,7 +67,6 @@ bool PacketQueue::pop(packet_buffer &buf)
         if(m_shutdown){
             return false;
         }
-        // 直接检查队列，不要调用 is_empty()（它内部会再次加锁，嵌套锁导致死锁）
         if(m_queue.empty()){
             return false;
         }

@@ -33,7 +33,7 @@ public:
 
 	void push_sample(double rxSpeed, double txSpeed)
 	{
-		for (int i = 0; i < N - 1; ++i) {   // 左移环形窗口：尾部为最新
+		for (int i = 0; i < N - 1; ++i) {
 			m_rx[i] = m_rx[i + 1];
 			m_tx[i] = m_tx[i + 1];
 		}
@@ -48,21 +48,17 @@ protected:
 		QPainter p(this);
 		p.setRenderHint(QPainter::Antialiasing);
 
-		// 卡片底
 		p.setPen(Qt::NoPen);
 		p.setBrush(QColor(0xff, 0xff, 0xff));
 		p.drawRoundedRect(rect(), 14, 14);
 
-		// 绘图区：左侧留刻度文字，顶部留图例/峰值行
 		const QRectF area = rect().adjusted(46, 28, -12, -20);
 
-		// 本窗口峰值（下载/上传取大者），量程与之联动
 		double peak = 0.0;
 		for (int i = 0; i < N; ++i)
 			peak = qMax(peak, qMax(m_rx[i], m_tx[i]));
 		const double vmax = qMax(1024.0, peak) * 1.15;
 
-		// 网格 + 纵向刻度
 		p.setFont(QFont("Segoe UI", 7));
 		for (int g = 0; g <= 3; ++g) {
 			const double y = area.bottom() - area.height() * g / 3.0;
@@ -73,7 +69,6 @@ protected:
 				Qt::AlignRight | Qt::AlignVCenter, format_speed(vmax * g / 3.0));
 		}
 
-		// 峰值虚线：横贯绘图区，标出当前窗口最大速率所在高度
 		if (peak > 0) {
 			const double py = area.bottom() - area.height() * (peak / vmax);
 			QPen dashPen(QColor(0xd9, 0x77, 0x06), 1, Qt::DashLine);
@@ -81,11 +76,9 @@ protected:
 			p.drawLine(QPointF(area.left(), py), QPointF(area.right(), py));
 		}
 
-		// 折线：下载蓝 / 上传绿
 		draw_series(p, area, m_rx, QColor(0x25, 0x63, 0xeb), vmax);
 		draw_series(p, area, m_tx, QColor(0x10, 0xb9, 0x81), vmax);
 
-		// 顶部行：左侧图例，右上方峰值数值
 		p.setFont(QFont("Segoe UI", 8));
 		p.setPen(QColor(0x25, 0x63, 0xeb));
 		p.drawText(QPointF(area.left(), 16), QStringLiteral("■ 下载"));
@@ -98,7 +91,7 @@ protected:
 	}
 
 private:
-	static constexpr int N = 60;   // 保留 60 秒
+	static constexpr int N = 60;
 	double m_rx[N];
 	double m_tx[N];
 
@@ -137,26 +130,22 @@ public:
 	void edit_card();
 	void update_speed();
 private:
-	void clear_cards();                                  // 清空所有卡片（重建前调用）
-	void create_card(const ServerEntry& entry);          // dia 中建一张可选卡片（点击选中）
+	void clear_cards();
+	void create_card(const ServerEntry& entry);
 	void show_switch_dialog();
-	void select_card(int index);       // dia 中选中某卡：更新主页面 + 高亮 + 收起弹窗
-	void show_home_card(int index);    // 主页面显示指定服务器卡片（连接/编辑）
-	void update_glass_card();          // 刷新半透明区里的"当前服务器"摘要卡
-	void update_home_btn();            // 按当前连接状态刷新主页面"连接/断开"按钮
-	void update_dia_highlight();       // 刷新 dia 卡片列表的选中高亮
-	// 受管服务：服务不可用阻塞弹窗（刷新异步：ActionRole 不关窗，结果原地更新/关闭）
+	void select_card(int index);
+	void show_home_card(int index);
+	void update_glass_card();
+	void update_home_btn();
+	void update_dia_highlight();
 	void show_service_blocked_box(const QString& reason);
-	// 受管服务：把拉到的服务器列表合并进 [ServerN]（撤旧托管卡、追加新卡、自建卡不动）
 	void apply_managed_servers(int count);
-	// 受管服务：切回「自建」时把受管卡片从 [ServerN] 撤掉（自建模式不看到/不连服务方卡）
 	void remove_managed_cards();
-	// [ServerN] 读写（apply/remove 共用；oldCount 用于清理删剩的脏节）
 	static std::vector<ServerEntry> read_server_entries(const cfgstr& ini_path, int* countOut);
 	static void write_server_entries(const cfgstr& ini_path, int oldCount,
 	                                 const std::vector<ServerEntry>& list);
 	bool eventFilter(QObject* obj, QEvent* ev) override;
-	void resizeEvent(QResizeEvent* ev) override;   // 覆盖层随主窗口尺寸同步
+	void resizeEvent(QResizeEvent* ev) override;
 	void createtray();
 protected:
 	void closeEvent(QCloseEvent * event) override;
@@ -164,11 +153,10 @@ private:
 	Config* m_cfg = nullptr;
 	Ui::QtWidgetsClassClass ui;
 
-	QWidget*   m_diaCard = nullptr;   // Switch 覆盖层：主窗口内部，默认隐藏，点 Switch 显示
-	QWidget*   m_glassTop = nullptr;  // 覆盖层顶部 200px 半透明区（点击收起）
-	QScrollArea* m_scroll = nullptr;  // 卡片列表滚动区（挂在覆盖层内）
+	QWidget* m_diaCard = nullptr;
+	QWidget* m_glassTop = nullptr;
+	QScrollArea* m_scroll = nullptr;
 
-	// 半透明区里的"当前服务器"摘要卡（选择/最新添加的那张）
 	QFrame*      m_glassCard = nullptr;
 	QLabel*      m_glassName = nullptr;
 	QLabel*      m_glassIp = nullptr;
@@ -177,60 +165,55 @@ private:
 	QWidget* m_cardContainer = nullptr;
 	QVBoxLayout* m_cardLayout = nullptr;
 
-	// dia 中的可选卡片
 	QList<QFrame*>      m_cards;
-	QList<ServerEntry>  m_cardServers;   // 每张卡片绑定的服务器配置（含各自身份）
-	int         m_selectedCard = -1;     // 主页面显示的服务器索引（选择优先于最新）
+	QList<ServerEntry> m_cardServers;
+	int m_selectedCard = -1;
 
-	// 主页面卡片（连接 + 编辑）
 	QFrame*      m_homeCard = nullptr;
 	QLabel*      m_homeName = nullptr;
 	QLabel*      m_homeIp = nullptr;
 	QLabel*      m_homeVip = nullptr;
-	QPushButton* m_homeBtn = nullptr;     // 连接/断开
-	QPushButton* m_homeEditBtn = nullptr; // 编辑
-	QLabel*      m_homeHint = nullptr;    // 无服务器时的占位提示
-	QFrame*      m_homeAccent = nullptr;  // 连接状态色条（卡片左缘）
-	QLabel*      m_homeAvatar = nullptr;  // 服务器头像圈（名称首字母）
-	QLabel*      m_homeTag = nullptr;     // 受管服务徽标（仅受管卡片）
-	QProgressBar* m_homeUsageBar = nullptr;  // 受管用量进度条
-	QLabel*      m_homeUsageText = nullptr; // 受管用量文字
-	QList<QLabel*> m_cardDots;              // Switch 卡片的在线状态圆点
-	void update_home_usage();               // 受管用量行/进度条刷新
+	QPushButton* m_homeBtn = nullptr;
+	QPushButton* m_homeEditBtn = nullptr;
+	QLabel* m_homeHint = nullptr;
+	QFrame* m_homeAccent = nullptr;
+	QLabel* m_homeAvatar = nullptr;
+	QLabel* m_homeTag = nullptr;
+	QProgressBar* m_homeUsageBar = nullptr;
+	QLabel* m_homeUsageText = nullptr;
+	QList<QLabel*> m_cardDots;
+	void update_home_usage();
 
 	QString     m_serverIp;
 	ConnState   m_state{ ConnState::Stopped };
-	int         m_activeCard = -1;   // 当前正在连接/已连接的卡片索引；-1=无
+	int m_activeCard = -1;
 
-	// 速度曲线采样
 	SpeedChart* m_speedChart = nullptr;
-	uint64_t    m_rxLast = 0;        // 上次采样的累计下载字节
-	uint64_t    m_txLast = 0;        // 上次采样的累计上传字节
-	bool        m_speedFirst = true; // 首次采样不产生速度值
+	uint64_t m_rxLast = 0;
+	uint64_t m_txLast = 0;
+	bool m_speedFirst = true;
 
 	AppBridge* m_bridge = nullptr;
 	QThread* m_thread_start = nullptr;
 
-	QPushButton* m_btnSwitch = nullptr;   // Switch Server 按钮（主界面，控制弹窗显隐）
-	QPushButton* m_btnGlobal = nullptr;   // 分流模式：全局（全流量走隧道）
-	QPushButton* m_btnSplit = nullptr;    // 分流模式：智能（国内直连）
-	// 设置对话框【关于】页（弹出期间有效，QPointer 自动置空）
+	QPushButton* m_btnSwitch = nullptr;
+	QPushButton* m_btnGlobal = nullptr;
+	QPushButton* m_btnSplit = nullptr;
+	QPushButton* m_btnIntranet = nullptr;
+	void refresh_mode_buttons();
 	QPointer<Setting> m_setting;
-	// 强制更新弹窗（下载进度直接显示在弹窗按钮上）
 	QPointer<QMessageBox> m_updateBox;
 	QPointer<QPushButton> m_boxBtn;
 
-	// 最近一次检查到的更新信息（「立即更新」时直接用）
 	QString  m_updateUrl;
 	QString  m_updateSha256;
 	QString  m_updateLatest;
 	quint64  m_updateSize = 0;
-	bool m_lastDownloadOk = false;   // 最近一次下载结果（强制弹窗循环据此退出）
+	bool m_lastDownloadOk = false;
 
-	// 受管服务阻塞弹窗（刷新异步进行：结果经 serviceChecked 原地更新或 accept）
 	QPointer<QMessageBox> m_svcBox;
 	bool m_svcCheckPending = false;
-	QLabel* m_svcInfo = nullptr;   // 主页用量条：剩余时长/流量（受管模式显示）
+	QLabel* m_svcInfo = nullptr;
 	QSystemTrayIcon* m_trayicon = nullptr;
 	QMenu* m_menu = nullptr;
 	QAction* m_actionShow = nullptr;
@@ -242,13 +225,11 @@ class Setting : public QDialog {
 public:
 	explicit Setting(QWidget* parent, AppBridge* bridge, int initialPage = 0);
 	~Setting();
-	// 更新状态同步（由主界面转发 AppBridge 信号；本类无 Q_OBJECT，用普通方法）
 	void applyUpdateInfo(int status, int action, const QString& latest,
 	                     const QString& notes, const QString& err,
 	                     const QString& url, const QString& sha256, quint64 size);
 	void applyDownloadProgress(int pct);
 	void applyDownloadFinished(bool ok, const QString& err);
-	// 受管服务状态同步（同上，由主界面转发）
 	void applyServiceInfo(int blocked, const QString& reason, const QString& fp,
 	                      const QString& clientId, const QString& status,
 	                      qulonglong expire, qulonglong quota, qulonglong used,
@@ -258,19 +239,16 @@ private:
 	void create_setting();
 	void build_about_page(class QStackedWidget* stack, class QListWidget* nav);
 	void build_service_page(class QStackedWidget* stack, class QListWidget* nav);
-	// config.ini [Service] Mode 读取（接入点已内置，无需读 URL/公钥）
 	bool st_cfg_managed() const;
-	int m_initialPage = 0;   // 打开时定位的导航页（0=通用 1=服务 2=关于）
+	int m_initialPage = 0;
 	QCheckBox* m_chkAutoStart = nullptr;
 	AppBridge* m_bridge = nullptr;
-	// 关于页控件
 	QLabel* m_aboutVer = nullptr;
 	QLabel* m_aboutStatus = nullptr;
 	QPushButton* m_btnCheck = nullptr;
 	QPushButton* m_btnUpdateNow = nullptr;
 	QString m_url, m_sha256, m_latest, m_notes;
 	quint64 m_size = 0;
-	// 服务页控件
 	QLabel* m_svcStatus = nullptr;
 	QLabel* m_svcDetail = nullptr;
 	QPushButton* m_btnSvcApply = nullptr;

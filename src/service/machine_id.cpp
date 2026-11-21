@@ -3,8 +3,6 @@
 #include <openssl/evp.h>
 
 #if defined(_WIN32)
-// include 顺序照搬 route_manager.h：winsock2/ws2tcpip 必须先于 windows.h，
-// 否则 iptypes/netioapi 里的 IP_ADAPTER_ADDRESSES 与 GAA_* 标志不声明
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #ifndef WIN32_LEAN_AND_MEAN
@@ -50,7 +48,6 @@ std::string to_hex(const unsigned char* data, unsigned int len)
     return out;
 }
 
-// 一次性 SHA-256（OpenSSL 3 的 EVP_Q_digest；失败返回空串）
 std::string sha256_hex(const std::string& data)
 {
     unsigned char md[EVP_MAX_MD_SIZE]{};
@@ -84,15 +81,10 @@ std::string wide_to_utf8(const std::wstring& w)
     return out;
 }
 
-} // namespace
+}
 
 std::string fingerprint_of(const std::string& machine_id)
 {
-    // 只用系统级设备标识：同一台机器上恒定（不随网卡/系统补丁/外设变化）。
-    // v1 曾混入 os/cpu/ram/mac——网卡切换（有线↔无线）或系统补丁都会让
-    // 同一台机器变成"新设备"，违背"机器码必须是固定值"（2026-10-31 老板要求）。
-    // 标识读不到（注册表/文件异常）时返回空指纹——绝不能退化为某个
-    // 固定常量，否则所有读失败的机器会共用同一个"设备身份"。
     if (machine_id.empty())
         return {};
     std::string blob = kFingerprintSalt;
@@ -117,11 +109,11 @@ std::string hash_macs(const std::vector<std::string>& macs_any_format)
         }
         if (mac.size() != 12)
         {
-            continue;   // 非 EUI-48 长度（InfiniBand 20 位等），不参与指纹
+            continue;
         }
         if (mac == "000000000000")
         {
-            continue;   // 未初始化/虚拟占位地址
+            continue;
         }
         normalized.insert(mac);
     }
@@ -145,7 +137,6 @@ std::string hash_macs(const std::vector<std::string>& macs_any_format)
 
 namespace {
 
-// RtlGetVersion 不在 SDK 头文件里暴露结构（winnt.h 不一定带），自带同布局定义。
 struct OsVersionInfoEx {
     unsigned long dwOSVersionInfoSize;
     unsigned long dwMajorVersion;
@@ -168,8 +159,6 @@ std::string collect_os()
     {
         return "Windows";
     }
-    // 仅版本号与架构，不含安装路径/用户信息。
-    // Windows 11 的主/次版本仍是 10.0，只能按 build 号区分（22000 = 21H2 起）
     const char* family = (vi.dwBuildNumber >= 22000) ? "Windows 11" : "Windows 10";
     return std::string(family) + " build " + std::to_string(vi.dwBuildNumber) + " x64";
 }
@@ -199,9 +188,6 @@ std::uint64_t collect_ram_mb()
     return ms.ullTotalPhys / (1024ull * 1024ull);
 }
 
-// 只取"物理网卡"的 MAC：以太网(6) 与 Wi-Fi(71)，处于 Up 状态。
-// 虚拟网卡（Wintun/虚拟机交换机）的 IfType 不在这两类里，天然被排除，
-// 避免装/卸 VPN 虚拟网卡导致指纹漂移。
 std::vector<std::string> collect_macs()
 {
     std::vector<std::string> macs;
@@ -249,8 +235,6 @@ std::vector<std::string> collect_macs()
     return macs;
 }
 
-// 系统级设备标识：HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
-// （系统安装时生成；重启/功能更新/换网卡/插拔外设都不变）
 std::string collect_machine_id()
 {
     wchar_t buf[128] = { 0 };
@@ -267,7 +251,7 @@ std::string collect_machine_id()
     return out;
 }
 
-} // namespace
+}
 
 MachineInfo collect_machine_info()
 {
@@ -282,7 +266,7 @@ MachineInfo collect_machine_info()
     return info;
 }
 
-#else // ---------------- POSIX / Linux ----------------
+#else
 
 namespace {
 
@@ -296,7 +280,6 @@ std::string collect_os()
     return std::string("Linux ") + u.release + " " + u.machine;
 }
 
-// /proc/cpuinfo 第一段 "model name"
 std::string collect_cpu()
 {
     std::ifstream in("/proc/cpuinfo");
@@ -342,7 +325,6 @@ std::uint64_t collect_ram_mb()
     return 0;
 }
 
-// /sys/class/net/*（跳过 lo）的 address 文件
 std::vector<std::string> collect_macs()
 {
     std::vector<std::string> macs;
@@ -370,9 +352,8 @@ std::vector<std::string> collect_macs()
     return macs;
 }
 
-} // namespace
+}
 
-// 系统级设备标识：/etc/machine-id（fallback /var/lib/dbus/machine-id）
 std::string collect_machine_id()
 {
     for (const char* path : { "/etc/machine-id", "/var/lib/dbus/machine-id" }) {
@@ -402,6 +383,6 @@ MachineInfo collect_machine_info()
     return info;
 }
 
-#endif // _WIN32
+#endif
 
-} // namespace service
+}

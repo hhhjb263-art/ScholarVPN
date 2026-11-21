@@ -21,7 +21,7 @@ bool PacketQueue::push(packet_buffer&& buf)
 			return false;
 		}
 		try {
-			m_queue.push(std::move(buf));   
+			m_queue.push(std::move(buf));
 		}
 		catch (...) {
 			return false;
@@ -51,7 +51,6 @@ PacketQueue::PopResult PacketQueue::pop_until(packet_buffer& buf,
 	std::chrono::steady_clock::time_point deadline)
 {
 	std::unique_lock<std::mutex> lock(m_mutex);
-	// 先查再等：有数据立即返回，不落入 wait
 	if (!m_queue.empty()) {
 		buf = std::move(m_queue.front());
 		m_queue.pop();

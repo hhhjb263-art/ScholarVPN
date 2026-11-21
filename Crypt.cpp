@@ -31,7 +31,6 @@ namespace {
     using KdfCtxPtr = std::unique_ptr<EVP_KDF_CTX, decltype(&EVP_KDF_CTX_free)>;
     using MdCtxPtr = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
 
-
     std::string collect_openssl_errors()
     {
         std::string result;
@@ -85,14 +84,13 @@ namespace {
         }
     }
 
-} // namespace
+}
 
 void secure_wipe(std::vector<std::uint8_t>& buffer) noexcept
 {
     if (!buffer.empty())
         OPENSSL_cleanse(buffer.data(), buffer.size());
 
-    // 防止调用者继续读取旧长度的数据。
     buffer.clear();
 }
 
@@ -197,7 +195,6 @@ bool generate_x25519_keypair(
         throw_openssl_error("EVP_PKEY_keygen failed");
     PKeyPtr key(raw_key, &EVP_PKEY_free);
 
-    // Private key, PKCS#8 PEM ("BEGIN PRIVATE KEY")
     {
         BioPtr bio(BIO_new_file(priv_path.c_str(), "wb"), &BIO_free);
         if (!bio)
@@ -207,7 +204,6 @@ bool generate_x25519_keypair(
             throw_openssl_error("PEM_write_bio_PrivateKey failed");
     }
 
-    // Public key PEM ("BEGIN PUBLIC KEY")
     {
         BioPtr bio(BIO_new_file(pub_path.c_str(), "wb"), &BIO_free);
         if (!bio)
@@ -216,7 +212,6 @@ bool generate_x25519_keypair(
             throw_openssl_error("PEM_write_bio_PUBKEY failed");
     }
 
-    // Also keep the public key text so the app can show it to the user
     {
         BioPtr mem(BIO_new(BIO_s_mem()), &BIO_free);
         if (!mem)
@@ -294,6 +289,7 @@ std::vector<std::uint8_t> ecdh_derive_shared_secret(
     return secret;
 }
 
+// 由 X25519 共享密钥派生会话密钥，按 info 区分收发方向
 std::vector<std::uint8_t> hkdf_derive_key(
     const std::vector<std::uint8_t>& shared_secret,
     const std::vector<std::uint8_t>& salt,
@@ -404,10 +400,6 @@ std::vector<std::uint8_t> aes256_gcm_encrypt(
     out.resize(written);
     return out;
 }
-
-// ---- 热路径零拷贝实现（与服务端 server/Crypt/crypt.cpp 同一算法布局）----
-// EVP_CIPHER_CTX 线程本地复用 + 逐包 EVP_CIPHER_CTX_reset，
-// 输出（nonce||ct||tag）直写调用方缓冲区，逐包 0 次堆分配
 
 thread_local CipherCtxPtr g_seal_ctx(nullptr, &EVP_CIPHER_CTX_free);
 thread_local CipherCtxPtr g_open_ctx(nullptr, &EVP_CIPHER_CTX_free);
@@ -538,7 +530,7 @@ std::size_t aes256_gcm_open(
     }
     const int final_result = EVP_DecryptFinal_ex(ctx, out + ct_len, &produced);
     if (final_result <= 0) {
-        OPENSSL_cleanse(out, ct_len);   // 认证失败：明文不可信，擦除
+        OPENSSL_cleanse(out, ct_len);
         return 0;
     }
     if (produced != 0) {
@@ -575,7 +567,7 @@ std::optional<std::vector<std::uint8_t>> aes256_gcm_decrypt(
         key, input.data(), input.size(), aad, aad_length,
         out.data(), out.size());
     if (written == 0)
-        return std::nullopt;   // tag 校验失败：静默语义
+        return std::nullopt;
     out.resize(written);
     return out;
 }
@@ -607,8 +599,6 @@ bool parse_inner_packet(
     return true;
 }
 
-
-// Ed25519 身份密钥（公私钥验证）
 bool generate_ed25519_keypair(
     const std::string& priv_path,
     const std::string& pub_path,
@@ -628,7 +618,6 @@ bool generate_ed25519_keypair(
         throw_openssl_error("EVP_PKEY_keygen failed");
     PKeyPtr key(raw_key, &EVP_PKEY_free);
 
-    // 私钥：PKCS#8 PEM
     {
         BioPtr bio(BIO_new_file(priv_path.c_str(), "wb"), &BIO_free);
         if (!bio)
@@ -638,7 +627,6 @@ bool generate_ed25519_keypair(
             throw_openssl_error("PEM_write_bio_PrivateKey failed");
     }
 
-    // 公钥：SPKI PEM
     {
         BioPtr bio(BIO_new_file(pub_path.c_str(), "wb"), &BIO_free);
         if (!bio)
@@ -647,7 +635,6 @@ bool generate_ed25519_keypair(
             throw_openssl_error("PEM_write_bio_PUBKEY failed");
     }
 
-    // 同时返回公钥 PEM 文本，便于展示 / 硬编码进对端程序
     {
         BioPtr mem(BIO_new(BIO_s_mem()), &BIO_free);
         if (!mem)
@@ -765,7 +752,6 @@ std::vector<std::uint8_t> ed25519_sign(
     if (!context)
         throw_openssl_error("EVP_MD_CTX_new failed");
 
-    // 纯 EdDSA（Ed25519）：OpenSSL 要求 md 参数为 NULL，不能传摘要算法
     if (EVP_DigestSignInit(
             context.get(), nullptr, nullptr, nullptr, private_key) != 1) {
         throw_openssl_error("EVP_DigestSignInit failed");
@@ -801,7 +787,7 @@ bool ed25519_verify(
     }
     validate_optional_buffer(message, message_length, "message");
     if (signature == nullptr || signature_length != ED25519_SIG_LEN) {
-        return false; // 长度不符视为无效签名
+        return false;
     }
     if (EVP_PKEY_is_a(public_key, "ED25519") != 1) {
         throw std::invalid_argument(
@@ -828,7 +814,6 @@ bool ed25519_verify(
     throw_openssl_error("Ed25519 signature verification error");
 }
 
-// 随机数与注册令牌
 std::vector<std::uint8_t> generate_nonce(std::size_t length)
 {
     if (length == 0) {
@@ -855,7 +840,6 @@ std::string generate_register_token()
     return token;
 }
 
-// 会话密钥派生（HKDF-Extract + HKDF-Expand）
 std::vector<std::uint8_t> hkdf_extract(
     const std::vector<std::uint8_t>& ikm,
     const std::vector<std::uint8_t>& salt)
@@ -906,7 +890,7 @@ std::vector<std::uint8_t> hkdf_extract(
 
     const std::size_t digest_len =
         static_cast<std::size_t>(EVP_MD_get_size(EVP_sha256()));
-    std::vector<std::uint8_t> prk(digest_len); // SHA-256 → 32 字节
+    std::vector<std::uint8_t> prk(digest_len);
     std::size_t prk_len = prk.size();
     if (EVP_KDF_derive(
             context.get(), prk.data(), prk_len, parameters) <= 0) {
@@ -998,22 +982,19 @@ DirectionalSessionKeys derive_directional_session_keys(
             "nonce_c / nonce_s cannot be empty");
     }
 
-    // salt = nonce_c || nonce_s（顺序固定，两端一致）
     std::vector<std::uint8_t> salt = nonce_c;
     salt.insert(salt.end(), nonce_s.begin(), nonce_s.end());
 
     std::vector<std::uint8_t> prk = hkdf_extract(shared_secret, salt);
     DirectionalSessionKeys keys;
-    keys.key_tx = hkdf_expand(prk, "tx", AES256_KEY_LEN); // 客户端→服务端
-    keys.key_rx = hkdf_expand(prk, "rx", AES256_KEY_LEN); // 服务端→客户端
+    keys.key_tx = hkdf_expand(prk, "tx", AES256_KEY_LEN);
+    keys.key_rx = hkdf_expand(prk, "rx", AES256_KEY_LEN);
 
     secure_wipe(prk);
     secure_wipe(salt);
     return keys;
 }
 
-
-// Ed25519 密钥：从 PEM 文本加载
 EVP_PKEY* load_ed25519_private_key_pem(const std::string& pem_text)
 {
     if (pem_text.empty()) {

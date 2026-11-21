@@ -27,7 +27,6 @@ bool base64_decode(const std::string& in, std::vector<std::uint8_t>& out)
     int pad = 0;
     for (char c : in)
     {
-        // 签名文件常常按 64 列换行，空白一律忽略
         if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
         {
             continue;
@@ -57,7 +56,7 @@ bool base64_decode(const std::string& in, std::vector<std::uint8_t>& out)
     return !out.empty();
 }
 
-} // namespace
+}
 
 CheckResult check_text(const std::string& policyBody,
                        const std::string& signatureBase64,
@@ -78,8 +77,6 @@ CheckResult check_text(const std::string& policyBody,
     EVP_PKEY* pub = nullptr;
     try
     {
-        // load_ed25519_public_key_pem 对非法 PEM 会抛异常（Crypt.h 约定）——
-        // 公钥配置错误必须降级为"验签失败"，绝不能 terminate 整个程序
         pub = load_ed25519_public_key_pem(releasePublicKeyPem);
     }
     catch (...)
@@ -88,7 +85,6 @@ CheckResult check_text(const std::string& policyBody,
     }
     if (pub == nullptr)
     {
-        // 公钥损坏/格式错误同样是程序问题，按验签失败处理 —— 不能"验不了就当通过"
         r.status = CheckStatus::SignatureInvalid;
         r.error = "发布公钥无法加载（格式错误或损坏）";
         return r;
@@ -129,6 +125,7 @@ CheckResult check_text(const std::string& policyBody,
     return r;
 }
 
+// 拉取策略并验签：签名不通过一律视为检查失败，不采信内容
 CheckResult check(const std::string& policyUrl,
                   const std::string& signatureUrl,
                   const std::string& releasePublicKeyPem,
@@ -138,8 +135,6 @@ CheckResult check(const std::string& policyUrl,
 {
     CheckResult r;
 
-    // 诊断日志：check 线程卡死时（DNS/getaddrinfo 无超时），此文件能
-    // 精确指出卡在哪个 fetch 上。每步追加，非破坏性。
     auto dbg = [&policyUrl](const std::string& m) {
         FILE* f = std::fopen("/tmp/scholarvpn-check-debug.log", "a");
         if (f != nullptr)
@@ -155,7 +150,6 @@ CheckResult check(const std::string& policyUrl,
         " status=" + std::to_string(pf.status) + " err=" + pf.error);
     if (!pf.ok)
     {
-        // 拿不到策略 ≠ 验签失败：这是网络问题，不该把用户锁死
         r.status = CheckStatus::NetworkFailed;
         r.error = "拉取策略失败：" + pf.error;
         return r;
@@ -189,4 +183,4 @@ const char* status_name(CheckStatus s)
     return "unknown";
 }
 
-} // namespace update
+}

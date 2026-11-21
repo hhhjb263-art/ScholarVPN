@@ -1,15 +1,3 @@
-// ============================================================================
-// tests/test_split_verify.cpp —— 分流注入的完整验证【需要管理员】
-//
-// 与 test_split_routes.cpp 的区别：那个只看 API 返回值，这个**从路由表读回来**，
-// 用来回答三个问题：
-//   1. 注入到底有没有真的写进路由表（而不是 API 返回成功但没生效）
-//   2. 写进去的 metric / 下一跳 / 接口是否正确
-//   3. 46ms 是不是"already exists"造成的假成功
-//
-// 结果同时打印到控制台并写入 %TEMP%\split_verify.txt（提权运行时看不到控制台）。
-// ============================================================================
-
 #include "route_manager.h"
 #include "platform/iplist.h"
 
@@ -46,7 +34,6 @@ void out(const char* fmt, ...)
     }
 }
 
-// 统计路由表里"目的前缀正好等于 cidrs 中某条"的路由数
 int count_in_table(const std::vector<cidr::Cidr>& cidrs, std::size_t* matchedIndex = nullptr)
 {
     PMIB_IPFORWARD_TABLE2 table = nullptr;
@@ -124,7 +111,7 @@ std::string next_hop_str(const MIB_IPFORWARD_ROW2& r)
     return buf;
 }
 
-} // namespace
+}
 
 int main()
 {

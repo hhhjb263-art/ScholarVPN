@@ -10,18 +10,10 @@
 
 namespace
 {
-    // 单次连接：等待握手完成的上限。
-    // 必须【大于】隧道内部的握手总超时（UDP.cpp 的 kAuthTimeout = 8s），
-    // 否则本状态机会在隧道还在正常重传时就把实例拆掉：
-    // 原值是 4s < kAuthTimeout 5s，移动网/跨境链路一次握手要 3~4s，
-    // 于是每次都"差一点成功就被掐断"，表现为永远连不上、无限重连。
     constexpr auto kHandshakeWait = std::chrono::seconds(12);
-    // 重连退避：500ms -> 1s -> 2s -> 5s（封顶）
     constexpr auto kMinBackoff = std::chrono::milliseconds(500);
     constexpr auto kMaxBackoff = std::chrono::milliseconds(5000);
-    // 连接监视周期
     constexpr auto kMonitorTick = std::chrono::milliseconds(50);
-    // 单次运行最多连续失败次数（成功后清零；超过即停止重连，置 Error）
     constexpr int kMaxConnectRetries = 5;
 }
 
@@ -117,24 +109,21 @@ const char* ReconnectManager::state_name(ConnState s)
     }
 }
 
+// 断线重连状态机：指数退避重试，认证被拒则终止，握手成功即重置计数
 void ReconnectManager::worker_loop()
 {
-    // 整个状态机包在 try/catch 里：任何异常（回调抛出的、UDP 内部的、
-    // 内存分配失败的）都不能穿过 std::thread 边界——否则 std::terminate
-    // 直接崩溃进程。
     try
     {
     auto backoff = kMinBackoff;
     bool firstAttempt = true;
-    int retryCount = 0;      // 自 start 起连续失败计数；任一次连接成功后清零
-    bool gaveUp = false;     // 达到上限放弃时保持 Error 状态（否则结尾会被覆盖为 Stopped）
+    int retryCount = 0;
+    bool gaveUp = false;
 
     while (m_running.load())
     {
         set_state(firstAttempt ? ConnState::Connecting : ConnState::Reconnecting);
         firstAttempt = false;
 
-        // ---------- 1) 建立连接 ----------
         if (!connect_once())
         {
             ++retryCount;
@@ -151,15 +140,14 @@ void ReconnectManager::worker_loop()
                 LOG_ERROR("[Reconnect] 连续尝试连接 %d 次全部失败，停止重连", retryCount);
                 set_state(ConnState::Error);
                 gaveUp = true;
-                break; // 跳出外层while，不再重试
+                break;
             }
-            // 退避后重试
             set_state(ConnState::Reconnecting);
             std::this_thread::sleep_for(backoff);
             backoff = (std::min)(backoff * 2, kMaxBackoff);
             continue;
         }
-        retryCount = 0;      // 连接成功：连续失败计数清零
+        retryCount = 0;
         backoff = kMinBackoff;
         set_state(ConnState::Connected);
         if (m_onConnected)
@@ -167,7 +155,6 @@ void ReconnectManager::worker_loop()
             m_onConnected();
         }
 
-        // ---------- 2) 监视连接 ----------
         while (m_running.load())
         {
             if (m_forceBreak.exchange(false))
@@ -192,7 +179,6 @@ void ReconnectManager::worker_loop()
             break;
         }
 
-        // ---------- 3) 断开：销毁旧实例，进入重连 ----------
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             teardown_current_locked();
@@ -204,7 +190,6 @@ void ReconnectManager::worker_loop()
         std::lock_guard<std::mutex> lock(m_mutex);
         teardown_current_locked();
     }
-    // 达到重试上限放弃时保持 Error（用户可见"错误"并需手动重连），否则正常收尾为 Stopped
     set_state(gaveUp ? ConnState::Error : ConnState::Stopped);
     }
     catch (const std::exception& e)
@@ -229,13 +214,13 @@ void ReconnectManager::worker_loop()
     }
 }
 
+// 单次建连：按配置选 TCP/UDP 传输并完成握手；新增传输方式从这里扩展
 bool ReconnectManager::connect_once()
 {
     const char* tname = (m_transport == Transport::TCP) ? "TCP" : "UDP";
     std::shared_ptr<UDP> u;
     try
     {
-        // 传输方式：按 m_transport 实例化对应类（多态接入，协议层共用基类）
         if (m_transport == Transport::TCP)
             u = std::make_shared<TCP>(m_remote.c_str(), m_port, false, m_queueMax);
         else
@@ -244,7 +229,6 @@ bool ReconnectManager::connect_once()
     }
     catch (const std::exception& e)
     {
-        // 走到这里几乎一定是 ServerIP 不是合法的 IPv4 字面量（本协议不支持域名）
         LOG_ERROR("[Reconnect] 参数错误（%s）：remote=%s:%u 不是合法 IPv4 —— "
                   "服务器条目只接受 IP 地址（如 1.2.3.4），不支持域名",
                   e.what(), m_remote.c_str(), static_cast<unsigned>(m_port));
@@ -255,7 +239,6 @@ bool ReconnectManager::connect_once()
 
     if (!u->init())
     {
-        // 具体原因（RST/超时/不可达）已由 UDP::init / TCP::establish 打印
         LOG_ERROR("[Reconnect] %s 建立隧道失败 remote=%s:%u（原因见上一行）",
                   tname, m_remote.c_str(), static_cast<unsigned>(m_port));
         return false;
@@ -277,7 +260,6 @@ bool ReconnectManager::connect_once()
         }
         if (u->needs_reconnect())
         {
-            // 注册模式被拒且原因=令牌无效/已使用：自动清除令牌，下次以登录模式重试
             if (!m_register_token.empty() && u->auth_deny_reason() == 1)
             {
                 m_register_token.clear();
@@ -298,9 +280,6 @@ bool ReconnectManager::connect_once()
     }
     if (!m_running.load())
     {
-        // 不是超时：stop()/切换服务器把循环打断了。这里以前也打印
-        // "握手等待超时（12s）"，实际可能只过了 2 秒——排查时会被这条
-        // 假超时带偏（已踩过：日志显示超时 12s，其实只等了 2.2s）。
         LOG_INFO("[Reconnect] 握手等待被取消（停止/切换服务器）");
         return u->is_handshaked();
     }

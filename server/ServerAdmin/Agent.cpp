@@ -1,6 +1,3 @@
-// ============================================================================
-// Agent.cpp —— admin_agent 实现（类声明见 Agent.h）
-// ============================================================================
 #include "Agent.h"
 #include "AdminWire.h"
 #include "../Crypt/crypt.h"
@@ -11,10 +8,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>   // std::exception（catch 签名要求显式可见）
+#include <exception>
 #include <string>
 #include <thread>
-#include <utility>     // std::move
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -28,11 +25,11 @@
 
 namespace {
 
-constexpr int    kHeartbeatSec = 15;          // 心跳周期（计划书 3.5）
-constexpr int    kBackoffMinMs = 1000;        // 退避起点
-constexpr int    kBackoffMaxMs = 60000;       // 退避封顶
-constexpr int    kPollSliceMs  = 500;         // 单次等待上限：便于发心跳/查 running
-constexpr size_t kMaxHttpResp  = 1024 * 1024; // 本机 AdminServer 响应上限
+constexpr int kHeartbeatSec = 15;
+constexpr int kBackoffMinMs = 1000;
+constexpr int kBackoffMaxMs = 60000;
+constexpr int kPollSliceMs = 500;
+constexpr size_t kMaxHttpResp = 1024 * 1024;
 
 std::string to_hex(const uint8_t* d, size_t n)
 {
@@ -43,7 +40,6 @@ std::string to_hex(const uint8_t* d, size_t n)
     return s;
 }
 
-// hex → bytes；非法返回 false
 bool from_hex(const std::string& s, std::vector<uint8_t>& out)
 {
     if (s.size() % 2 != 0) return false;
@@ -63,8 +59,6 @@ bool from_hex(const std::string& s, std::vector<uint8_t>& out)
     return true;
 }
 
-// 本机 AdminServer 仍是环回明文 HTTP：保留一个简单的 TCP 连接器即可。
-// 管理通道（agent ↔ controller）的连接/域名解析/TLS 已改用 wire::Conn。
 int plain_tcp_connect(const std::string& host, uint16_t port, int timeout_ms)
 {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -85,7 +79,7 @@ int plain_tcp_connect(const std::string& host, uint16_t port, int timeout_ms)
         ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
         if (err != 0) { ::close(fd); return -1; }
     }
-    ::fcntl(fd, F_SETFL, flags);   // 恢复阻塞；后续节奏由 poll 控制
+    ::fcntl(fd, F_SETFL, flags);
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return fd;
@@ -103,9 +97,6 @@ bool send_all(int fd, const std::string& data)
     return true;
 }
 
-// 收一帧见 AdminWire.h 的 wire::Conn::recv_frame（循环读到凑齐或超时）
-
-// 解析 HTTP 响应（Connection: close 语义：头 + 之后全是 body）
 bool parse_http(const std::string& raw, int& status, std::string& body)
 {
     const size_t he = raw.find("\r\n\r\n");
@@ -119,7 +110,6 @@ bool parse_http(const std::string& raw, int& status, std::string& body)
     return status > 0;
 }
 
-// 极简 HTTP 客户端：连本机 AdminServer 发一条短连接请求，读到对端关闭
 bool http_call(const std::string& host, uint16_t port, const std::string& token,
                const std::string& method, const std::string& path,
                const std::string& req_body, int& status, std::string& resp_body)
@@ -153,7 +143,6 @@ bool http_call(const std::string& host, uint16_t port, const std::string& token,
     return parse_http(raw, status, resp_body);
 }
 
-// "host:port" → (host, port)
 bool parse_hostport(const std::string& s, std::string& host, uint16_t& port)
 {
     const size_t c = s.rfind(':');
@@ -165,7 +154,7 @@ bool parse_hostport(const std::string& s, std::string& host, uint16_t& port)
     return true;
 }
 
-Agent* g_agent = nullptr;   // 供信号处理优雅停止
+Agent* g_agent = nullptr;
 void on_signal(int) { if (g_agent != nullptr) g_agent->stop(); }
 
 void usage(const char* prog)
@@ -185,7 +174,7 @@ void usage(const char* prog)
         prog);
 }
 
-}  // namespace
+}
 
 Agent::Agent(Options opt) : opt_(std::move(opt)) {}
 
@@ -220,7 +209,6 @@ void Agent::run()
 {
     running_.store(true);
 
-    // 载入本机身份私钥（= 服务端 server_sig.key，controller 白名单登记的就是它的公钥指纹）
     try {
         priv_ = load_ed25519_private_key(opt_.key_path.c_str());
     } catch (const std::exception& e) {
@@ -241,7 +229,7 @@ void Agent::run()
         tls_ctx_ = wire::make_client_ctx(opt_.tls_ca, err);
         if (tls_ctx_ == nullptr) {
             fprintf(stderr, "[agent] TLS 初始化失败: %s\n", err.c_str());
-            return;   // 证书/CA 配置错误：重连也不会好，直接退出让运维处理
+            return;
         }
         const std::string name = opt_.tls_server_name.empty()
                                      ? opt_.controller_host : opt_.tls_server_name;
@@ -251,9 +239,9 @@ void Agent::run()
 
     int backoff = kBackoffMinMs;
     while (running_.load()) {
-        if (connect_and_serve()) break;   // 收到 stop()：正常退出
+        if (connect_and_serve()) break;
         if (!running_.load()) break;
-        const int wait_ms = backoff + (std::rand() % 500);   // 退避 + 抖动
+        const int wait_ms = backoff + (std::rand() % 500);
         fprintf(stderr, "[agent] 与 controller 断开，%d ms 后重连\n", wait_ms);
         for (int slept = 0; slept < wait_ms && running_.load(); slept += 200)
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -284,7 +272,6 @@ bool Agent::connect_and_serve()
     wire::Framer fr;
     std::string frame, type;
 
-    // 1) 等 controller 下发的挑战
     if (conn.recv_frame(fr, frame, wire::kTimeoutMs) != 1 ||
         !wire::get_string(frame, "type", type) || type != "challenge") {
         fprintf(stderr, "[agent] 未收到 challenge\n");
@@ -293,7 +280,6 @@ bool Agent::connect_and_serve()
     std::string nonce;
     if (!wire::get_string(frame, "nonce", nonce)) return false;
 
-    // 2) 签名 + hello（上报公钥指纹，controller 据此比对白名单）
     const std::string sig = sign_challenge(nonce);
     if (sig.empty()) {
         fprintf(stderr, "[agent] 挑战签名失败\n");
@@ -308,7 +294,6 @@ bool Agent::connect_and_serve()
         return false;
     }
 
-    // 3) 等准入结果
     const int wr = conn.recv_frame(fr, frame, wire::kTimeoutMs);
     if (wr != 1) {
         fprintf(stderr, "[agent] 等待准入结果%s\n", wr == 0 ? "超时" : "时连接断开");
@@ -322,11 +307,10 @@ bool Agent::connect_and_serve()
         std::string reason;
         wire::get_string(frame, "reason", reason);
         fprintf(stderr, "[agent] 准入被拒: %s\n", reason.c_str());
-        return false;   // 白名单可能还没登记：退避后重试
+        return false;
     }
     fprintf(stderr, "[agent] 已接入 controller\n");
 
-    // 4) 心跳 + 命令循环
     auto last_hb = std::chrono::steady_clock::now();
     while (running_.load()) {
         const int r = conn.recv_frame(fr, frame, kPollSliceMs);
@@ -342,7 +326,6 @@ bool Agent::connect_and_serve()
                 wire::get_string(frame, "body", body);
                 wire::get_int(frame, "id", id);
 
-                // 转发给本机 AdminServer（业务执行层）——"HTTP 语义原样过隧道"
                 int status = 0;
                 std::string resp;
                 if (!http_call(opt_.admin_host, opt_.admin_port, opt_.admin_token,
@@ -358,7 +341,6 @@ bool Agent::connect_and_serve()
                     return false;
                 }
             }
-            // 其他类型（heartbeat 等）忽略
         }
         const auto now = std::chrono::steady_clock::now();
         if (now - last_hb >= std::chrono::seconds(kHeartbeatSec)) {
@@ -368,7 +350,7 @@ bool Agent::connect_and_serve()
             last_hb = now;
         }
     }
-    return true;   // stop() 打断
+    return true;
 }
 
 int main(int argc, char* argv[])

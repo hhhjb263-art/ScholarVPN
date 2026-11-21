@@ -1,16 +1,3 @@
-// ============================================================================
-// tests/test_checker.cpp —— 策略验签与决策的离线测试（不联网）
-//
-// 用项目自己的 Ed25519 实现现场生成密钥、签名，再喂给 check_text，
-// 重点验证「篡改必须被拒」——这是"验签失败即拒绝使用"的地基。
-//
-// 编译（MSVC，需要 OpenSSL）：
-//   cl /std:c++20 /EHsc /utf-8 /I. /Isrc /Ithird_party\openssl\include ^
-//      tests\test_checker.cpp src\update\update_checker.cpp src\update\update_policy.cpp ^
-//      src\update\update_fetcher.cpp Crypt.cpp ^
-//      /link /LIBPATH:third_party\openssl\lib libcrypto.lib ws2_32.lib
-// ============================================================================
-
 #include "update/update_checker.h"
 #include "Crypt.h"
 
@@ -92,7 +79,7 @@ const char* kPolicy =
     "size = 48213000\n"
     "generated = 1792540800\n";
 
-} // namespace
+}
 
 int main()
 {
@@ -129,7 +116,7 @@ int main()
         const std::string sig = sign_to_b64(priv, kPolicy);
         std::string tampered = kPolicy;
         const std::size_t pos = tampered.find("minimum = 1.6.0");
-        tampered.replace(pos, 15, "minimum = 0.0.1");   // 把门槛改低，企图绕过强制
+        tampered.replace(pos, 15, "minimum = 0.0.1");
         const auto r = update::check_text(tampered, sig, pubPem, "win-x64", "1.6.0");
         check(r.status == update::CheckStatus::SignatureInvalid, "改正文应验签失败");
     }
@@ -165,7 +152,7 @@ int main()
 
     std::printf("== 签名有效但内容残缺 ==\n");
     {
-        const std::string partial = "minimum = 1.6.0\nurl = u\nsha256 = s\n";   // 没有 latest
+        const std::string partial = "minimum = 1.6.0\nurl = u\nsha256 = s\n";
         const std::string sig = sign_to_b64(priv, partial);
         const auto r = update::check_text(partial, sig, pubPem, "win-x64", "1.6.0");
         check(r.status == update::CheckStatus::PolicyInvalid, "缺 latest 应判内容无效");

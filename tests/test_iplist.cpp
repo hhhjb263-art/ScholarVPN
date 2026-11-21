@@ -1,10 +1,3 @@
-// ============================================================================
-// tests/test_iplist.cpp —— 国内 IP 列表加载的单元测试
-//
-// 编译运行：
-//   g++ -std=c++17 -Isrc tests/test_iplist.cpp src/platform/iplist.cpp -o test_iplist.exe
-// ============================================================================
-
 #include "platform/iplist.h"
 
 #include <cstdio>
@@ -27,7 +20,7 @@ void check(bool ok, const char* what, const std::string& detail = {})
     std::printf("  FAIL  %s%s%s\n", what, detail.empty() ? "" : "  ->  ", detail.c_str());
 }
 
-} // namespace
+}
 
 int main()
 {

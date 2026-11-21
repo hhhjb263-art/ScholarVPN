@@ -85,6 +85,7 @@ import androidx.core.content.FileProvider
 import com.scholarvpn.client.BuildConfig
 import com.scholarvpn.client.service.MachineId
 import com.scholarvpn.client.service.ServiceClient
+import com.scholarvpn.client.service.ServiceException
 import com.scholarvpn.client.update.UpdateChecker
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.HorizontalDivider
@@ -95,48 +96,47 @@ import com.scholarvpn.client.vpn.VpnStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import java.io.File
 
-/**
- * 主界面：品牌栏 + 渐变状态英雄卡 + 服务器卡片列表（点卡片连接）+ 添加/编辑/删除 + FAB。
- * TODO(M3)：卡片滑动删除、导入导出配置。
- */
 class MainActivity : ComponentActivity() {
 
     private var granted by mutableStateOf(false)
     private val servers = mutableStateListOf<ServerEntry>()
 
-    // 应用内更新（对应桌面端设置/关于页的检查更新）
     private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var updateState by mutableStateOf("")
     private var pendingUpdate by mutableStateOf<UpdateChecker.Policy?>(null)
-    private var editingIndex by mutableStateOf<Int?>(null)   // null=关闭编辑器；-1=新增
+    private var editingIndex by mutableStateOf<Int?>(null)
     private var activeIndex by mutableStateOf(0)
 
-    // 受管服务（服务方服务器）：申请试用 / 状态同步 / 服务器列表下发
     private var svcState by mutableStateOf<VpnSettings.ServiceState?>(null)
     private var svcBusy by mutableStateOf(false)
     private var svcMsg by mutableStateOf("")
+    private var pendingConnect by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         granted = VpnService.prepare(this) == null
         reloadServers()
+        svcState = VpnSettings(this).loadServiceState()
 
-        // 受管状态心跳（2026-11-02 需求 3）：启动打开即与授权服务器建立通信，
-        // 之后每 5 分钟同步一次状态（轮询而非长连接：低频小请求在 Doze 下也可靠）。
+        mainScope.launch {
+            delay(300)
+            if (!svcBusy) provisionManaged(refreshOnly = true)
+        }
+
         val svcHeartbeat = android.os.Handler(android.os.Looper.getMainLooper())
         val svcTick = object : Runnable {
             override fun run() {
-                if (granted && !svcBusy) provisionManaged(refreshOnly = true)
+                if (!svcBusy) provisionManaged(refreshOnly = true)
                 svcHeartbeat.postDelayed(this, 300_000L)
             }
         }
-        svcHeartbeat.postDelayed(svcTick, 30_000L)
-        svcState = VpnSettings(this).loadServiceState()
+        svcHeartbeat.postDelayed(svcTick, 300_000L)
         setContent {
             ScholarVpnTheme {
                 val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -171,7 +171,6 @@ class MainActivity : ComponentActivity() {
                             HorizontalDivider()
                             Spacer(Modifier.height(8.dp))
 
-                            // 应用更新（对应桌面端设置/关于页）
                             UpdateSection(
                                 state = updateState,
                                 hasUpdate = pendingUpdate != null,
@@ -179,7 +178,6 @@ class MainActivity : ComponentActivity() {
                                 onUpdate = { pendingUpdate?.let { doUpdate(it) } },
                             )
 
-                            // 受管服务（服务方服务器）：申请试用 / 同步 / 下发列表
                             ServiceSection(
                                 state = svcState,
                                 busy = svcBusy,
@@ -190,8 +188,6 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                 ) {
-                // Service 清令牌（注册成功消费/令牌失效作废）后自动刷新卡片，
-                // 防止界面内存里的废令牌被编辑保存回存储（"连接后秒拒"的根因）
                 LaunchedEffect(Unit) {
                     VpnStatus.tokenClearTick.collect { reloadServers() }
                 }
@@ -233,7 +229,6 @@ class MainActivity : ComponentActivity() {
                                         ServerCard(
                                             entry = s,
                                             selected = index == activeIndex,
-                                            // 本卡正在连接/已连接（断开按钮渲染在本卡上）
                                             isBusyCard = busy && busyIdx == index,
                                             connecting = busy && busyIdx == index &&
                                                 phase != VpnStatus.Phase.CONNECTED,
@@ -257,7 +252,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // 右下角 +：添加服务器
                     FloatingActionButton(
                         onClick = { editingIndex = -1 },
                         modifier = Modifier
@@ -269,8 +263,6 @@ class MainActivity : ComponentActivity() {
                         Icon(Icons.Filled.Add, contentDescription = "添加服务器")
                     }
 
-                    // 回到空闲/失败态时从存储重载：服务端可能已自动清空令牌
-                    // （拒绝时 UI 内存里的旧列表不得把令牌又存回去）
                     LaunchedEffect(phase) {
                         if (phase == VpnStatus.Phase.IDLE || phase == VpnStatus.Phase.FAILED) {
                             reloadServers()
@@ -304,13 +296,12 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        } // AgreementGate
-        } // ModalNavigationDrawer
+        }
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        // 回到前台时以存储为准刷新（Service 可能已清令牌/改配置）
         reloadServers()
     }
 
@@ -327,10 +318,6 @@ class MainActivity : ComponentActivity() {
         store.setActiveIndex(activeIndex)
     }
 
-    /**
-     * 受管服务接入（对应桌面端 AppBridge::check_service / apply_managed_servers）。
-     * refreshOnly=true = 已有凭据，只做状态同步 + 拉服务器列表。
-     */
     private fun provisionManaged(refreshOnly: Boolean) {
         if (svcBusy) return
         svcBusy = true
@@ -341,7 +328,13 @@ class MainActivity : ComponentActivity() {
                 val info = MachineId.collect(this@MainActivity)
                 val st = store.loadServiceState()
                 val creds = if (refreshOnly && !info.fp.isBlank()) {
-                    ServiceClient.fetchStatus(info.fp)
+                    try {
+                        ServiceClient.fetchStatus(info.fp)
+                    } catch (e: ServiceException) {
+                        // 404 = 服务端无此设备记录，改走注册拿凭据
+                        if (e.message?.contains("404") == true) ServiceClient.registerTrial(info)
+                        else throw e
+                    }
                 } else {
                     ServiceClient.registerTrial(info)
                 }
@@ -358,21 +351,20 @@ class MainActivity : ComponentActivity() {
                     remaining = creds.remaining,
                 ))
 
-                // 闸门判定：拒绝/到期/配额耗尽 → 只提示，不下发卡片
                 val verdict = ServiceClient.evaluate(
                     creds, System.currentTimeMillis() / 1000)
                 if (verdict.blocked) {
+                    pendingConnect = false
                     svcMsg = verdict.reason
                     svcState = store.loadServiceState()
                     return@launch
                 }
 
-                // 拉服务器列表并整体替换受管卡片。
-                // 拉取失败不致命：凭据已就绪，用户仍可手填（老部署没有 /svc/ 也该能用）。
                 val list = try {
                     ServiceClient.fetchServerList(creds.fp.ifBlank { info.fp })
                 } catch (e: Exception) {
                     reloadServers()
+                    pendingConnect = false
                     svcMsg = "凭据已就绪，但拉取服务器列表失败：${e.message}"
                     svcState = store.loadServiceState()
                     return@launch
@@ -385,7 +377,12 @@ class MainActivity : ComponentActivity() {
                 reloadServers()
                 svcMsg = "已就绪：$n 台服务器（${creds.clientId}）"
                 svcState = store.loadServiceState()
+                if (pendingConnect) {
+                    pendingConnect = false
+                    mainScope.launch { if (servers.isNotEmpty()) connectActive() }
+                }
             } catch (e: Exception) {
+                pendingConnect = false
                 svcMsg = "失败：${e.message}"
             } finally {
                 svcBusy = false
@@ -393,21 +390,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 拉取策略并比较版本（对应桌面端 AppBridge::check_update） */
     private fun checkUpdate() {
         updateState = "检查中..."
         mainScope.launch {
             try {
                 val p = UpdateChecker.fetchPolicy()
-                // 更新判定（需求 5）：包哈希不同即提示（版本号只管大更新/强制），
-                // 状态行展示变更说明（notes）由用户自行决定是否更新。
                 val prefs = getSharedPreferences("scholarvpn_update", MODE_PRIVATE)
                 val installedSha = prefs.getString("installed_sha", "") ?: ""
                 if (UpdateChecker.isNewer(p.latest, BuildConfig.VERSION_NAME) ||
                     UpdateChecker.hasNewPackage(installedSha, p.sha256)) {
-                    pendingUpdate = p
-                    updateState = "发现新版本 v${p.latest}，点击立即更新" +
-                        (if (p.notes.isNotBlank()) "（${p.notes}）" else "")
+                    if (p.url.isBlank()) {
+                        pendingUpdate = null
+                        updateState = "后台策略缺少 Android 下载地址"
+                    } else {
+                        pendingUpdate = p
+                        updateState = "发现新版本 v${p.latest}，点击立即更新" +
+                            (if (p.notes.isNotBlank()) "（${p.notes}）" else "")
+                    }
                 } else {
                     pendingUpdate = null
                     updateState = "已是最新版本 v" + BuildConfig.VERSION_NAME
@@ -419,7 +418,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 下载 + 触发系统安装（对应桌面端 download_and_install） */
     private fun doUpdate(p: UpdateChecker.Policy) {
         updateState = "准备下载..."
         mainScope.launch {
@@ -452,7 +450,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun connectActive() {
-        if (servers.isEmpty()) return
+        if (servers.isEmpty()) {
+            pendingConnect = true
+            svcMsg = "正在自动获取服务器…"
+            if (!svcBusy) provisionManaged(refreshOnly = true)
+            return
+        }
         saveServers()
         val intent = VpnService.prepare(this)
         if (intent != null) {
@@ -492,11 +495,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** 品牌 logo 渐变（状态英雄卡与 logo 底共用） */
-/**
- * 受管服务面板（抽屉内）：申请试用 / 查看状态 / 拉取服务器列表。
- * 未申请时给"使用服务方服务器"主按钮；已申请显示 client_id、剩余时长与用量。
- */
 @Composable
 private fun ServiceSection(
     state: VpnSettings.ServiceState?,
@@ -564,7 +562,6 @@ private fun brandBrush(): Brush {    return if (isSystemInDarkTheme()) {
     }
 }
 
-/** 顶部品牌栏：渐变 logo 块 + 应用名 */
 @Composable
 private fun BrandHeader(onLogoClick: () -> Unit = {}) {
     Row(
@@ -591,7 +588,6 @@ private fun BrandHeader(onLogoClick: () -> Unit = {}) {
     }
 }
 
-/** 状态文案与圆点颜色 */
 private fun phaseLabel(phase: VpnStatus.Phase): String = when (phase) {
     VpnStatus.Phase.IDLE -> "未连接"
     VpnStatus.Phase.CONNECTING -> "连接中…"
@@ -607,19 +603,12 @@ private fun phaseDotColor(phase: VpnStatus.Phase): Color = when (phase) {
     VpnStatus.Phase.FAILED -> Color(0xFFFF6B6B)
 }
 
-/** 渐变状态英雄卡：呼吸灯圆点 + 大状态文案 + Service 详细消息 + 当前服务器 */
 @Composable
 private fun StatusHero(
     phase: VpnStatus.Phase,
     message: String,
     busyServer: ServerEntry?,
 ) {
-    // 只有「正在握手 / 正在重连」这种过渡态才做呼吸动画——这两个状态短暂，
-    // 动画能给出"还在努力"的反馈，且用户通常只在几秒内看着它。
-    //
-    // CONNECTED 不再动画（2026-10-18）：已连接是长期稳定态，呼吸灯不传递任何
-    // 新信息，却让 Compose 以 60fps 持续重绘，是前台耗电/发热的次要来源。
-    // 静态绿点一样能表达"已连接"，还省掉整条渲染管线。
     val pulsing = phase == VpnStatus.Phase.CONNECTING ||
         phase == VpnStatus.Phase.RECONNECTING
 
@@ -669,7 +658,6 @@ private fun StatusHero(
     }
 }
 
-/** 呼吸灯圆点（连接中/已连接时脉动） */
 @Composable
 private fun PulsingDot(color: Color, animate: Boolean) {
     val alpha = if (animate) {
@@ -689,16 +677,12 @@ private fun PulsingDot(color: Color, animate: Boolean) {
     )
 }
 
-/** 单张服务器卡片：头像圆标 / 名称 / IP:端口 · 传输 + 胶囊「连接/断开」按钮 + 编辑图标 */
 @Composable
 private fun ServerCard(
     entry: ServerEntry,
     selected: Boolean,
-    /** 本卡正在连接/已连接：按钮变红色「断开」 */
     isBusyCard: Boolean,
-    /** 本卡正在握手/重连：按钮内显示转圈 */
     connecting: Boolean,
-    /** 其他卡忙碌：本卡连接按钮禁用 */
     otherBusy: Boolean,
     onSelect: () -> Unit,
     onEdit: () -> Unit,
@@ -729,7 +713,6 @@ private fun ServerCard(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // 头像圆标：服务器名首字符
             Box(
                 modifier = Modifier
                     .size(46.dp)
@@ -781,7 +764,6 @@ private fun ServerCard(
             Column(horizontalAlignment = Alignment.End) {
                 Button(
                     onClick = { if (isBusyCard) onDisconnect() else onConnect() },
-                    // 授权未完成时首次点击先走授权流程
                     enabled = !otherBusy || isBusyCard,
                     shape = CircleShape,
                     colors = if (isBusyCard) ButtonDefaults.buttonColors(
@@ -817,7 +799,6 @@ private fun ServerCard(
     }
 }
 
-/** 空状态：大圆 + 引导文案 + 「添加服务器」按钮 */
 @Composable
 private fun EmptyState(onAdd: () -> Unit) {
     Column(
@@ -859,7 +840,6 @@ private fun EmptyState(onAdd: () -> Unit) {
     }
 }
 
-/** 添加 / 编辑服务器对话框（删除仅编辑已有卡片时出现；令牌/公钥/传输折叠在「高级选项」） */
 @Composable
 private fun ServerEditor(
     initial: ServerEntry?,
@@ -874,8 +854,12 @@ private fun ServerEditor(
     var clientId by rememberSaveable { mutableStateOf(initial?.clientId ?: "user") }
     var token by rememberSaveable { mutableStateOf(initial?.registerToken ?: "") }
     var pubKey by rememberSaveable { mutableStateOf(initial?.serverPubKey ?: "") }
+    var subnets by rememberSaveable { mutableStateOf(initial?.intranetSubnets ?: "") }
     var advanced by rememberSaveable {
-        mutableStateOf(initial?.let { it.registerToken.isNotBlank() || it.serverPubKey.isNotBlank() } ?: false)
+        mutableStateOf(initial?.let {
+            it.registerToken.isNotBlank() || it.serverPubKey.isNotBlank() ||
+                it.intranetSubnets.isNotBlank()
+        } ?: false)
     }
 
     AlertDialog(
@@ -914,7 +898,6 @@ private fun ServerEditor(
                     shape = MaterialTheme.shapes.small,
                 )
 
-                // 高级选项折叠头
                 val chevron by animateFloatAsState(
                     targetValue = if (advanced) 180f else 0f,
                     animationSpec = tween(200, easing = FastOutSlowInEasing),
@@ -936,7 +919,7 @@ private fun ServerEditor(
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        "高级选项（令牌 / 公钥 / 传输）",
+                        "高级选项（令牌 / 公钥 / 传输 / 内网）",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.Medium,
@@ -961,6 +944,28 @@ private fun ServerEditor(
                             Spacer(Modifier.width(10.dp))
                             Text("TCP 传输（默认 UDP）", style = MaterialTheme.typography.bodyMedium)
                         }
+                        if (initial?.managed == true) {
+                            Text(
+                                "受管服务器（由服务方下发）不支持内网访问，仅支持全局 / 智能分流。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            OutlinedTextField(
+                                value = subnets, onValueChange = { subnets = it },
+                                label = { Text("内网网段（留空=全局代理）") },
+                                placeholder = { Text("192.168.10.0/24,10.20.0.0/16") },
+                                minLines = 2,
+                                shape = MaterialTheme.shapes.small,
+                            )
+                            if (subnets.isNotBlank()) {
+                                Text(
+                                    "填写后只有这些网段走隧道，其余流量走本地网络，系统 DNS 不变。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -975,6 +980,7 @@ private fun ServerEditor(
                         clientId = clientId.ifBlank { "user" },
                         registerToken = token,
                         serverPubKey = pubKey,
+                        intranetSubnets = if (initial?.managed == true) "" else subnets.trim(),
                     ))
                 },
                 enabled = ip.isNotBlank(),
@@ -994,9 +1000,6 @@ private fun ServerEditor(
     )
 }
 
-/**
- * 更新入口与状态行：无状态时显示「检查更新」，发现新版本后变「立即更新」
- */
 @Composable
 private fun UpdateSection(
     state: String,

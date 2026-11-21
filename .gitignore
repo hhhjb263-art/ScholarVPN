@@ -465,3 +465,10 @@ ServerAdmin/**/build/
 
 # 本地测试产物与发布工具的输出（dist 目录整体不入库，含发布私钥！）
 dist/
+
+# 后台管理面板与发号/授权后端：只在服务器本地维护，不入仓库
+tools/webadmin/
+tools/broker/
+
+# MSVC 预处理输出（*.i 体积数 MB，非源码）
+*.i

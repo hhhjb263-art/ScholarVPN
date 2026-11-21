@@ -1,11 +1,3 @@
-// ============================================================================
-// tests/test_cidr.cpp —— cidr::parse / normalize / size 的单元测试
-//
-// 编译运行（Windows MinGW）：
-//   g++ -std=c++17 -I.. tests/test_cidr.cpp -o test_cidr.exe && test_cidr.exe
-// 没有任何第三方依赖，失败会打印具体用例并返回非 0。
-// ============================================================================
-
 #include "platform/cidr.h"
 
 #include <cstdio>
@@ -28,7 +20,6 @@ void check(bool ok, const char* what, const std::string& detail = {})
     std::printf("  FAIL  %s%s%s\n", what, detail.empty() ? "" : "  ->  ", detail.c_str());
 }
 
-// 解析成功且字符串与期望一致
 void expect_ok(const std::string& input, const std::string& expect, bool normalize_first = false)
 {
     cidr::Cidr c;
@@ -51,25 +42,22 @@ void expect_bad(const std::string& input)
     check(!cidr::parse(input, c), "应解析失败", input.empty() ? "<空串>" : input);
 }
 
-} // namespace
+}
 
 int main()
 {
     std::printf("== cidr 解析 ==\n");
 
-    // 正常形式
-    expect_ok("1.2.3.4", "1.2.3.4/32");           // 无前缀默认 /32
+    expect_ok("1.2.3.4", "1.2.3.4/32");
     expect_ok("1.2.3.0/24", "1.2.3.0/24");
     expect_ok("0.0.0.0/0", "0.0.0.0/0");
     expect_ok("255.255.255.255/32", "255.255.255.255/32");
     expect_ok("223.5.5.0/24", "223.5.5.0/24");
-    expect_ok("10.8.0.1/8", "10.8.0.1/8", false);  // 未 normalize，保留主机位
+    expect_ok("10.8.0.1/8", "10.8.0.1/8", false);
 
-    // 空白容忍
     expect_ok("  1.2.3.0/24  ", "1.2.3.0/24");
     expect_ok("\t114.114.114.114\r\n", "114.114.114.114/32");
 
-    // 规范化
     expect_ok("1.2.3.4/24", "1.2.3.0/24", true);
     expect_ok("192.168.255.255/16", "192.168.0.0/16", true);
     expect_ok("255.255.255.255/0", "0.0.0.0/0", true);
@@ -77,14 +65,14 @@ int main()
     std::printf("== cidr 拒绝非法输入 ==\n");
     expect_bad("");
     expect_bad("   ");
-    expect_bad("1.2.3");                  // 段太少
-    expect_bad("1.2.3.4.5");              // 段太多
-    expect_bad("1.2.3.256");              // 越界
-    expect_bad("1.2.3.4/33");             // 前缀越界
-    expect_bad("1.2.3.4/");               // 空前缀
-    expect_bad("1.2.3.4/24x");            // 尾随垃圾
+    expect_bad("1.2.3");
+    expect_bad("1.2.3.4.5");
+    expect_bad("1.2.3.256");
+    expect_bad("1.2.3.4/33");
+    expect_bad("1.2.3.4/");
+    expect_bad("1.2.3.4/24x");
     expect_bad("abc");
-    expect_bad("1..3.4");                 // 空段
+    expect_bad("1..3.4");
     expect_bad("1.2.3.-1");
     expect_bad("1.2.3.4/-1");
 

@@ -6,46 +6,33 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.Base64
 
-/** 受管服务接入点（发行版内置，对齐 Windows src/service/service_bootstrap.h）。 */
 object ServiceEndpoints {
     const val BASE_URL = "https://scholarvpn.homes:8445"
 
-    /** service 签名公钥（SPKI DER base64，对应 dist/keys-service/release.key）。 */
     const val PUB_KEY_B64 = "MCowBQYDK2VwAyEAZqHN3GK6ZO5qp7eRAzkfcA5QQfUMZBFk8vLIPlMJpEQ="
 }
 
-/** broker 凭据 INI 的解析结果（对齐 Windows service::Credentials）。 */
 data class Credentials(
     val fp: String = "",
     val clientId: String = "",
-    val token: String = "",        // 一次性注册令牌，仅注册响应携带
-    val status: String = "",       // trial | approved | rejected | revoked
-    val expireAt: Long = 0,        // unix 秒，0 = 不限
-    val quotaBytes: Long = 0,      // 0 = 不限
+    val token: String = "",
+    val status: String = "",
+    val expireAt: Long = 0,
+    val quotaBytes: Long = 0,
     val usedBytes: Long = 0,
-    val limitKind: String = "",    // 服务器选定的限制维度：days | bytes | none
-    val remaining: Long = 0,       // 该维度剩余量（天/字节）；0 = 已超限
+    val limitKind: String = "",
+    val remaining: Long = 0,
     val valid: Boolean = false,
     val error: String = "",
 )
 
-/** 闸门判定（对齐 Windows service::Verdict：查不到 ≠ 违规，放行）。 */
 data class Verdict(val blocked: Boolean, val reason: String)
 
 data class ManagedServer(val addr: String, val pubkeyB64: String, val remark: String)
 
 class ServiceException(message: String) : Exception(message)
 
-/**
- * 受管服务 HTTP 客户端（纯逻辑 + 网络拆开，网络部分仅此文件）。
- *
- * 可信性铁律（与 Windows/更新系统同一套）：所有 broker 响应都带 Ed25519 签名，
- * 个人凭据在响应头 X-Service-Signature，服务器列表用分离的 .sig 文件；
- * 验签不通过的内容一律拒绝，绝不入库。
- */
 object ServiceClient {
-
-    // ------------------------------------------------------------ 纯逻辑 ----
 
     fun parseCredentials(text: String): Credentials {
         val m = HashMap<String, String>()
@@ -70,21 +57,19 @@ object ServiceClient {
         return c.copy(valid = c.clientId.isNotEmpty())
     }
 
-    /** 闸门判定：rejected/revoked/到期/配额耗尽 → 禁止连接；查不到 → 放行。 */
+    // 本地准入判定：被拒/吊销/超期/超配额一律拦在连接之前
     fun evaluate(c: Credentials, nowUnix: Long): Verdict {
         if (!c.valid) {
             return Verdict(false, c.error.ifEmpty { "服务状态未知" })
         }
         if (c.status == "rejected") return Verdict(true, "该设备的服务申请已被拒绝，请联系服务方")
         if (c.status == "revoked") return Verdict(true, "该设备的授权已被服务方取消，请联系服务方")
-        // 服务器已选定限制维度并算好剩余量：remaining=0 即超限（统一文案）
         if (c.limitKind == "days" || c.limitKind == "bytes") {
             if (c.remaining <= 0L) {
                 return Verdict(true, "已超出使用范围，请联系管理员")
             }
             return Verdict(false, "")
         }
-        // 旧 broker 兼容：无新字段时按原始字段判定（文案统一）
         if (c.expireAt != 0L && nowUnix >= c.expireAt) {
             return Verdict(true, "已超出使用范围，请联系管理员")
         }
@@ -94,10 +79,6 @@ object ServiceClient {
         return Verdict(false, "")
     }
 
-    /**
-     * Ed25519 验签。pubB64 是 SPKI DER base64（44 字节，头 12 字节 + 裸钥 32 字节）；
-     * 也兼容直接传裸 32 字节 base64（与 config.ini ServerPubKey 的 raw 格式一致）。
-     */
     fun verifySignature(body: ByteArray, sigB64: String, pubB64: String): Boolean {
         return runCatching {
             val der = Base64.getDecoder().decode(pubB64)
@@ -118,8 +99,6 @@ object ServiceClient {
         return host to port
     }
 
-    // ------------------------------------------------------------ 网络 ----
-
     private fun enc(s: String): String =
         URLEncoder.encode(s, "UTF-8")
 
@@ -131,8 +110,7 @@ object ServiceClient {
             conn.readTimeout = timeoutMs
             conn.instanceFollowRedirects = false
             conn.setRequestProperty("Accept", "text/plain, */*")
-            // 与 Windows 端一致：显式禁用系统代理，避免被本机代理劫持
-            System.getProperty("proxyHost")?.let { /* JVM 级代理由系统设置，此处不覆写 */ }
+            System.getProperty("proxyHost")?.let {   }
             val code = conn.responseCode
             if (code != 200) {
                 val err = runCatching { conn.errorStream?.readBytes() }.getOrNull()
@@ -150,7 +128,6 @@ object ServiceClient {
     }
 
     private fun requireSig(headers: Map<String, List<String>>): String {
-        // 头名大小写不敏感（HttpURLConnection 返回的 key 一般保留原样）
         val sig = headers.entries.firstOrNull {
             it.key.equals("X-Service-Signature", ignoreCase = true)
         }?.value?.firstOrNull()
@@ -158,7 +135,6 @@ object ServiceClient {
         return sig
     }
 
-    /** 申请/换发试用。成功 = valid 且签名已验证。 */
     fun registerTrial(
         info: MachineInfo,
         baseUrl: String = ServiceEndpoints.BASE_URL,
@@ -177,7 +153,6 @@ object ServiceClient {
         return c
     }
 
-    /** 状态同步（每次启动 / 手动刷新）。 */
     fun fetchStatus(
         fp: String,
         baseUrl: String = ServiceEndpoints.BASE_URL,
@@ -193,10 +168,7 @@ object ServiceClient {
         return c
     }
 
-    /**
-     * 拉取服务器列表（server-list.ini + 分离的 .sig）。验签通过才返回；
-     * 失败抛 [ServiceException]。
-     */
+    // 拉取受管服务器列表并验签；服务端增删节点后客户端下次同步即生效
     fun fetchServerList(
         fp: String,
         baseUrl: String = ServiceEndpoints.BASE_URL,

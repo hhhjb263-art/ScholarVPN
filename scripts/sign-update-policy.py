@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-# ============================================================================
-# scripts/sign-update-policy.py —— 发布侧：生成密钥 / 签署更新策略
-#
-# 客户端的更新检查依赖三样东西，全部由本脚本产出：
-#   1. release.key / release_pub.pem   发布密钥对（私钥绝对不能进仓库！）
-#   2. update-policy.ini               策略文件
-#   3. update-policy.ini.sig           对策略文件**原始字节**的 Ed25519 签名（base64）
-#
-# ⚠️ 签名对象是文件的原始字节流——传输时不得做任何转换（比如改行尾、加 BOM），
-#    否则客户端验签必失败。上传前用 --verify 再自检一遍。
-#
-# 用法（典型一次发布）：
-#   python scripts/sign-update-policy.py gen-keys --out-dir keys
-#   python scripts/sign-update-policy.py make --key keys/release.key \
-#       --latest 1.7.0 --minimum 1.6.0 \
-#       --url https://dl.example.com/scholarvpn/ScholarVPN-1.7.0-setup.exe \
-#       --sha256 9f2c8a41... \
-#       --size 48213000 --notes "修复认证边界问题" \
-#       --out-dir dist
-#   python scripts/sign-update-policy.py verify \
-#       --policy dist/update-policy.ini --sig dist/update-policy.ini.sig \
-#       --pub keys/release_pub.pem
-# ============================================================================
 
 import argparse
 import base64
@@ -34,9 +11,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives import serialization
-
-
-# ---------------------------------------------------------------- 密钥 ----
 
 def gen_keys(out_dir: pathlib.Path) -> None:
     priv_path = out_dir / "release.key"
@@ -62,14 +36,12 @@ def gen_keys(out_dir: pathlib.Path) -> None:
     print(f"已生成：{priv_path}（私钥，妥善保管，不入仓库）")
     print(f"已生成：{pub_path}（公钥，填进客户端 [Update] PublicKey）")
 
-
 def load_priv(path: pathlib.Path) -> Ed25519PrivateKey:
     key = serialization.load_pem_private_key(path.read_bytes(), password=None)
     if not isinstance(key, Ed25519PrivateKey):
         print(f"{path} 不是 Ed25519 私钥", file=sys.stderr)
         sys.exit(1)
     return key
-
 
 def load_pub(path: pathlib.Path) -> Ed25519PublicKey:
     key = serialization.load_pem_public_key(path.read_bytes())
@@ -78,21 +50,13 @@ def load_pub(path: pathlib.Path) -> Ed25519PublicKey:
         sys.exit(1)
     return key
 
-
-# ---------------------------------------------------------------- 策略 ----
-
 def ver_tuple(v):
-    """("1.7.0") -> (1, 7, 0)；非法返回 None"""
     try:
         return tuple(int(x) for x in v.strip().split("."))
     except ValueError:
         return None
 
-
 def make_policy(args) -> None:
-    # 防呆：minimum 高于 latest 会把所有客户端锁进死局——
-    # 客户端更新到 latest 仍低于 minimum，永远无法解锁。
-    # （唯一自救是运维把 minimum 降回来重新上传。）
     if args.minimum:
         mt = ver_tuple(args.minimum)
         lt = ver_tuple(args.latest)
@@ -119,6 +83,12 @@ def make_policy(args) -> None:
     if args.size:
         lines.append(f"size      = {args.size}")
     lines.append(f"generated = {int(datetime.datetime.now().timestamp())}")
+    if getattr(args, "android_url", None):
+        lines.append(f"android_url    = {args.android_url}")
+    if getattr(args, "android_sha256", None):
+        lines.append(f"android_sha256 = {args.android_sha256}")
+    if getattr(args, "android_size", None):
+        lines.append(f"android_size   = {args.android_size}")
 
     body = "\n".join(lines) + "\n"
 
@@ -127,7 +97,7 @@ def make_policy(args) -> None:
     policy_path = out_dir / "update-policy.ini"
     sig_path = policy_path.with_suffix(policy_path.suffix + ".sig")
 
-    policy_path.write_bytes(body.encode("utf-8"))   # 注意：原始字节，保持 LF
+    policy_path.write_bytes(body.encode("utf-8"))
 
     key = load_priv(pathlib.Path(args.key))
     sig = key.sign(body.encode("utf-8"))
@@ -140,7 +110,6 @@ def make_policy(args) -> None:
     print(f"  python scripts/sign-update-policy.py verify --policy {policy_path} "
           f"--sig {sig_path} --pub {args.pub if args.pub else '<release_pub.pem>'}")
 
-
 def sign_only(args) -> None:
     policy_path = pathlib.Path(args.policy)
     sig_path = pathlib.Path(args.sig) if args.sig else \
@@ -150,21 +119,17 @@ def sign_only(args) -> None:
     sig_path.write_bytes(base64.encodebytes(key.sign(data)).replace(b"\n", b""))
     print(f"已签名：{sig_path}")
 
-
 def verify(args) -> int:
     data = pathlib.Path(args.policy).read_bytes()
     sig = base64.b64decode(pathlib.Path(args.sig).read_bytes())
     pub = load_pub(pathlib.Path(args.pub))
     try:
         pub.verify(sig, data)
-    except Exception as e:   # noqa: BLE001 - 验签失败要给人看原因
+    except Exception as e:
         print(f"验签失败：{e}", file=sys.stderr)
         return 1
     print("验签通过：文件与签名匹配")
     return 0
-
-
-# ---------------------------------------------------------------- 入口 ----
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="生成发布密钥 / 签署客户端更新策略")
@@ -182,6 +147,9 @@ def main() -> int:
     p.add_argument("--size", type=int, help="安装包字节数")
     p.add_argument("--notes", help="更新说明（单行）")
     p.add_argument("--pub", help="release_pub.pem（仅用于打印自检命令）")
+    p.add_argument("--android-url", help="Android APK 下载地址（可选）")
+    p.add_argument("--android-sha256", help="Android APK SHA-256（可选）")
+    p.add_argument("--android-size", type=int, help="Android APK 字节数（可选）")
     p.add_argument("--out-dir", default="dist")
 
     p = sub.add_parser("sign", help="只对已有策略文件重新签名")
@@ -208,7 +176,6 @@ def main() -> int:
     if args.cmd == "verify":
         return verify(args)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

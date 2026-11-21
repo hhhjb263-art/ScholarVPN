@@ -14,8 +14,6 @@
 #include <windows.h>
 #include <shlobj.h>
 
-// SHGetFolderPathW（cfg_config_root）需要 shell32；
-// 这个 pragma 原来是写在 Config.cpp 里的，函数搬过来时漏了 → 编译能过、链接才炸
 #pragma comment(lib, "shell32.lib")
 
 std::string cfg_to_utf8(const cfgstr& s)
@@ -88,9 +86,9 @@ bool cfg_unlink(const cfgstr& path)
     return ::DeleteFileW(path.c_str()) != 0;
 }
 
-bool cfg_restrict_file(const cfgstr& /*path*/)
+bool cfg_restrict_file(const cfgstr&)
 {
-    return true;   // Windows 由 DPAPI 加密私钥，不依赖文件权限
+    return true;
 }
 
 cfgstr cfg_app_dir()
@@ -98,7 +96,7 @@ cfgstr cfg_app_dir()
     return cfg_path_join(cfg_config_root(), CS("ScholarVPN"));
 }
 
-#else // ---------------- POSIX / Linux ----------------
+#else
 
 #include <pwd.h>
 #include <sys/stat.h>
@@ -107,7 +105,6 @@ cfgstr cfg_app_dir()
 
 std::string cfg_to_utf8(const cfgstr& s)
 {
-    // Linux 的 cfgstr 本身就是 UTF-8 字节流，零转换
     return s;
 }
 
@@ -136,9 +133,6 @@ cfgstr cfg_path_join(const cfgstr& dir, const cfgstr& name)
 
 namespace {
 
-// sudo 会把 $HOME 改成 /root。身份密钥与 config.ini 若跟着落到 /root，
-// 用户下次普通身份运行就"变成一台新设备"，服务端要求重新注册令牌。
-// 优先用 SUDO_UID 查真实家目录（比 $SUDO_USER / $HOME 都可靠）。
 std::string real_home()
 {
     if (const char* uid = std::getenv("SUDO_UID"); uid != nullptr && *uid != '\0')
@@ -160,7 +154,7 @@ std::string real_home()
     return std::string(".");
 }
 
-} // namespace
+}
 
 cfgstr cfg_config_root()
 {
@@ -178,13 +172,11 @@ bool cfg_unlink(const cfgstr& path)
 
 bool cfg_restrict_file(const cfgstr& path)
 {
-    // 身份私钥：没有 DPAPI，必须靠 0600 兜底（属主可读写，组/其他无权限）
     return ::chmod(path.c_str(), 0600) == 0;
 }
 
 cfgstr cfg_app_dir()
 {
-    // Linux 惯例：小写目录名
     return cfg_path_join(cfg_config_root(), "scholarvpn");
 }
 

@@ -1,13 +1,9 @@
 #pragma once
 
-// 本文件按平台分段：Windows = Wintun；Linux = /dev/net/tun。
-// 两个实现共用 ITunDevice 接口，ClientApp 通过 create_tun_device() 取实例。
-// 注意：#include "tun.h" 必须在 #if 之【外】——Linux 分支同样需要它，
-// 之前写进了 Windows 分支，导致 Linux 下 LinuxTun 完全没声明（真机编译才发现）。
 #include "tun.h"
 
 #if defined(_WIN32)
-#include <atomic>       // 环形缓冲丢包日志限流（热路径，不能逐包打日志）
+#include <atomic>
 #include <cstring>
 #include <type_traits>
 #include <cstdint>
@@ -20,7 +16,6 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
-
 
 namespace {
 	constexpr DWORD kSessionRingCapacity = 4u * 1024u * 1024u;
@@ -52,13 +47,12 @@ namespace {
 		MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &wBuf[0], wcharCount);
 		return wBuf;
 	}
-	// 简单十六进制摘要（只打印前 N 字节）
 	std::string hex_summary(const uint8_t* data, size_t len, size_t max_print = 32)
 	{
 		if (data == nullptr || len == 0) return "<empty>";
 		std::ostringstream oss;
 		oss << std::hex << std::setfill('0');
-		size_t to = (std::min)(len, max_print);   // 括号阻止 windows.h 的 min 宏展开
+		size_t to = (std::min)(len, max_print);
 		for (size_t i = 0; i < to; ++i) {
 			oss << std::setw(2) << static_cast<int>(data[i]);
 			if (i + 1 != to) oss << ' ';
@@ -271,9 +265,6 @@ uint8_t* WintunTun::read_packet(tun_len_t* outPackLen)
 		LOG_ERROR("read_packet：实例未就绪或API未加载");
 		return nullptr;
 	}
-	// Wintun API 的签名是 DWORD*，而 tun_len_t 是 uint32_t：
-	// 两者大小相同但类型不同（Windows 上 DWORD 是 unsigned long），
-	// 不能直接把 tun_len_t* 传进去，必须过一手局部变量
 	DWORD len = 0;
 	BYTE* packet = m_fnReceivePacket(m_hsession, &len);
 	if (packet != nullptr) {
@@ -312,17 +303,11 @@ bool WintunTun::write_packet(const uint8_t* RawIPdata, tun_len_t len)
 	BYTE* send_packet = m_fnAllocateSendPacket(m_hsession, len);
 	if (send_packet == nullptr) {
 		DWORD err = ::GetLastError();
-		// 环形缓冲满 = 下行突发超过网卡消费速度（背压，属正常现象）。
-		// 这里在热路径上：一次大流量下载可能每秒触发上千次。而 Logger 每条
-		// 日志都会 fflush 落盘并同步回调 UI——逐包打日志本身就成了瓶颈
-		// （实测表现：下载速度在几 MB/s 卡住、日志文件暴涨）。
-		// 改为 1s 最多一条 + 累计计数。
 		static std::atomic<uint64_t> s_ringDropTotal{ 0 };
 		static std::atomic<uint64_t> s_ringDropLastLogTick{ 0 };
 		const uint64_t total = s_ringDropTotal.fetch_add(1) + 1;
 		const uint64_t nowTick = ::GetTickCount64();
 		const uint64_t lastTick = s_ringDropLastLogTick.load();
-		// 竞态下多打一条无所谓（丢包日志不是审计日志）
 		if (nowTick - lastTick >= 1000) {
 			s_ringDropLastLogTick.store(nowTick);
 			LOG_WARN("分配发送缓冲区失败 err=%lu（环形缓冲区满），累计丢弃 %llu 包",
@@ -387,7 +372,7 @@ void WintunTun::reset_api_pointers() noexcept
 	m_fnSendPacket = nullptr;
 }
 
-#else // ============================ Linux ============================
+#else
 
 #include <cerrno>
 #include <cstring>
@@ -398,22 +383,20 @@ void WintunTun::reset_api_pointers() noexcept
 #include <linux/if_tun.h>
 
 namespace {
-// 读缓冲上限：MTU 1400 + 余量；单包不会超过这个数
 constexpr size_t kLinuxTunBuf = 2048;
-} // namespace
+}
 
 LinuxTun::~LinuxTun()
 {
 	cleanup_resource();
 }
 
-bool LinuxTun::init_tun(const std::string& TunName, const std::string& /*tunnelType*/)
+bool LinuxTun::init_tun(const std::string& TunName, const std::string&)
 {
 	if (m_fd >= 0) {
 		LOG_WARN("LinuxTun: 已经打开 %s", m_ifname.c_str());
 		return false;
 	}
-	// O_NONBLOCK：读循环无包时靠 poll() 等待，不阻塞线程
 	m_fd = ::open("/dev/net/tun", O_RDWR | O_NONBLOCK);
 	if (m_fd < 0) {
 		LOG_FATAL("LinuxTun: 打开 /dev/net/tun 失败: %s"
@@ -422,7 +405,6 @@ bool LinuxTun::init_tun(const std::string& TunName, const std::string& /*tunnelT
 		return false;
 	}
 	struct ifreq ifr{};
-	// IFF_TUN = 三层 IP 包；IFF_NO_PI = 不要 4 字节协议头（读到的就是裸 IP 包）
 	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
 	std::strncpy(ifr.ifr_name, TunName.c_str(), IFNAMSIZ - 1);
 	if (::ioctl(m_fd, TUNSETIFF, &ifr) < 0) {
@@ -443,7 +425,6 @@ uint8_t* LinuxTun::read_packet(tun_len_t* outPackLen)
 	if (m_fd < 0) return nullptr;
 	const ssize_t n = ::read(m_fd, m_buf.data(), m_buf.size());
 	if (n <= 0) {
-		// EAGAIN：环形缓冲为空（正常情况，外层靠 poll 等）
 		return nullptr;
 	}
 	m_recvCount.fetch_add(1, std::memory_order_relaxed);
@@ -451,9 +432,8 @@ uint8_t* LinuxTun::read_packet(tun_len_t* outPackLen)
 	return m_buf.data();
 }
 
-void LinuxTun::release_read_packet(const uint8_t* /*pkt*/)
+void LinuxTun::release_read_packet(const uint8_t*)
 {
-	// 缓冲是成员变量，下一次 read 直接覆盖；不需要像 Wintun 那样显式归还
 }
 
 bool LinuxTun::write_packet(const uint8_t* RawIPdata, tun_len_t len)
@@ -463,7 +443,6 @@ bool LinuxTun::write_packet(const uint8_t* RawIPdata, tun_len_t len)
 	}
 	const ssize_t n = ::write(m_fd, RawIPdata, len);
 	if (n != static_cast<ssize_t>(len)) {
-		// TUN 是整包语义，短写很少见；热路径不逐包打日志
 		static std::atomic<uint64_t> s_drop{ 0 };
 		const uint64_t total = s_drop.fetch_add(1) + 1;
 		if (total <= 3 || total % 1000 == 0) {
@@ -492,7 +471,7 @@ uint64_t LinuxTun::receive_count() const
 
 tun_event_t LinuxTun::read_wait_event() const
 {
-	return m_fd;   // 直接把 fd 交给 poll()
+	return m_fd;
 }
 
 void LinuxTun::cleanup_resource()
@@ -504,8 +483,9 @@ void LinuxTun::cleanup_resource()
 	m_ifname.clear();
 }
 
-#endif // _WIN32
+#endif
 
+// 虚拟网卡工厂：新增平台时在这里返回新的 ITunDevice 实现
 std::unique_ptr<ITunDevice> create_tun_device()
 {
 #if defined(_WIN32)

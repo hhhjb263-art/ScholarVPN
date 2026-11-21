@@ -1,10 +1,3 @@
-// ============================================================================
-// tests/test_resolve_host.cpp —— 域名校验与解析的单元测试（不需要管理员）
-//
-// 编译运行（MinGW）：
-//   g++ -std=c++17 -Isrc tests/test_resolve_host.cpp -o test_resolve.exe -lws2_32
-// ============================================================================
-
 #include "util/utf.h"
 
 #include <cstdio>
@@ -26,13 +19,12 @@ void check(bool ok, const std::string& what)
     std::printf("  FAIL  %s\n", what.c_str());
 }
 
-} // namespace
+}
 
 int main()
 {
 #if defined(_WIN32)
     ::SetConsoleOutputCP(CP_UTF8);
-    // Windows 上 getaddrinfo 依赖 Winsock 已初始化（否则返回 WSANOTINITIALISED）
     WSADATA wsa{};
     ::WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif

@@ -1,6 +1,6 @@
 #include "UDP.h"
 #include "logger.h"
-#include "tun_macro.h"   // LOG_INFO/LOG_WARN（logger.h 仅提供 LOG_ERR/LOG_KEY/LOG_DBG）
+#include "tun_macro.h"
 #include <cstdio>
 #include <chrono>
 #include <cstring>
@@ -12,26 +12,12 @@
 
 namespace {
 
-// 三阶段身份认证（Ed25519 + 临时X25519 + HKDF + AES-256-GCM）
-//   阶段1（明文）：C→S [nonce_c]；S→C [nonce_s || DH_SRV_EPHEM_PUB || sig_srv]（SIG_SRV_PRI 签名）；
-//                  客户端用内置 SIG_SRV_PUB 验签，失败=中间人直接断开；C→S [DH_CLI_EPHEM_PUB]
-//   阶段2：X25519 ECDH → HKDF-Extract(salt=nonce_c||nonce_s) → Expand 出 key_tx/key_rx，加密隧道开启
-//   阶段3（密文）：客户端发送身份报文（会话上下文 + client_id + SIG_CLI_PUB + register_token + 签名），
-//                  服务器验签后按 注册/登录 分支校验，通过才放行 TUN 流量
-// 每个阶段的总超时。8s（原 5s）：移动网/跨境链路一次完整握手实测可到 3~4s
-// （服务端 UDP.cpp 的注释里有同类观测），5s 只剩不到 1 次重传余量，
-// 链路一抖就整体失败 → 重连 → 再失败。上层的握手等待窗口必须大于本值，
-// 见 reconnect_manager.cpp 的 kHandshakeWait。
 constexpr auto kAuthTimeout = std::chrono::seconds(8);
 constexpr auto kAuthRetryInterval = std::chrono::milliseconds(500);
 constexpr int kAuthMaxRetries = 10;
 
-// 心跳保活
-// 发送间隔两端统一 1s；判死阈值按传输区分，见 UDP.h 的 m_heartbeatTimeout
-// （UDP 5s / TCP 20s——TCP 外层重传退避 1s→2s→4s 很容易超过 5s）
 constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
-// 从 EVP_PKEY 中取原始公钥（X25519 / Ed25519 均为 32 字节）
 bool get_raw_pubkey(EVP_PKEY* pkey, std::vector<uint8_t>& out)
 {
     if (pkey == nullptr)
@@ -48,7 +34,6 @@ EVP_PKEY* make_x25519_public_key(const uint8_t* raw, size_t len)
     return EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, raw, len);
 }
 
-// 生成一次性临时 X25519 密钥对（每次会话独立，前向安全）
 bool generate_ephemeral_x25519(EVP_PKEY*& priv_out, std::vector<uint8_t>& pub_out)
 {
     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_from_name(nullptr, "X25519", nullptr);
@@ -72,7 +57,7 @@ bool generate_ephemeral_x25519(EVP_PKEY*& priv_out, std::vector<uint8_t>& pub_ou
     return true;
 }
 
-} // namespace
+}
 
 UDP::UDP(const char* remoteip, uint16_t port, bool is_running, size_t queueMax) :
 	m_sock(SOCK_INVALID), m_sendqueue(queueMax), m_recvqueue(queueMax)
@@ -104,16 +89,15 @@ UDP::~UDP()
 	sock_runtime_stop();
 }
 
+// 传输层初始化：建套接字、起收发线程，会话状态在这里复位
 bool UDP::init()
 {
 	if (m_running.load() || send_thread.joinable() || recv_thread.joinable()) {
-		return false; // 已经初始化过了, 避免重复创建线程/泄漏 socket
+		return false;
 	}
-	// socket 运行时（Windows 需要 WSAStartup，Linux 空实现；内部引用计数）
 	if (!sock_runtime_start()) {
 		return false;
 	}
-	// 传输差异全部走钩子：基类实现 = UDP；TCP 子类覆写 open_socket/establish
 	const char* tname = (proto_version() == static_cast<uint8_t>(v_tcp)) ? "TCP" : "UDP";
 	m_sock = open_socket();
 	if (m_sock == SOCK_INVALID) {
@@ -121,9 +105,6 @@ bool UDP::init()
 		sock_runtime_stop();
 		return false;
 	}
-	// 放大收发缓冲：Windows 默认 8KB，突发流量下 UDP 直接丢包、
-	// TCP 拥塞窗口收缩，表现为"连接正常但网速很慢"。
-	// 8MB 对 1Gbps×~50ms RTT 的带宽延迟积留出余量；无 Linux 式 rmem_max 钳制
 	{
 		const int bufsize = 8 * 1024 * 1024;
 		setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF,
@@ -132,8 +113,6 @@ bool UDP::init()
 			reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
 	}
 	if (!establish()) {
-		// 具体原因已由 establish()（TCP 为 connect 失败分类）打印；
-		// 这里补上"哪个传输、连的哪个地址"，否则上层只能看到"UDP init 失败"
 		char ipbuf[INET_ADDRSTRLEN] = { 0 };
 		sock_ntop(m_sockaddr.sin_addr, ipbuf, sizeof(ipbuf));
 		LOG_ERR("[%s] 建立隧道失败：%s:%u（详见上一行原因）\n",
@@ -144,7 +123,6 @@ bool UDP::init()
 		return false;
 	}
 
-	// 三阶段认证状态复位（每次连接全新状态）
 	m_handshaked.store(false);
 	m_authenticated.store(false);
 	m_auth_failed.store(false);
@@ -152,7 +130,7 @@ bool UDP::init()
 	m_server_hello_ok.store(false);
 	m_enc_ready.store(false);
 	m_need_reconnect.store(false);
-	m_replay.reset();   // 新连接新会话：反重放窗口重置
+	m_replay.reset();
 	m_nonce_s.clear();
 	m_dh_cli_pub.clear();
 	m_dh_srv_pub.clear();
@@ -166,15 +144,12 @@ bool UDP::init()
 	m_last_rx_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 
-	// 解析内置的服务器身份公钥 SIG_SRV_PUB（硬编码）
 	if (m_server_sig_pub != nullptr) {
 		EVP_PKEY_free(m_server_sig_pub);
 		m_server_sig_pub = nullptr;
 	}
 	try {
 		m_server_sig_pub = load_ed25519_public_key_pem(m_server_sig_pub_pem);
-		// 诊断：打印客户端将用于验签的服务器公钥指纹（32 字节 hex），
-		// 与服务端启动日志的"服务器身份公钥指纹"比对——不一致即密钥配置错误
 		{
 			std::vector<uint8_t> raw;
 			size_t klen = 0;
@@ -196,7 +171,6 @@ bool UDP::init()
 		return false;
 	}
 
-	// 阶段1：生成 nonce_c（16 字节随机数）
 	m_nonce_c = generate_nonce(KAuthNonceLen);
 
 	m_running = true;
@@ -210,7 +184,6 @@ void UDP::stop()
 	m_running = false;
 	m_sendqueue.shutdown();
 	m_recvqueue.shutdown();
-	// 先关闭 socket，让阻塞在 recvfrom 上的接收线程立即返回，再回收线程，避免 stop 卡死
 	if (m_sock != SOCK_INVALID) {
 		sock_close(m_sock);
 		m_sock = SOCK_INVALID;
@@ -226,7 +199,7 @@ void UDP::stop()
 	m_server_hello_ok.store(false);
 	m_enc_ready.store(false);
 	m_need_reconnect.store(false);
-	m_replay.reset();   // 停止即重置：下次连接（实例复用时）从干净窗口开始
+	m_replay.reset();
 	secure_wipe(m_key_c2s);
 	secure_wipe(m_key_s2c);
 	m_nonce_c.clear();
@@ -255,17 +228,12 @@ void UDP::set_identity(
 	m_register_token = register_token;
 }
 
-// 网卡将数据填入队列
 void UDP::send_ip_packet(packet_buffer&& buf)
 {
 	if (!m_running.load()) {
 		return;
 	}
 	if (!m_sendqueue.push(std::move(buf))) {
-		// 队列满 = 上行突发超过发送线程的消化速度（拥塞/链路变慢）。
-		// 这是【丢包】而不是断线：原来的实现完全静默，用户只感觉到"网速慢"，
-		// 日志里连一条线索都没有（发送线程侧也不会报错）。
-		// 限流报前 3 条，之后只计数。
 		const uint32_t n = m_tx_queue_drop.fetch_add(1);
 		if (n < 3) {
 			LOG_ERR("[%s] 上行发送队列已满（上限 %zu 包），丢弃报文%s\n",
@@ -294,12 +262,8 @@ bool UDP::try_recv_ip_packet(packet_buffer& buf)
 
 bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector<uint8_t>& sendbuf)
 {
-	// 数据面明文载荷统一按 KMax_data_payload(1400) 限长：密文封装后不超过 Max_payload_len(1429)，
-	// 与服务端 send_packet 的入口检查一致
 	if (len > KMax_data_payload)
 		return false;
-	// 整帧写原子化：send_work（心跳/数据/认证）与 recv_work（心跳应答）都可能发帧，
-	// TCP 流式发送（raw_send）必须保证一帧不被另一帧打断（粘包/半包交错会破坏对端分帧）
 	std::lock_guard<std::mutex> lock(m_send_mutex);
 	size_t total_len = Ktunnel_header + len;
 	sendbuf.resize(total_len);
@@ -310,8 +274,6 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 	header.type = type;
 	header.payload_len = htons(static_cast<uint16_t>(len));
 	uint32_t seq = m_seq.fetch_add(1);
-	// 序号安全上限：达到 2^31 标记重连（新会话=新密钥=新反重放窗口），
-	// 防止 32 位序号回绕后被滑窗误判
 	if (seq >= kSeqRekeyLimit) {
 		LOG_ERR("[UDP] 发送序号达到安全上限，触发重连换会话\n");
 		m_need_reconnect.store(true);
@@ -320,7 +282,6 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 	header.sequence = htonl(seq);
 
 	memcpy(sendbuf.data(), &header, Ktunnel_header);
-	// 数据面加密：密钥就绪后 data/heart/identity/disconnect 等一律以密文发送（阶段1明文消息除外）
 	if (m_enc_ready.load() && (type == static_cast<uint8_t>(m_data) ||
 		type == static_cast<uint8_t>(m_heart) ||
 		type == static_cast<uint8_t>(m_heart_response) ||
@@ -329,21 +290,15 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 		type == static_cast<uint8_t>(m_identity_deny) ||
 		type == static_cast<uint8_t>(disconnect)))
 	{
-		// enc_len = inner明文(1+len) + nonce12 + tag16
 		const size_t enc_len = len + 1 + AES_GCM_NONCE_LEN + AES_GCM_TAG_LEN;
 		if (enc_len > Max_payload_len)
 			return false;
 		header.payload_len = htons(static_cast<uint16_t>(enc_len));
 		memcpy(sendbuf.data(), &header, Ktunnel_header);
-		// 零临时 vector：内层 type 字节作第一段明文、载荷作第二段直接加密，
-		// 输出（nonce||ct||tag）直写 sendbuf 帧头之后。
-		// 注意必须先按密文尺寸扩容：out_cap = 明文长度会把 seal 撑爆
-		// （曾因此所有密文发送抛 length_error，服务端永远收不到身份报文）
 		sendbuf.resize(Ktunnel_header + enc_len);
 		size_t sealed_len = 0;
 		try
 		{
-			// 客户端发送方向 = key_tx（m_key_c2s）；AAD = 帧头
 			sealed_len = aes256_gcm_seal(
 				m_key_c2s,
 				&type, 1,
@@ -360,38 +315,30 @@ bool UDP::send_packet(uint8_t type, const uint8_t* data, size_t len, std::vector
 			return false;
 		sendbuf.resize(Ktunnel_header + sealed_len);
 		total_len = Ktunnel_header + sealed_len;
-		// 发送差异走钩子：UDP = sendto（数据报）；TCP = send_all（流式循环写）。
-		// 这里绝不能硬编码 sendto——TCP 子类覆写的 raw_send 才是流式发送：
-		// 否则阶段3身份报文/心跳/数据面等密文帧在 TCP socket 上 sendto 失败
-		// （Windows 对已连接流式 socket 调用 sendto 返回 WSAEISCONN），
-		// 表现为"TCP 握手阶段1/2 正常、阶段3 永远过不去"的连接失败
 		return raw_send(sendbuf.data(), total_len);
 	}
 	if (len) {
 		memcpy(sendbuf.data() + Ktunnel_header, data, len);
 	}
-	// 发送差异走钩子：UDP = sendto（数据报）；TCP = send_all（流式循环写）
 	return raw_send(sendbuf.data(), total_len);
 }
 
-// ---- 基类传输钩子的 UDP 实现 ----
 sock_t UDP::open_socket()
 {
 	return socket(AF_INET, SOCK_DGRAM, 0);
 }
 
+// UDP 无连接，空实现只为满足传输接口；TCP 分支才真正建连
 bool UDP::establish()
 {
-	return true;   // UDP 无连接，无建立阶段
+	return true;
 }
 
-// UDP：sendto 单发数据报；对端端口不可达（ICMP 回执）时标记重连
 bool UDP::raw_send(const uint8_t* data, size_t len)
 {
 	int ret = sendto(m_sock, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
 		reinterpret_cast<const sockaddr*>(&m_sockaddr), sizeof(m_sockaddr));
 	if (ret == SOCK_ERR) {
-		// 对端端口不可达，标记隧道需要重连
 		if (sock_last_error() == kSockConnReset)
 			m_need_reconnect.store(true);
 		return false;
@@ -399,8 +346,6 @@ bool UDP::raw_send(const uint8_t* data, size_t len)
 	return true;
 }
 
-// UDP：recvfrom 一收一条完整数据报（含来源过滤）。
-// 阻塞 socket：stop() 靠 closesocket 解除阻塞；空包/瞬时错误返回继续
 bool UDP::recv_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_len, bool& got)
 {
 	m_udpBuf.resize(KMax_packet_size);
@@ -411,13 +356,8 @@ bool UDP::recv_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_le
 		reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
 	if (ret <= 0) {
 		got = false;
-		return true;   // 空数据报/瞬时错误：外层循环继续
+		return true;
 	}
-	// 只接受目标服务器（m_sockaddr）的回包：
-	// UDP socket 未 bind/connect，任何第三方都能往本端端口发包，
-	// 不校验来源可能被伪造注入（伪造 data 直通 TUN）。
-	// 本协议服务器总是从收到的源地址回包（server 用 s.peer_addr），
-	// 来源 IP/端口必须与客户端发送目标一致。
 	if (peer_addr.sin_addr.s_addr != m_sockaddr.sin_addr.s_addr ||
 		peer_addr.sin_port != m_sockaddr.sin_port)
 	{
@@ -437,13 +377,11 @@ bool UDP::recv_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_le
 	}
 	memcpy(&hdr, m_udpBuf.data(), Ktunnel_header);
 	if (hdr.magic != Kmagic) {
-		// 来源不是本协议对端（扫描垃圾流量 / 服务端协议完全不同）
 		LOG_ERR("[UDP] 收到非法 magic=0x%08X 的报文，丢弃\n", hdr.magic);
 		got = false;
 		return true;
 	}
 	if (hdr.version != proto_version()) {
-		// 魔数对但版本不同：几乎总是服务端二进制版本与客户端不一致
 		LOG_ERR("[UDP] 协议版本不匹配: 收到 v%u, 本端 v%u —— 服务端版本可能与客户端不一致，丢弃\n",
 			static_cast<unsigned>(hdr.version), static_cast<unsigned>(proto_version()));
 		got = false;
@@ -455,22 +393,17 @@ bool UDP::recv_frame(tunnel_header& hdr, const uint8_t*& payload, size_t& pay_le
 		got = false;
 		return true;
 	}
-	// 校验报文完整性：头部 + payload 长度不超过实际收到字节数
 	if (static_cast<size_t>(ret) < Ktunnel_header + pay_len) {
 		LOG_ERR("[UDP] 报文不完整: 实际 %d 字节 < 头部+%zu，丢弃\n", ret, pay_len);
 		got = false;
 		return true;
 	}
-	// payload 指针指向成员缓冲（handle_frame 同步使用，下次调用前有效）；AAD = 帧头起始
 	payload = m_udpBuf.data() + Ktunnel_header;
 	got = true;
 	return true;
 }
 
-// 阶段3：组装并签名身份报文（返回不含内层 type 字节的 body，send_packet 会补）
-// body = [flags(1: 0=登录 1=注册)] [token_len(1)] [token?] [identity_payload] [sig_cli(64)]
-// identity_payload = nonce_c(16) || nonce_s(16) || dh_cli_pub(32) || dh_srv_pub(32)
-//                    || sig_cli_pub(32) || id_len(1) || client_id
+// 组装身份报文（含注册标志与 Ed25519 签名）；协议新增认证字段从这里改
 bool UDP::build_identity_message(std::vector<uint8_t>& out)
 {
 	if (!m_ed25519_priv) {
@@ -493,7 +426,6 @@ bool UDP::build_identity_message(std::vector<uint8_t>& out)
 		return false;
 	}
 
-	// identity_payload（服务器会按相同规则重建并验签）
 	std::vector<uint8_t> payload;
 	payload.reserve(KAuthIdentityFixed + m_client_id.size());
 	payload.insert(payload.end(), m_nonce_c.begin(), m_nonce_c.end());
@@ -517,7 +449,7 @@ bool UDP::build_identity_message(std::vector<uint8_t>& out)
 
 	out.clear();
 	out.reserve(2 + m_register_token.size() + payload.size() + sig.size());
-	const uint8_t flags = m_register_token.empty() ? 0 : 1; // 0=登录 1=注册
+	const uint8_t flags = m_register_token.empty() ? 0 : 1;
 	out.push_back(flags);
 	if (m_register_token.size() > 255) {
 		LOG_ERR("[UDP] register_token 过长\n");
@@ -534,8 +466,6 @@ bool UDP::build_identity_message(std::vector<uint8_t>& out)
 
 void UDP::send_work()
 {
-	// send_thread 是 std::thread，任何异常穿过线程边界都会 std::terminate 崩溃。
-	// 整体 try/catch：异常只记日志、标记重连，绝不崩溃进程。
 	try {
 	std::vector<uint8_t> sendbuf;
 	sendbuf.reserve(KMax_packet_size);
@@ -546,7 +476,6 @@ void UDP::send_work()
 	auto last_retry = auth_start;
 	int retries = 0;
 
-	// 阶段1a：发送 nonce_c（明文），等待服务器带签名的响应
 	send_packet(static_cast<uint8_t>(m_auth_hello), m_nonce_c.data(), m_nonce_c.size(), sendbuf);
 	last_retry = clock_type::now();
 	while (m_running.load() && !m_server_hello_ok.load() && !m_auth_failed.load() && !m_need_reconnect.load())
@@ -561,7 +490,6 @@ void UDP::send_work()
 				m_need_reconnect.store(true);
 				break;
 			}
-			// 重传保持同一 nonce
 			send_packet(static_cast<uint8_t>(m_auth_hello), m_nonce_c.data(), m_nonce_c.size(), sendbuf);
 			last_retry = now;
 		}
@@ -572,10 +500,9 @@ void UDP::send_work()
 			LOG_ERR("[UDP] 服务器身份校验失败：疑似中间人攻击，断开连接\n");
 		}
 		m_hs_state = HS_IDLE;
-		return; // 超时/中间人/被拒：交由上层决定重连
+		return;
 	}
 
-	// 阶段1b：生成本次临时 X25519 密钥对，发送公钥（明文）
 	if (!generate_ephemeral_x25519(m_dh_cli_priv, m_dh_cli_pub)) {
 		LOG_ERR("[UDP] 生成临时 X25519 密钥对失败\n");
 		m_need_reconnect.store(true);
@@ -583,7 +510,6 @@ void UDP::send_work()
 	}
 	send_packet(static_cast<uint8_t>(m_auth_client_hello), m_dh_cli_pub.data(), m_dh_cli_pub.size(), sendbuf);
 
-	// 阶段2：X25519 ECDH + HKDF 派生 key_tx/key_rx，加密隧道开启
 	{
 		EVP_PKEY* srv_pub = make_x25519_public_key(m_dh_srv_pub.data(), m_dh_srv_pub.size());
 		if (srv_pub == nullptr) {
@@ -613,13 +539,12 @@ void UDP::send_work()
 			return;
 		}
 		secure_wipe(ss);
-		m_key_c2s = std::move(keys.key_tx); // 客户端→服务端（发送加密）
-		m_key_s2c = std::move(keys.key_rx); // 服务端→客户端（接收解密）
+		m_key_c2s = std::move(keys.key_tx);
+		m_key_s2c = std::move(keys.key_rx);
 		m_enc_ready.store(true);
 		LOG_INFO("[UDP] 加密隧道已建立（阶段2完成）");
 	}
 
-	// 阶段3：加密隧道内身份认证
 	{
 		std::vector<uint8_t> identity_msg;
 		if (!build_identity_message(identity_msg)) {
@@ -643,12 +568,6 @@ void UDP::send_work()
 					m_need_reconnect.store(true);
 					break;
 				}
-				// 同时重传 auth_client_hello（本端临时 DH 公钥）：这一帧只在阶段1b
-				// 发过一次，UDP 上丢一次，服务端就永远派生不出会话密钥（s.enc_ready
-				// 恒为 false），之后所有密文帧——包括身份报文——都被服务端在解密
-				// 之前丢弃，表现为 5s 握手超时后断开重连，且每次重连都重演。
-				// 服务端对该帧有阶段机保护（非 HELLO 阶段直接拒绝，不会覆盖已派生
-				// 密钥），所以重传是幂等且安全的。
 				if (!m_dh_cli_pub.empty()) {
 					send_packet(static_cast<uint8_t>(m_auth_client_hello),
 						m_dh_cli_pub.data(), m_dh_cli_pub.size(), sendbuf);
@@ -684,7 +603,6 @@ void UDP::send_work()
 	m_handshaked.store(true);
 	m_hs_state = HS_SUCCESS;
 
-	// 数据面（心跳 + TUN 流量，全部 AES-GCM 加密）
 	auto last_heart = clock_type::now();
 	while (m_running.load())
 	{
@@ -693,17 +611,12 @@ void UDP::send_work()
 		}
 		const auto now = clock_type::now();
 
-		// 心跳（TCP keepalive 的简化版）
 		if (now - last_heart >= kHeartbeatInterval) {
 			send_packet(static_cast<uint8_t>(m_heart), nullptr, 0, sendbuf);
 			last_heart = now;
 		}
-		// 心跳超时：超过 m_heartbeatTimeout 未收到【能通过认证的】对端报文 -> 判定链路失效
-		// （阈值按传输区分：UDP 5s / TCP 20s，见 UDP.h 的成员注释）
 		if (m_last_rx_ms.load() != 0 &&
 			now - std::chrono::steady_clock::time_point(std::chrono::milliseconds(m_last_rx_ms.load())) > m_heartbeatTimeout) {
-			// 注意措辞：这条不等于"对端不可达"——本端解密失败或被反重放窗口丢弃的帧
-			// 同样不刷新存活时间（上面两条限流日志会给出真正原因），故两者都列出
 			LOG_ERR("[UDP] heartbeat timeout: %lldms 内未收到任何通过认证的对端报文"
 				"（对端不可达，或本端解密失败/被反重放丢弃），重连\n",
 				static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -712,15 +625,12 @@ void UDP::send_work()
 			break;
 		}
 
-		// 事件驱动等待发送数据，最多等到下一个心跳时刻：有数据立即醒来发送，
-		// 到点自动醒来发心跳。取代原先"队列空固定 sleep 20ms 轮询"——
-		// 突发首包不再额外拖平均 10ms 延迟
 		const auto status = m_sendqueue.pop_until(buf, last_heart + kHeartbeatInterval);
 		if (status == PacketQueue::PopResult::Shutdown) {
 			break;
 		}
 		if (status == PacketQueue::PopResult::Timeout) {
-			continue;   // 到心跳时刻：回循环头发送心跳
+			continue;
 		}
 		if (buf.is_empty()) {
 			continue;
@@ -731,10 +641,6 @@ void UDP::send_work()
 			continue;
 		}
 		if (!send_packet(static_cast<uint8_t>(m_data), buf.get_data(), paysize, sendbuf)) {
-			// 瞬时发送失败（本地缓冲满/瞬时错误）≠ 断线：丢当前包继续，
-			// 由上层 TCP/应用重传兜底。对端真正不可达（ICMP 端口不可达
-			// kSockConnReset / TCP 对端关闭）已由 raw_send 置 need_reconnect，
-			// 下一轮循环自然退出——避免高速突发时误判断线导致反复重连降速。
 			buf.clear();
 			continue;
 		}
@@ -758,20 +664,8 @@ void UDP::send_work()
 	}
 }
 
-/*
-	struct tunnel_header
-{
-	uint32_t magic;			    4
-	uint8_t version;		    1
-	uint8_t type;			    1
-	uint16_t payload_len;		2
-	uint32_t sequence;			4
-};  12
-*/
 void UDP::recv_work()
 {
-	// recv_thread 是 std::thread，异常穿过边界会 std::terminate 崩溃。
-	// 整体 try/catch：异常只记日志、标记重连，绝不崩溃进程。
 	try {
 	std::vector<uint8_t> sendbuf;
 	sendbuf.reserve(KMax_packet_size);
@@ -781,12 +675,10 @@ void UDP::recv_work()
 		const uint8_t* payload = nullptr;
 		size_t payload_len = 0;
 		bool got = false;
-		// 传输差异走钩子：UDP = recvfrom 一条数据报；TCP = 分帧凑一条
 		if (!recv_frame(header, payload, payload_len, got))
-			break;                       // 连接死亡：收包线程退出（实例随后被销毁）
+			break;
 		if (!got)
 			continue;
-		// 任何合法报文都视为对端存活 + 解密分发/阶段1握手：两条传输路径共用
 		handle_frame(header, payload, payload_len, sendbuf);
 	}
 	}
@@ -802,17 +694,11 @@ void UDP::recv_work()
 	}
 }
 
-// 帧统一处理：解密分发 + 阶段1明文握手（UDP 数据报与 TCP 分帧两条路径共用）。
-// 原 recv_work 循环体，continue 语义在此等价于 return。
-// AAD = 本帧帧头起始地址（AES-GCM 附加认证数据），由 payload 指针直接推导
 void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 	size_t payload_len, std::vector<uint8_t>& sendbuf)
 {
 	const uint8_t* aad = payload - Ktunnel_header;
-	// 存活时间不再在此无条件刷新：未认证报文（伪造/扫描）不应阻止心跳
-	// 超时清理；密文帧在 GCM 验证成功后才刷新 m_last_rx_ms
 
-		// 密文类型：密钥就绪后 data/heart/identity/disconnect 等均为 AES-GCM 密文，先解密再按内层类型分发
 		if (header.type == static_cast<uint8_t>(m_data) ||
 			header.type == static_cast<uint8_t>(m_heart) ||
 			header.type == static_cast<uint8_t>(m_heart_response) ||
@@ -823,21 +709,16 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 		{
 			if (!m_enc_ready.load())
 			{
-				return; // 密钥未就绪前收到的数据/心跳一律丢弃
+				return;
 			}
 			const uint32_t seq_host = ntohl(header.sequence);
-			// 反重放分两步：解密前只做"不修改状态"的过旧预检（未认证报文
-			// 不能污染窗口），GCM 验证成功后才提交窗口与存活时间
 			if (m_replay.too_old(seq_host)) {
 				return;
 			}
-			// 零临时 vector：密文段（nonce||ct||tag）直接从接收缓冲解密到栈上
-			// 明文缓冲（内层明文 = type(1)+载荷 ≤ KMax_data_payload）
 			uint8_t plain[KMax_data_payload + 1];
 			size_t plain_len = 0;
 			try
 			{
-				// 客户端接收方向 = key_rx（m_key_s2c）；AAD = 帧头
 				plain_len = aes256_gcm_open(
 					m_key_s2c,
 					payload, payload_len,
@@ -851,8 +732,6 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			}
 			if (plain_len == 0)
 			{
-				// 认证失败（GCM tag 不匹配 / 密钥不一致）：不推进窗口、不刷新存活。
-				// 限流报前 3 条——静默丢弃会让"密钥/帧有问题"看起来和"对端不可达"一样
 				const uint32_t n = m_auth_fail_logged.fetch_add(1);
 				if (n < 3)
 				{
@@ -861,9 +740,7 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 				}
 				return;
 			}
-			// 验证通过才提交反重放窗口 + 刷新存活时间
 			if (!m_replay.accept(seq_host)) {
-				// 重放/乱序过旧帧：静默丢弃会让"被丢帧"看起来像"对端不可达"
 				const uint32_t n = m_replay_reject_logged.fetch_add(1);
 				if (n < 3)
 				{
@@ -876,8 +753,6 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			if (plain_len < 1)
 				return;
 			const uint8_t inner_type = plain[0];
-			// 数据面（热路径）直接从栈缓冲零拷贝入队；其余小载荷（心跳/身份）
-			// 拷进临时 vector 走原有分发逻辑
 			if (inner_type == static_cast<uint8_t>(m_data))
 			{
 				if (plain_len <= 1)
@@ -905,12 +780,7 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			case m_heart_response:
 				break;
 			case m_identity_ok:
-				// 阶段3：身份验证通过
 				m_authenticated.store(true);
-				// 多用户服务端会在 identity_ok 里通告分配的虚拟 IP：
-				// payload = [virtual_ip(4, 网络序)] [prefix(1)]
-				// 客户端之后用 m_assigned_ip 覆盖 config.ini 的 VirtualIP 配置网卡
-				// （见 main.cpp 的 connected_callback），保证与服务端分配一致。
 				if (inner_payload.size() >= 5)
 				{
 					uint32_t ip_net = 0;
@@ -924,12 +794,10 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 				}
 				break;
 			case m_identity_deny:
-				// 阶段3：身份验证被拒绝；内层首字节为原因码 0=未注册 1=令牌无效/已使用
 				m_auth_deny_reason.store(inner_payload.empty() ? -1 : static_cast<int>(inner_payload[0]));
 				m_auth_failed.store(true);
 				break;
 			case disconnect:
-				// 服务端显式断开（密文内层）：标记重连
 				m_need_reconnect.store(true);
 				break;
 			default:
@@ -938,15 +806,11 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			return;
 		}
 
-		// 明文类型（阶段1握手消息）
 		switch (header.type)
 		{
 		case m_auth_server_hello:
 		{
-			// 阶段1：服务器响应 [nonce_s(16) || DH_SRV_EPHEM_PUB(32) || sig_srv(64)]
 			if (payload_len != KAuthServerHelloLen) {
-				// 长度不符几乎总是服务端二进制版本与客户端不一致（协议字段变更），
-				// 必须可见，否则表现为"无任何日志的握手超时"
 				LOG_ERR("[UDP] ServerHello 长度不匹配: 收到 %u 字节, 期望 %zu —— 服务端版本可能与客户端不一致\n",
 					static_cast<unsigned>(payload_len), KAuthServerHelloLen);
 				break;
@@ -954,7 +818,6 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			m_nonce_s.assign(payload, payload + KAuthNonceLen);
 			m_dh_srv_pub.assign(payload + KAuthNonceLen, payload + KAuthNonceLen + KAuthDhPubLen);
 			const uint8_t* sig = payload + KAuthNonceLen + KAuthDhPubLen;
-			// sig_payload = nonce_c || nonce_s || DH_SRV_EPHEM_PUB
 			std::vector<uint8_t> sig_payload;
 			sig_payload.reserve(KAuthNonceLen * 2 + KAuthDhPubLen);
 			sig_payload.insert(sig_payload.end(), m_nonce_c.begin(), m_nonce_c.end());
@@ -972,9 +835,6 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 				sig_ok = false;
 			}
 			if (!sig_ok) {
-				// 可能是中间人，也可能是"用来验签的公钥与服务器身份不一致"
-				//（服务器条目留空 ServerPubKey 时用的是内置固定公钥；
-				//  服务器换了身份密钥也会这样）。两种都表现为握手刚起步就断开
 				LOG_ERR("[UDP] SIG_SRV_PUB 验签失败：无法确认服务器身份，断开连接\n"
 					"      请核对本条目是否配了正确的 ServerPubKey（留空 = 用内置固定公钥），\n"
 					"      以及服务端 keys/server_sig.pub 是否与之一致（服务端启动日志会打印指纹）\n");
@@ -985,20 +845,14 @@ void UDP::handle_frame(const tunnel_header& header, const uint8_t* payload,
 			break;
 		}
 		case m_heart:
-			// 对端心跳：回复心跳响应
 			send_packet(static_cast<uint8_t>(m_heart_response), nullptr, 0, sendbuf);
 			break;
 		case m_heart_response:
-			// 心跳确认：可用于链路检测，暂不处理
 			break;
 		case m_data: {
-			// 明文数据兼容路径已删除：伪造源地址的明文 m_data 可在密钥就绪前未认证注入 TUN（高危）。
-			// 数据面只接受 AES-256-GCM 密文（上方密文分支），与服务端行为一致。
 			break;
 		}
 		case disconnect:
-			// 明文 disconnect 不再受理：服务端从不发送明文 disconnect，
-			// 受理它只会让伪造源地址的报文触发客户端重连风暴
 			break;
 		default:
 			break;

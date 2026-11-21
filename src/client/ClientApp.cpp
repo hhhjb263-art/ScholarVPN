@@ -1,11 +1,11 @@
-
 #include "ClientApp.h"
 #include <cstdarg>
-#include <cstring>   // memcpy：上行报文的源地址终检
-#include <chrono>    // 分流注入耗时统计
-#include "platform/iplist.h"   // 国内网段列表（Mode=split）
-#include "tun_macro.h"   // LOG_INFO 等分级日志宏（logger.h 只有 LOG_ERR/LOG_KEY/LOG_DBG）
-#include"../src/util/utf.h"   // narrow/to_cfgstr/is_valid_ipv4/get_exe_dir/find_key_file 统一由 utf.h 提供
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+#include "platform/iplist.h"
+#include "tun_macro.h"
+#include"../src/util/utf.h"
 #if !defined(_WIN32)
 #include <poll.h>
 #include <unistd.h>
@@ -13,10 +13,6 @@
 
 namespace {
 
-// 客户端身份私钥本地加密存储。
-// Windows：DPAPI（绑定当前用户，磁盘不落明文）
-// Linux  ：没有 DPAPI，私钥以 0600 权限落盘（与 WireGuard 的做法一致）。
-//          保护边界是"文件权限 + 用户账户"，root 可读属预期行为。
 #if defined(_WIN32)
 bool dpapi_protect(const std::vector<uint8_t>& plain, std::vector<uint8_t>& out)
 {
@@ -49,7 +45,7 @@ bool dpapi_unprotect(const std::vector<uint8_t>& enc, std::vector<uint8_t>& plai
 #else
 bool dpapi_protect(const std::vector<uint8_t>& plain, std::vector<uint8_t>& out)
 {
-    out = plain;      // 不加密；写入后由 cfg_restrict_file() 收紧到 0600
+    out = plain;
     return true;
 }
 
@@ -60,14 +56,6 @@ bool dpapi_unprotect(const std::vector<uint8_t>& enc, std::vector<uint8_t>& plai
 }
 #endif
 
-// 服务器身份公钥 SIG_SRV_PUB（硬编码编译进客户端，作"服务器条目没填 ServerPubKey"
-// 时的兜底固定值）。按构建配置区分，目前 Debug/Release 都指向线上正式服务器。
-//
-// 历史坑：之前这两段是两把早已作废的旧服务器公钥（指纹 Release 4092aa67…、
-// Debug f80ef768…），与线上服务器实际身份（指纹 0ce5731a…，即下面这把）都不匹配。
-// 结果：任何留空 ServerPubKey 的服务器条目都会在阶段1 之后立刻"验签失败"断开，
-// 现象与"服务器把我踢了"一模一样。改服务器身份密钥时，这里和 config.ini 的
-// ServerPubKey 必须一起更新（可用 server/keys/server_sig.pub 的正文行）。
 #ifdef _DEBUG
 const std::string kServerSigPubPem = R"(-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEADOVzGrvIQ/LWfUu9aatEdjKotXm2OXcy02/IJ/RqlcI=
@@ -80,7 +68,7 @@ MCowBQYDK2VwAyEADOVzGrvIQ/LWfUu9aatEdjKotXm2OXcy02/IJ/RqlcI=
 )";
 #endif
 
-} // namespace
+}
 
 ClientApp::ClientApp() = default;
 
@@ -103,7 +91,6 @@ void ClientApp::emit_log(const char* fmt, ...)
     }
 }
 
-// Callback setters
 void ClientApp::set_state_callback(StateCallback cb)
 {
     m_onState = std::move(cb);
@@ -134,9 +121,6 @@ void ClientApp::save_config()
     config.SaveClientConfig(m_cfg);
 }
 
-// 当前进程是否已提权（管理员）。
-// Windows：TokenElevation（即使账户是管理员，UAC 未过也返回 false）
-// Linux  ：euid == 0（创建 tun / 改路由 / 改 DNS 都需要 root 或 CAP_NET_ADMIN）
 bool ClientApp::is_elevated()
 {
 #if defined(_WIN32)
@@ -155,20 +139,13 @@ bool ClientApp::is_elevated()
 #endif
 }
 
+// 一次性初始化：日志、套接字运行时、管理员权限校验、配置与密钥
 bool ClientApp::init()
 {
     Logger::Init();
 
-    // 进程级 Winsock 初始化（幂等，Linux 空实现）。
-    // 必须早于任何 getaddrinfo 调用：start() 里解析服务器域名时，
-    // UDP::init() 还没跑（它要到 start() 后段才创建），此时 WSACleanup 状态下的
-    // getaddrinfo 会直接返回 WSANOTINITIALISED —— 表现为"域名永远解析失败"。
     sock_runtime_start();
 
-    // 免 UAC 启动：普通用户也能运行本程序（界面/托盘可用），但创建 Wintun 网卡、
-    // 改路由、改 DNS 都需要管理员权限，连接功能因此不可用。这里提前拦截并给出明确
-    // 原因——否则要走到 WintunTun::init_tun() 才失败，而 GUI 未接日志，用户只会看到
-    // "点了没反应"。
     if (!is_elevated())
     {
         LOG_ERR("[权限] 当前以普通用户运行：创建虚拟网卡 / 修改路由 / 修改 DNS 需要管理员权限，"
@@ -176,9 +153,6 @@ bool ClientApp::init()
         return false;
     }
 
-    // 启动兜底清扫（只执行一次，且在 bridge 工作线程，不会卡 GUI）：
-    // 上次进程异常退出（崩溃/被杀/断电）时，黑洞 DNS / DisableSmartNameResolution
-    // 可能残留。restore() 会把残留的 0.0.0.0 黑洞 DNS 清回 DHCP 自动并恢复注册表策略，
     m_dnsGuard.restore();
 
     m_configDir = cfg_app_dir();
@@ -186,16 +160,12 @@ bool ClientApp::init()
     Config::CreateDir(m_configDir);
     const cfgstr keysDirW = cfg_path_join(m_configDir, CS("keys"));
     Config::CreateDir(keysDirW);
-    // 后续按 "目录前缀 + 文件名" 拼路径（OpenSSL / ifstream 都要窄字符），
-    // 统一用 '/'：Windows 也接受正斜杠，省掉两端分隔符分叉
     std::string keysDir = cfg_to_utf8(keysDirW);
     if (keysDir.empty() || (keysDir.back() != '/' && keysDir.back() != '\\'))
     {
         keysDir += '/';
     }
 
-    // ---- Ed25519 身份密钥（SIG_CLI_PRI 本地加密存储 / SIG_CLI_PUB）----
-    // 私钥经 Windows DPAPI 加密存为 client.id.enc；公钥明文存为 client.id.pub。
     const cfgstr idPubPathW = cfg_path_join(keysDirW, CS("client.id.pub"));
     const cfgstr idEncPathW = cfg_path_join(keysDirW, CS("client.id.enc"));
     if (!Config::FileExists(idPubPathW))
@@ -221,7 +191,6 @@ bool ClientApp::init()
                 LOG_ERR("Failed to store identity private key");
                 return false;
             }
-            // Linux：没有 DPAPI，必须把私钥文件收紧到 0600（Windows 分支为空操作）
             if (!cfg_restrict_file(idEncPathW))
             {
                 LOG_ERR("[Identity] 无法把 %s 权限设为 0600，私钥可能被其他用户读取",
@@ -262,7 +231,6 @@ bool ClientApp::init()
         return false;
     }
 
-    // ---- 服务器身份公钥 SIG_SRV_PUB：优先硬编码，否则回退 keys\server.pub ----
     m_serverSigPubPem = kServerSigPubPem;
     if (m_serverSigPubPem.find("-----BEGIN PUBLIC KEY-----") == std::string::npos)
     {
@@ -294,7 +262,7 @@ bool ClientApp::init()
                 "Client keys are stored at %s\n"
                 "Please fill in ServerIP in config.ini, then run the client again.",
                 narrow(m_configPath).c_str(), keysDir.c_str());
-        return false;   // 首次运行：生成配置文件后等待用户填写
+        return false;
     }
 #endif
     if (Config::FileExists(m_configPath))
@@ -315,11 +283,6 @@ bool ClientApp::init()
         LOG_KEY("[Config] config.ini not found (%s), using defaults", narrow(m_configPath).c_str());
     }
 
-    // 多服务器：LoadClientConfig 已把 servers[0] 的 ServerPubKey 同步进主字段。
-    // 非空时用它覆盖内置硬编码公钥（与 set_server() 的包装逻辑一致），
-    // 避免"未走 set_server() 直连"时阶段1验签用错服务器公钥。
-    // 覆盖前先备份内置公钥：切换到"未配置自定义公钥"的服务器时恢复用，
-    // 否则上一台的自定义公钥会残留，导致验签必失败（公钥串台）
     m_builtinServerSigPubPem = m_serverSigPubPem;
     if (!m_cfg.ServerPubKey.empty())
     {
@@ -329,10 +292,6 @@ bool ClientApp::init()
         LOG_KEY("[Identity] 已应用服务器 %s 配置的 ServerPubKey 验签", cfg_to_utf8(m_cfg.ServerIP).c_str());
     }
 
-    // 传输方式：servers[0] 就是默认/活动服务器。不经过 set_server() 的启动路径
-    // （AppBridge::start、Debug 直连、自动重连后的首次启动）必须在这里同步，
-    // 否则 config.ini 里写着 Transport=1（TCP），程序却永远按默认 UDP 去连——
-    // 现象就是"切成 TCP 后仍然连不上，而且服务端根本看不到 TCP 连接进来"。
     if (!m_cfg.servers.empty())
     {
         m_transport = m_cfg.servers[0].transport ? Transport::TCP : Transport::UDP;
@@ -346,11 +305,8 @@ bool ClientApp::init()
             static_cast<int>(m_transport));
 
 #ifndef _DEBUG
-    // 配置里允许填域名：这里只保留原文，解析放到 start()。
-    // 每次连接都解析一次 —— IP 被封后改 DNS 解析即可生效，不需要重启客户端。
     m_serverHost = narrow(m_cfg.ServerIP);
     m_remote = m_serverHost;
-    // 空 = 多服务器模式：init 只建网卡/路由，目标服务器稍后由 set_server() 指定
     if (!m_remote.empty() && !is_valid_host(m_remote))
     {
         LOG_ERR("Invalid ServerIP in config.ini (既不是 IPv4 也不是域名): %s", m_remote.c_str());
@@ -363,7 +319,6 @@ bool ClientApp::init()
     }
     m_port = static_cast<uint16_t>(m_cfg.ServerPort);
 #else
-    // Debug：默认192.168.1.12
     m_remote = "192.168.1.12";
     m_serverHost = m_remote;
     m_port = 51820;
@@ -392,7 +347,7 @@ bool ClientApp::init()
 #if defined(_WIN32)
     const char* kTunName = "MyTunAdapter";
 #else
-    const char* kTunName = "vpn0";   // Linux 惯例：短接口名（IFNAMSIZ=16）
+    const char* kTunName = "vpn0";
 #endif
     if (!m_tun->init_tun(kTunName, "MyTunnel"))
     {
@@ -404,7 +359,6 @@ bool ClientApp::init()
         return false;
     }
     m_adapter = std::make_unique<AdapterConfig>(m_tun->get_interface_id());
-    // VirtualIP 可留空
     if (!m_cfg.VirtualIP.empty())
     {
         if (!m_adapter->set_IPv4_address(m_cfg.VirtualIP, static_cast<uint8_t>(m_cfg.VirtualPrefix)))
@@ -426,14 +380,6 @@ bool ClientApp::init()
         LOG_ERR("[Warn] Failed to set DNS, continuing without custom DNS");
     }
     m_route = std::make_unique<RouteManager>(m_tun->get_interface_id());
-    // 只加服务器 bypass 路由：保证握手包能走物理网卡到达服务器。
-    // 注意：不能在 init 里切默认路由 / 做 DNS 防护——握手可能失败，
-    // 隧道未建立时默认路由指向 TUN 就是"黑洞"，全部流量进 TUN 被丢，
-    // 物理网卡 DNS 被清空则 DNS 解析全挂（表现为浏览器没网）。
-    // 默认路由 + DNS 防护必须等握手成功（Connected 回调）才激活。
-    // 多服务器模式（m_remote 为空）：此刻尚无目标服务器，跳过；
-    // 由 start() 在 set_server() 指定目标后补加（空 IP 的 InetPton 必失败，
-    // 否则 init() 整体失败，表现为"初始化失败"永远连不上）。
     if (!m_remote.empty())
     {
         if (!m_route->add_server_bypass_route(cfg_from_utf8(m_remote)))
@@ -447,18 +393,14 @@ bool ClientApp::init()
     return true;
 }
 
+// 建连入口：装配 ReconnectManager 与状态回调，起上下行两个数据面线程
 bool ClientApp::start()
 {
-    // 注意：此处不能再调 init()！init() 会用 config 重新解析 m_remote，
-    // 会覆盖 set_server() 设置的"当前卡片服务器 IP"。
-    // init() 由 AppBridge::connect_to_server / start 在调用 start() 之前完成。
     if (m_running.exchange(true))
     {
         return false;
     }
 
-    // 强制更新闸门 + 受管服务闸门：界面已禁用「连接」，但托盘菜单/命令行仍可能
-    // 调到这里。用户要求不允许离线使用，所以这里也必须各挡一道。
     if (m_updateBlocked.load())
     {
         LOG_ERR("[Update] 当前版本被要求强制更新，拒绝连接");
@@ -474,13 +416,6 @@ bool ClientApp::start()
         return false;
     }
 
-    // 注意：不能在这里做启动兜底 restore()——start() 每次连接都会调用，
-    // 白遍历一遍网卡；且 m_running 已置 true，若 restore 内部异常会卡死状态机。
-    // 启动兜底已移到 init()（只在程序启动/首次连接时执行一次）。
-
-    // 解析服务器地址（配置里可能是域名）。
-    // 必须在这里做：add_server_bypass_route 与 ReconnectManager 都只认 IPv4 字面量。
-    // 此刻默认路由还没指向 TUN，DNS 查询走物理网卡，结果才是可信的。
     if (!m_serverHost.empty())
     {
         std::string ip;
@@ -499,9 +434,6 @@ bool ClientApp::start()
         m_remote = ip;
     }
 
-    // set_server() 可能已切换/首次指定目标服务器：这里补加 bypass 路由，
-    // 保证握手包走物理网卡到达服务器（init() 时 m_remote 为空会跳过）。
-    // create_route 对已存在的同前缀路由返回成功，重复添加无害。
     if (m_route && !m_remote.empty() &&
         !m_route->add_server_bypass_route(cfg_from_utf8(m_remote)))
     {
@@ -510,42 +442,28 @@ bool ClientApp::start()
         return false;
     }
 
-    // 收发队列深度：4096 包（单向 ≈5.6MB）。
-    // 原值 256 包（≈350KB）在高带宽高 RTT 链路上小于带宽延迟积
-    // （100Mbps×50ms ≈ 625KB）：一有突发就队列满 → 静默丢包 →
-    // 上层 TCP 疯狂重传 → 越重传越慢。队列深度至少要能吸收一个 BDP 的突发。
     m_mgr = std::make_unique<ReconnectManager>(m_remote, m_port, 4096);
     m_mgr->set_transport(m_transport);
     m_mgr->set_identity(m_ed25519Priv, m_serverSigPubPem,
                         narrow(m_cfg.ClientID), narrow(m_cfg.RegisterToken));
 
-    // 上行闸门先关：新连接会重新协商虚拟 IP，网卡地址还没同步前不能发包
     m_tunIpReady.store(false);
 
-    // 状态回调：断线/重连时撤销\"全流量进 TUN\"的黑洞，让物理网卡恢复上网，
-    // 同时恢复物理网卡 DNS（防泄漏守卫反向操作），握手包仍走 bypass 路由。
     m_mgr->set_state_callback([this](ConnState s)
         {
-            // 回调运行在 ReconnectManager 的 worker 线程里，任何异常穿过
-            // std::thread 边界都会 std::terminate 崩溃（崩溃后 stop() 跑不到，
-            // 黑洞路由/DNS 残留，电脑断网）。整体 try/catch 兜底。
             try
             {
                 m_state.store(s);
                 emit_log("[Reconnect] state -> %s", ReconnectManager::state_name(s));
-                // 只在断线重连（Reconnecting）时撤销默认路由 + 恢复物理网卡 DNS：
-                // Connecting 是首次连接/握手开始，DNS 防护尚未激活，无需恢复，白遍历网卡。
                 if (s == ConnState::Reconnecting)
                 {
-                    // 断线/换传输方式：下次连接会重新协商虚拟 IP，先关上行闸门，
-                    // 避免"旧地址的包"在重连成功的瞬间被当成有效上行发出去
                     m_tunIpReady.store(false);
                     if (m_route)
                     {
-                        m_route->remove_default_route();   // 只撤默认路由，保留服务器 bypass
+                        m_route->remove_default_route();
                     }
-                    m_dnsProxy.stop();                    // 断线期间路由未定，代理停用
-                    m_dnsGuard.restore();                 // 恢复物理网卡 DNS（断线期间可正常上网）
+                    m_dnsProxy.stop();
+                    m_dnsGuard.restore();
                 }
                 if (s == ConnState::Stopped || s == ConnState::Error)
                 {
@@ -566,39 +484,37 @@ bool ClientApp::start()
             }
         });
 
-    // 连接成功回调：加默认路由 + 防 DNS 泄漏 + 采用服务端通告的虚拟 IP + 注册成功清 RegisterToken
-    // 回调运行在 worker 线程，整体 try/catch 防止异常穿过 std::thread 边界导致崩溃。
     m_mgr->set_connected_callback([this]()
         {
             try
             {
             if (m_route)
             {
+                // 顺序不能换：先 bypass 服务器，再加默认路由，否则握手包会进 TUN 黑洞
                 m_route->add_server_bypass_route(cfg_from_utf8(m_remote));
-                // 分流：把国内网段先指回物理出口，再加默认路由。
-                // 顺序不能反——先加默认路由会有一个短暂窗口，
-                // 期间国内流量被送进隧道（不致命，但触发无谓重连）。
-                apply_split_routing();
-                m_route->add_default_route(m_cfg.Metric);
-                // 注意：**不要**在这里调用 add_ipv6_default_route()（::/0 kill-switch）。
-                // 2026-09-25 实测回归（Android 端同样现象）：把 ::/0 拉进 TUN 后，
-                // 我们的客户端只会本地静默丢弃这些 IPv6 包（tun_to_udp_loop 的
-                // IPv4-only 过滤），V6 优先的应用要等连接超时（10~20s）才回落 IPv4
-                // —— 表现为"连上了但很多应用打不开/很慢"。不接管 IPv6（走物理网卡）
-                // 后恢复正常。代价：IPv6 流量绕过隧道、泄漏真实出口 IP。
-                // 要既堵泄漏又不卡，正确做法是对 IPv6 包回 ICMPv6 Destination
-                // Unreachable / TCP RST，让应用快速失败——尚未实现（需真机验证）。
+                if (intranet_active())
+                {
+                    // 内网模式：只把指定网段指向隧道，默认路由留给物理网卡
+                    apply_intranet_routing();
+                }
+                else
+                {
+                    if (routing_intranet() && m_serverManaged)
+                    {
+                        emit_log("[Intranet] 受管服务器不支持内网访问，本次按全局模式连接");
+                    }
+                    apply_split_routing();
+                    m_route->add_default_route(m_cfg.Metric);
+                }
             }
-            // 隧道已建立：此时才清物理网卡 DNS / 禁用多宿主解析（防泄漏），
-            // 断线时由状态回调恢复，不会出现\"没连上却把系统 DNS/路由切走\"的黑洞。
-            m_dnsGuard.protect(m_tun->get_interface_id(), effective_dns());
-            // P3 DNS 分流：分流模式（非受管）启动本地 DNS 代理——
-            // 国内域名 → 223.5.5.5 直连解析，国外域名 → 8.8.8.8 走隧道（无污染）。
-            // 启动失败（域名表缺失/端口占用）回落原 DNS 行为，绝不因此断流。
+            if (!intranet_active())
+            {
+                // 内网模式下不改系统 DNS：公网解析仍由物理网卡完成
+                m_dnsGuard.protect(m_tun->get_interface_id(), effective_dns());
+            }
             if (routing_split())
             {
                 const cfgstr listFile = cfg_path_join(cfg_from_utf8(get_exe_dir()), CS("chn-domains.txt"));
-                // 国外上游 = 配置 DNS 首选（默认 8.8.8.8，走隧道）
                 std::string foreign = narrow(m_cfg.DNS);
                 const std::size_t comma = foreign.find(',');
                 if (comma != std::string::npos)
@@ -611,22 +527,18 @@ bool ClientApp::start()
                     emit_log("[DnsProxy] DNS 分流已启用（国内直连解析 / 国外走隧道）");
                 }
             }
+            else if (intranet_active())
+            {
+                // 内网模式不动系统 DNS：公网解析继续走物理网卡
+                m_dnsProxy.stop();
+            }
             else
             {
-                m_dnsProxy.stop();   // 非分流连接不代理，恢复常规 DNS
+                m_dnsProxy.stop();
                 m_adapter->set_DNS_IPv4(effective_dns());
             }
             emit_log("[Reconnect] Connected, routes + DNS guard active");
 
-            // 多用户服务端：identity_ok 通告的虚拟 IP 覆盖网卡地址
-            //
-            // 顺序很关键：先关上行闸门（m_tunIpReady=false），改完网卡地址再开。
-            // 2026-10-19 回归事故：服务端改成"随机分配虚拟 IP"后，每次连接
-            // （含重连、含 UDP↔TCP 切换）客户端都会拿到一个【新】地址，而
-            // tun_to_udp_loop 在握手一成功就开始转发——网卡地址还没切过来的
-            // 那几百毫秒里，发出的包源地址还是旧 IP，被服务端源地址防伪校验
-            // 整片丢弃。现象就是：网速掉到几十 K、隧道内 TCP 三次握手 SYN 都
-            // 上不去（"TCP 连不上"）、切换传输后彻底连不上。
             auto u = m_mgr->udp();
             m_tunIpReady.store(u == nullptr || u->assigned_ip() == 0);
             if (u && u->assigned_ip() != 0 && m_adapter)
@@ -638,12 +550,6 @@ bool ClientApp::start()
                               (ip >> 8) & 0xFF, ip & 0xFF);
                 const cfgstr wip = cfg_from_utf8(ipstr);
                 const uint8_t prefix = u->assigned_prefix();
-                // 采用服务端分配的虚拟 IP 之前，先清掉本网卡上的【其它】IPv4 地址：
-                // Wintun 适配器是持久设备、地址跨进程保留，历次运行被分到不同虚拟 IP 时
-                // 网卡上会残留多个地址，Windows 选源地址可能挑到旧的那个，被服务端的
-                // 源地址防伪校验整片丢弃（现象：认证成功、显示已连接，却一个包都上不去）。
-                // 传 wip = 保留本次要用的地址本身：已在网卡上就不动它（不退掉再重加，
-                // 避免 set 失败后网卡没有任何地址），只清残留。
                 const int cleared = m_adapter->clear_IPv4_addresses(wip);
                 if (cleared > 0)
                 {
@@ -660,18 +566,12 @@ bool ClientApp::start()
                 }
                 else
                 {
-                    // 网卡地址没改成功 = 上行每个包都会被服务端丢掉。
-                    // 闸门仍然打开（万一旧地址恰好就是本次分配的地址，流量还能走），
-                    // 由 tun_to_udp_loop 的源地址终检逐包兜住并计数，不再静默：
-                    // 否则用户看到的是"显示已连接、一个包都上不去"。
                     LOG_ERR("[TUN] 设置服务端分配的 IP 失败: %s/%u —— 上行数据可能被服务端"
                             "源地址校验丢弃；请重连（或检查 Wintun 网卡地址是否被占用）",
                             ipstr, static_cast<unsigned>(prefix));
                 }
-                // 地址（含清理残留）已处理：放行上行（不匹配的包由终检拦下）
                 m_tunIpReady.store(true);
             }
-            // 注册模式连上 = 注册成功：清空 RegisterToken，下次自动登录
             if (!m_cfg.RegisterToken.empty())
             {
                 m_cfg.RegisterToken.clear();
@@ -681,7 +581,6 @@ bool ClientApp::start()
             }
             if (m_onConnect)
             {
-                // ConnectedCallback 携带服务端分配的虚拟 IP（可能为空）
                 m_onConnect(assigned_ip());
             }
             }
@@ -695,7 +594,6 @@ bool ClientApp::start()
             }
         });
 
-    // 注册令牌被拒：清空 RegisterToken，切换登录模式重试
     m_mgr->set_register_token_rejected_callback([this]()
         {
             try
@@ -733,10 +631,9 @@ bool ClientApp::start()
     return true;
 }
 
+// 上行：虚拟网卡读 IP 包，握手完成且虚拟 IP 就绪后封装发往服务端
 void ClientApp::tun_to_udp_loop()
 {
-    // 桥接线程兜底：任何异常（内存耗尽/Wintun/加密层）只记日志继续，
-    // 绝不能穿过 std::thread 边界——否则 std::terminate 直接崩溃进程
     while (m_running.load())
     {
         try
@@ -747,9 +644,6 @@ void ClientApp::tun_to_udp_loop()
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
-            // 上行闸门：服务端通告了虚拟 IP，但网卡地址还没切过去（connected
-            // 回调里改地址）——这段时间发出的包源地址是旧的，服务端会整片丢弃。
-            // 宁可先不发（应用侧看到的是短暂拥塞），也不要把注定被丢的包打出去。
             const uint32_t assigned = u->assigned_ip();
             if (assigned != 0 && !m_tunIpReady.load())
             {
@@ -760,9 +654,6 @@ void ClientApp::tun_to_udp_loop()
             uint8_t* pkt = m_tun->read_packet(&len);
             if (pkt && len > 0)
             {
-                // 只转发 IPv4：Wintun 网卡上还会有系统自己产生的 IPv6 链路本地报文
-                // （MLD/NDP 等 48~76 字节的控制报文），隧道的 tun 只配置了 IPv4，
-                // 塞进去只会被服务端逐包拒收（白耗上行 + 刷服务端日志）。本地丢弃。
                 if (len < 20 || (pkt[0] >> 4) != 4)
                 {
                     m_tun->release_read_packet(pkt);
@@ -775,14 +666,10 @@ void ClientApp::tun_to_udp_loop()
                     }
                     continue;
                 }
-                // 源地址终检（最后一道保险）：包内源 IP 必须等于本会话的虚拟 IP，
-                // 否则服务端必然按"冒用源地址"丢弃（白耗上行 + 服务端刷拒绝日志）。
-                // 闸门已经挡住主要窗口，这里兜的是"网卡上残留旧地址、Windows 挑错
-                // 源地址"这种闸门管不到的情况。
                 if (assigned != 0)
                 {
                     uint32_t src = 0;
-                    memcpy(&src, pkt + 12, 4);          // IPv4 头 offset 12 = 源地址
+                    memcpy(&src, pkt + 12, 4);
                     if (src != htonl(assigned))
                     {
                         m_tun->release_read_packet(pkt);
@@ -804,9 +691,6 @@ void ClientApp::tun_to_udp_loop()
             }
             else
             {
-                // 环形缓冲空：等"有包可读"事件（事件驱动，有包立即唤醒），
-                // 200ms 超时兜底检查 m_running/重连状态——替代固定 5ms sleep 轮询。
-                // Windows 等 Wintun 的 ring 事件句柄；Linux 直接 poll tun 的 fd。
                 const tun_event_t ev = m_tun->read_wait_event();
 #if defined(_WIN32)
                 if (ev != nullptr)
@@ -845,9 +729,9 @@ void ClientApp::tun_to_udp_loop()
     }
 }
 
+// 下行：从服务端收 IP 包，写回虚拟网卡
 void ClientApp::udp_to_tun_loop()
 {
-    // 桥接线程兜底：同 tun_to_udp_loop，异常不穿线程边界
     while (m_running.load())
     {
         try
@@ -885,7 +769,6 @@ void ClientApp::udp_to_tun_loop()
 
 namespace {
 
-// 大小写不敏感比较（配置里写 Split / SPLIT 都认）
 bool equals_ci(const std::string& a, const char* b)
 {
     const std::size_t n = std::strlen(b);
@@ -906,7 +789,6 @@ bool equals_ci(const std::string& a, const char* b)
     return true;
 }
 
-// 从程序目录加载内置的国内网段列表（exeDirUtf8 为 UTF-8 路径）
 bool load_china_ip_list(const std::string& exeDirUtf8, std::vector<cidr::Cidr>& out)
 {
     const cfgstr path = cfg_path_join(cfg_from_utf8(exeDirUtf8), CS("chnroute.txt"));
@@ -920,7 +802,7 @@ bool load_china_ip_list(const std::string& exeDirUtf8, std::vector<cidr::Cidr>& 
     return !out.empty();
 }
 
-} // namespace
+}
 
 bool ClientApp::routing_split() const
 {
@@ -932,14 +814,100 @@ void ClientApp::set_routing_split(bool split)
     m_cfg.RoutingMode = split ? CS("split") : CS("full");
 }
 
-// 实际使用的 DNS。
-// 分流模式下刻意改用国内 DNS：隧道只承载国外流量，DNS 却全走隧道是反直觉的——
-// 一旦隧道出口异常，连国内域名都解析不了，表现就是"完全没网"。
-// 国内 DNS 的地址落在 chnroute 里，会走直连，隧道挂了也不影响国内访问。
+bool ClientApp::routing_intranet() const
+{
+    return equals_ci(cfg_to_utf8(m_cfg.RoutingMode), "intranet");
+}
+
+// 内网访问只对自建卡片开放；受管服务器即使配置了也按 full 处理
+
+cfgstr ClientApp::routing_mode() const
+{
+    return m_cfg.RoutingMode;
+}
+
+void ClientApp::set_routing_mode(const cfgstr& mode)
+{
+    m_cfg.RoutingMode = mode;
+    m_intranetApplied.store(false);
+}
+
+static cfgstr ipv4_text(uint32_t v)
+{
+    char buf[16] = {0};
+    std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+                  (v >> 24) & 0xFFu, (v >> 16) & 0xFFu,
+                  (v >> 8) & 0xFFu, v & 0xFFu);
+    return cfg_from_utf8(buf);
+}
+
+// 内网访问：只把配置的网段指向隧道，系统默认路由保持物理网卡
+void ClientApp::apply_intranet_routing()
+{
+    if (!m_route || m_intranetApplied.load())
+    {
+        return;
+    }
+    if (m_serverManaged)
+    {
+        LOG_ERR("[Intranet] 受管服务器（由服务方下发）不支持内网访问，已忽略 IntranetSubnets");
+        return;
+    }
+
+    std::vector<cidr::Cidr> list;
+    const std::string raw = cfg_to_utf8(m_cfg.IntranetSubnets);
+    std::string item;
+    for (std::size_t i = 0; i <= raw.size(); ++i)
+    {
+        const char c = (i < raw.size()) ? raw[i] : ',';
+        if (c != ',' && c != ';' && c != ' ' && c != '\t')
+        {
+            item.push_back(c);
+            continue;
+        }
+        if (item.empty())
+        {
+            continue;
+        }
+        cidr::Cidr one{};
+        if (cidr::parse(item, one))
+        {
+            list.push_back(one);
+        }
+        else
+        {
+            LOG_WARN("[Intranet] 忽略无法解析的网段: %s", item.c_str());
+        }
+        item.clear();
+    }
+
+    if (list.empty())
+    {
+        LOG_ERR("[Intranet] IntranetSubnets 为空或全部无效，未注入任何路由："
+                "除隧道本身外所有流量仍走物理网络");
+        return;
+    }
+
+    int ok = 0;
+    for (const auto& n : list)
+    {
+        if (m_route->add_tunnel_route(ipv4_text(n.addr), n.prefix, m_cfg.Metric))
+        {
+            ++ok;
+        }
+    }
+    if (ok == 0)
+    {
+        LOG_ERR("[Intranet] %zu 条内网路由全部注入失败（需管理员权限）", list.size());
+        return;
+    }
+    m_intranetApplied.store(true);
+    LOG_INFO("[Intranet] 注入 %d/%zu 条内网路由，默认路由保持物理网卡",
+             ok, list.size());
+}
+
 cfgstr ClientApp::effective_dns() const
 {
-    // 分流模式：TUN DNS 先指向国内上游；连接成功后由 P3 DNS 代理接管
-    // （127.0.0.1，按域名分流：国内直连解析 / 国外走隧道无污染）
     if (!routing_split())
     {
         return m_cfg.DNS;
@@ -947,12 +915,9 @@ cfgstr ClientApp::effective_dns() const
     return CS("223.5.5.5,119.29.29.29");
 }
 
-// 流量分流：Mode=split 时把国内网段指回物理出口。
-// 调用点固定在 add_default_route() 之前——先让国内段绕开隧道，再接管默认路由。
+// 分流：把国内 CIDR 指向物理网关，前缀比隧道默认路由更具体因而优先生效
 void ClientApp::apply_split_routing()
 {
-    // 受管连接同样支持智能分流：P3 DNS 代理已解决国内 DNS 污染问题——
-    // 国内域名走直连（不烧配额），国外域名走隧道（无污染）
     if (!equals_ci(cfg_to_utf8(m_cfg.RoutingMode), "split"))
     {
         LOG_INFO("[Split] Mode=full：全流量走隧道");
@@ -960,7 +925,6 @@ void ClientApp::apply_split_routing()
     }
     if (m_route->split_route_count() > 0)
     {
-        // 断线重连：路由已存在，重复注入只会让路由表膨胀
         LOG_INFO("[Split] 已注入 %zu 条，跳过重复注入", m_route->split_route_count());
         return;
     }
@@ -986,7 +950,6 @@ void ClientApp::apply_split_routing()
     }
     if (static_cast<std::size_t>(ok) * 10 < total)
     {
-        // 只成功一小部分比完全不分流更危险：用户无法判断哪些走了隧道
         LOG_WARN("[Split] 仅成功 %d/%zu（不足 10%%），回滚避免半个分流", ok, total);
         m_route->remove_split_routes();
         return;
@@ -994,8 +957,6 @@ void ClientApp::apply_split_routing()
     LOG_INFO("[Split] 注入 %d/%zu 条国内网段，耗时 %lld ms", ok, total,
              static_cast<long long>(ms));
 
-    // 自校验：CreateIpForwardEntry2 返回成功不代表真的写进去了。
-    // 把记录过的条目拿到系统路由表里对一遍，日志才能自证分流是否生效。
     const int actual = m_route->count_active_split_routes();
     if (actual >= 0)
     {
@@ -1014,7 +975,7 @@ void ClientApp::apply_split_routing()
 void ClientApp::stop()
 {
     const bool wasRunning = m_running.exchange(false);
-    m_tunIpReady.store(false);   // 停止即关上行闸门
+    m_tunIpReady.store(false);
     if (m_mgr)
     {
         m_mgr->stop();
@@ -1023,6 +984,7 @@ void ClientApp::stop()
     {
         m_route->clear_routes();
     }
+    m_intranetApplied.store(false);
     if (m_threadTunToUdp.joinable())
     {
         m_threadTunToUdp.join();
@@ -1032,7 +994,6 @@ void ClientApp::stop()
         m_threadUdpToTun.join();
     }
     m_mgr.reset();
-    // 断线/停止：恢复物理网卡 DNS（防 DNS 泄漏守卫的恢复步骤）
     m_dnsProxy.stop();
     m_dnsGuard.restore();
     m_state.store(ConnState::Stopped);
@@ -1041,14 +1002,6 @@ void ClientApp::stop()
         emit_log("VPN stopped");
     }
 }
-
-//void ClientApp::force_reconnect()
-//{
-//    if (m_mgr)
-//    {
-//        m_mgr->force_disconnect_for_test();
-//    }
-//}
 
 ConnState ClientApp::state() const
 {
@@ -1078,19 +1031,15 @@ std::string ClientApp::client_id() const
     return narrow(m_cfg.ClientID);
 }
 
-// 多服务器：切换目标服务器及其各自认证身份（init 之后、start 之前调用）
 void ClientApp::set_server(const ServerEntry& entry)
 {
+    m_serverManaged = entry.managed;
     m_serverHost = narrow(entry.ServerIP);
     m_remote = m_serverHost;
     m_port = static_cast<uint16_t>(entry.ServerPort);
     m_transport = entry.transport ? Transport::TCP : Transport::UDP;
     m_cfg.ClientID = entry.ClientID;
     m_cfg.RegisterToken = entry.RegisterToken;
-    // 把本条的传输方式/身份同步回 m_cfg.servers：
-    // save_config() 会按 m_cfg.servers 全量重写 config.ini，"注册成功清 Token"
-    // 或"令牌被拒清 Token"那两次保存会把 Transport 写回 init() 时缓存的值。
-    // 不同步的话：用户切到 TCP 连一次 -> 保存把 Transport 改回 0 -> 下次又变 UDP。
     bool synced = false;
     for (auto& s : m_cfg.servers)
     {
@@ -1104,31 +1053,20 @@ void ClientApp::set_server(const ServerEntry& entry)
             break;
         }
     }
-    // 列表里没有这一条（启动时 Count=0，卡片是受管服务刚下发的）→ 补进去。
-    // 不补的话 save_config() 会按空的 m_cfg.servers 把 [Server] Count 写成 0，
-    // 下一次启动所有卡片凭空消失（"清 Token"那两次保存就会触发）。
     if (!synced)
     {
         m_cfg.servers.push_back(entry);
     }
-    // 服务器身份公钥：该服务器配置了公钥就用它验签（多服务器各自独立）；
-    // 为空则恢复内置硬编码公钥——绝不能保留上一台服务器的自定义公钥，
-    // 否则切换服务器后拿 A 的公钥验 B 的签名，验签必失败（公钥串台）
     if (!entry.ServerPubKey.empty())
     {
         m_serverSigPubPem = "-----BEGIN PUBLIC KEY-----\n"
                           + narrow(entry.ServerPubKey)
                           + "\n-----END PUBLIC KEY-----\n";
-        // 注意别再打 m_remote（服务器 IP）——历史上这里打的是 IP，看着像"公钥"，
-        // 排查时无法判断到底用的是哪把钥匙。实际指纹由 UDP::init 的
-        // "[Identity] 客户端验签用的服务器公钥指纹" 打印，可与服务端启动日志比对
         emit_log("已应用服务器条目 %s 配置的 ServerPubKey 验签", cfg_to_utf8(m_cfg.ServerIP).c_str());
     }
     else
     {
         m_serverSigPubPem = m_builtinServerSigPubPem;
-        // 兜底用的是编译进程序的固定公钥：它一旦与服务器实际身份不一致，
-        // 阶段1 就会验签失败并断开（现象酷似"被服务器踢掉"），必须显式提示
         emit_log("服务器条目未配置 ServerPubKey，使用内置固定公钥验签"
                  "（若与服务器身份不符会在握手时验签失败）");
     }
@@ -1136,4 +1074,3 @@ void ClientApp::set_server(const ServerEntry& entry)
              (m_transport == Transport::TCP) ? "TCP" : "UDP",
              narrow(m_cfg.ClientID).c_str());
 }
-

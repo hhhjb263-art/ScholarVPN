@@ -10,7 +10,6 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
-
 #include <climits>
 #include <cstdio>
 #include <memory>
@@ -41,12 +40,6 @@ using KdfCtxPtr = std::unique_ptr<EVP_KDF_CTX, decltype(&EVP_KDF_CTX_free)>;
 using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
 using MdCtxPtr = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
 
-// 创建密钥文件后修正权限与属主：
-//   私钥恒为 0600（仅属主可读），公钥为 0644（公钥本就应公开，便于分发）。
-//   若以 root 运行（sudo / systemd），把文件属主改为"所在目录的属主"——
-//   例如 keys/ 目录属主是 user，则自动生成的密钥归 user 所有：
-//   项目属主（VS Code）可读可备份，其他本地用户因 0600 仍不可读。
-//   非 root 运行时文件本就属当前用户，仅设置权限即可。
 void fix_key_file_owner(const std::string& private_pem_path,
                         const std::string& public_pem_path)
 {
@@ -60,11 +53,9 @@ void fix_key_file_owner(const std::string& private_pem_path,
             ::chown(public_pem_path.c_str(), st.st_uid, st.st_gid);
         }
     }
-    // chown 可能清掉 setuid/setgid 位，因此权限放在 chown 之后设置
     ::chmod(private_pem_path.c_str(), 0600);
     ::chmod(public_pem_path.c_str(), 0644);
 }
-
 
 std::string collect_openssl_errors()
 {
@@ -119,14 +110,13 @@ void validate_aes256_key(const std::vector<std::uint8_t>& key)
     }
 }
 
-} // namespace
+}
 
 void secure_wipe(std::vector<std::uint8_t>& buffer) noexcept
 {
     if (!buffer.empty())
         OPENSSL_cleanse(buffer.data(), buffer.size());
 
-    // 防止调用者继续读取旧长度的数据。
     buffer.clear();
 }
 
@@ -420,18 +410,10 @@ std::optional<std::vector<std::uint8_t>> aes256_gcm_decrypt(
         key, input.data(), input.size(), aad, aad_length,
         out.data(), out.size());
     if (written == 0)
-        return std::nullopt;   // tag 校验失败：静默语义
+        return std::nullopt;
     out.resize(written);
     return out;
 }
-
-// ---- 热路径零拷贝实现 ----
-//
-// EVP_CIPHER_CTX 复用策略：thread_local 各线程独占，逐包 EVP_CIPHER_CTX_reset
-// 后重新 init（替代逐包 new/free——GCM 上下文分配是每包最贵的堆操作之一）。
-// 同一 cipher 对象逐包换 key/nonce 是 OpenSSL 公开支持用法（Init_ex 传 cipher=NULL
-// 只更新 key/iv）。线程本地保证无跨线程竞争；Session 生命周期跨线程，
-// 密钥字节由调用方传入，上下文不持有密钥引用。
 
 thread_local CipherCtxPtr g_seal_ctx(nullptr, &EVP_CIPHER_CTX_free);
 thread_local CipherCtxPtr g_open_ctx(nullptr, &EVP_CIPHER_CTX_free);
@@ -482,7 +464,6 @@ std::size_t aes256_gcm_seal(
         throw_openssl_error("AES-GCM AAD update failed");
     }
 
-    // GCM 是流式：两段明文分开 Update 即可（内层 type 字节 + 载荷免拼接）
     std::size_t total = 0;
     std::uint8_t* ct = out + AES_GCM_NONCE_LEN;
     if (plaintext1_length != 0 &&
@@ -499,7 +480,6 @@ std::size_t aes256_gcm_seal(
     if (EVP_EncryptFinal_ex(ctx, ct + pt_len, &produced) != 1) {
         throw_openssl_error("AES-GCM encryption finalization failed");
     }
-    // AES-GCM final 不产生额外字节（CTR 模式流式）；保险起见仍校验
     if (produced != 0) {
         throw std::runtime_error("AES-GCM produced unexpected final bytes");
     }
@@ -574,10 +554,9 @@ std::size_t aes256_gcm_open(
 
     const int final_result = EVP_DecryptFinal_ex(ctx, out + ct_len, &produced);
     if (final_result <= 0) {
-        OPENSSL_cleanse(out, ct_len);   // 认证失败：明文不可信，擦除
+        OPENSSL_cleanse(out, ct_len);
         return 0;
     }
-    // GCM final 不应再产出明文（同上，防御性校验）
     if (produced != 0) {
         OPENSSL_cleanse(out, ct_len);
         throw std::runtime_error("AES-GCM produced unexpected final bytes");
@@ -612,8 +591,6 @@ bool parse_inner_packet(
     return true;
 }
 
-
-// Ed25519 身份密钥（公私钥验证）
 bool generate_ed25519_keypair(const std::string& private_pem_path,
                               const std::string& public_pem_path,
                               std::string& pub_pem_out)
@@ -632,7 +609,6 @@ bool generate_ed25519_keypair(const std::string& private_pem_path,
         return false;
     PKeyPtr key(raw_key, &EVP_PKEY_free);
 
-    // 私钥：PKCS#8 PEM
     {
         FilePtr fp(std::fopen(private_pem_path.c_str(), "wb"));
         if (!fp)
@@ -642,7 +618,6 @@ bool generate_ed25519_keypair(const std::string& private_pem_path,
             return false;
     }
 
-    // 公钥：SPKI PEM
     {
         FilePtr fp(std::fopen(public_pem_path.c_str(), "wb"));
         if (!fp)
@@ -651,7 +626,6 @@ bool generate_ed25519_keypair(const std::string& private_pem_path,
             return false;
     }
 
-    // 同时返回公钥 PEM 文本，便于展示 / 硬编码进对端程序
     {
         BioPtr mem(BIO_new(BIO_s_mem()), &BIO_free);
         if (!mem)
@@ -737,7 +711,6 @@ std::vector<std::uint8_t> ed25519_sign(
     if (!context)
         throw_openssl_error("EVP_MD_CTX_new failed");
 
-    // 纯 EdDSA（Ed25519）：OpenSSL 要求 md 参数为 NULL，不能传摘要算法
     if (EVP_DigestSignInit(
             context.get(), nullptr, nullptr, nullptr, private_key) != 1) {
         throw_openssl_error("EVP_DigestSignInit failed");
@@ -773,7 +746,7 @@ bool ed25519_verify(
     }
     validate_optional_buffer(message, message_length, "message");
     if (signature == nullptr || signature_length != ED25519_SIG_LEN) {
-        return false; // 长度不符视为无效签名
+        return false;
     }
     if (EVP_PKEY_is_a(public_key, "ED25519") != 1) {
         throw std::invalid_argument(
@@ -800,7 +773,6 @@ bool ed25519_verify(
     throw_openssl_error("Ed25519 signature verification error");
 }
 
-// 随机数与注册令牌
 std::vector<std::uint8_t> generate_nonce(std::size_t length)
 {
     if (length == 0) {
@@ -827,7 +799,6 @@ std::string generate_register_token()
     return token;
 }
 
-// 会话密钥派生（HKDF-Extract + HKDF-Expand）
 std::vector<std::uint8_t> hkdf_extract(
     const std::vector<std::uint8_t>& ikm,
     const std::vector<std::uint8_t>& salt)
@@ -878,7 +849,7 @@ std::vector<std::uint8_t> hkdf_extract(
 
     const std::size_t digest_len =
         static_cast<std::size_t>(EVP_MD_get_size(EVP_sha256()));
-    std::vector<std::uint8_t> prk(digest_len); // SHA-256 → 32 字节
+    std::vector<std::uint8_t> prk(digest_len);
     std::size_t prk_len = prk.size();
     if (EVP_KDF_derive(
             context.get(), prk.data(), prk_len, parameters) <= 0) {
@@ -970,14 +941,13 @@ DirectionalSessionKeys derive_directional_session_keys(
             "nonce_c / nonce_s cannot be empty");
     }
 
-    // salt = nonce_c || nonce_s（顺序固定，两端一致）
     std::vector<std::uint8_t> salt = nonce_c;
     salt.insert(salt.end(), nonce_s.begin(), nonce_s.end());
 
     std::vector<std::uint8_t> prk = hkdf_extract(shared_secret, salt);
     DirectionalSessionKeys keys;
-    keys.key_tx = hkdf_expand(prk, "tx", AES256_KEY_LEN); // 客户端→服务端
-    keys.key_rx = hkdf_expand(prk, "rx", AES256_KEY_LEN); // 服务端→客户端
+    keys.key_tx = hkdf_expand(prk, "tx", AES256_KEY_LEN);
+    keys.key_rx = hkdf_expand(prk, "rx", AES256_KEY_LEN);
 
     secure_wipe(prk);
     secure_wipe(salt);

@@ -28,7 +28,6 @@ void ServerAdmin::onNewConnection()
     m_clients[clientSocket] = client_ip;
 
     connect(clientSocket, &QTcpSocket::readyRead,this, &ServerAdmin::onReadyRead);
-    //connect(clientSocket, &QTcpSocket::disconnected, this, &ServerAdmin::onDisconnected);
     for(auto it = m_clients.begin();it != m_clients.end();++it){
         QTcpSocket *sock = it.key();
         QString name = it.value();

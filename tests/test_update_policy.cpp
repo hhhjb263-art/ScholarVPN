@@ -1,10 +1,3 @@
-// ============================================================================
-// tests/test_update_policy.cpp —— 版本比较与更新决策的单元测试（纯逻辑）
-//
-// 编译运行：
-//   g++ -std=c++17 -Isrc tests/test_update_policy.cpp src/update/update_policy.cpp -o t.exe
-// ============================================================================
-
 #include "update/update_policy.h"
 
 #include <cstdio>
@@ -28,7 +21,7 @@ void check(bool ok, const std::string& what)
     std::printf("  FAIL  %s\n", what.c_str());
 }
 
-} // namespace
+}
 
 int main()
 {
@@ -103,20 +96,20 @@ int main()
     {
         Policy p;
         p.latest = "1.7.0";
-        p.minimum = "";           // 没配最低版本
+        p.minimum = "";
         p.url = "u";
         p.sha256 = "s";
         p.valid = true;
         check(decide(p, "1.0.0").action == Action::Optional, "无 minimum 时不该强制");
     }
     {
-        Policy p;   // 默认无效
+        Policy p;
         check(decide(p, "1.0.0").action == Action::None, "策略未配置 → 不更新");
     }
     {
         Policy p;
         p.latest = "1.7.0";
-        p.minimum = "abc";        // 服务端笔误
+        p.minimum = "abc";
         p.url = "u";
         p.sha256 = "s";
         p.valid = true;

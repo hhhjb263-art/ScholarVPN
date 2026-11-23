@@ -557,12 +557,9 @@ bool ClientApp::start()
                 }
                 if (m_adapter->set_IPv4_address(wip, prefix))
                 {
-                    if (wip != m_cfg.VirtualIP)
-                    {
-                        m_cfg.VirtualIP = wip;
-                        m_cfg.VirtualPrefix = prefix;
-                        emit_log("[TUN] 已采用服务端分配的虚拟 IP: %s/%u", ipstr, static_cast<unsigned>(prefix));
-                    }
+                    // 只配到网卡上，不回写 config：VirtualIP 是"用户指定"语义，
+                    // 把服务端临时分配的地址写回去，下次启动就变成了固定请求，容易和别的设备撞车
+                    emit_log("[TUN] 已采用服务端分配的虚拟 IP: %s/%u", ipstr, static_cast<unsigned>(prefix));
                 }
                 else
                 {

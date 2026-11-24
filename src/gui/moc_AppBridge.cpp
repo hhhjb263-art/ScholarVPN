@@ -46,6 +46,7 @@ template <> constexpr inline auto AppBridge::qt_create_metaobjectdata<qt_meta_ta
         "connected",
         "ip",
         "logappend",
+        "level",
         "line",
         "tokenRejected",
         "updateChecked",
@@ -101,69 +102,69 @@ template <> constexpr inline auto AppBridge::qt_create_metaobjectdata<qt_meta_ta
             { QMetaType::QString, 6 },
         }}),
         // Signal 'logappend'
-        QtMocHelpers::SignalData<void(const QString &)>(7, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::QString, 8 },
+        QtMocHelpers::SignalData<void(int, const QString &)>(7, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Int, 8 }, { QMetaType::QString, 9 },
         }}),
         // Signal 'tokenRejected'
-        QtMocHelpers::SignalData<void()>(9, 2, QMC::AccessPublic, QMetaType::Void),
+        QtMocHelpers::SignalData<void()>(10, 2, QMC::AccessPublic, QMetaType::Void),
         // Signal 'updateChecked'
-        QtMocHelpers::SignalData<void(int, int, const QString &, const QString &, const QString &, const QString &, const QString &, quint64)>(10, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Int, 11 }, { QMetaType::Int, 12 }, { QMetaType::QString, 13 }, { QMetaType::QString, 14 },
-            { QMetaType::QString, 15 }, { QMetaType::QString, 16 }, { QMetaType::QString, 17 }, { QMetaType::ULongLong, 18 },
+        QtMocHelpers::SignalData<void(int, int, const QString &, const QString &, const QString &, const QString &, const QString &, quint64)>(11, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Int, 12 }, { QMetaType::Int, 13 }, { QMetaType::QString, 14 }, { QMetaType::QString, 15 },
+            { QMetaType::QString, 16 }, { QMetaType::QString, 17 }, { QMetaType::QString, 18 }, { QMetaType::ULongLong, 19 },
         }}),
         // Signal 'downloadProgress'
-        QtMocHelpers::SignalData<void(int)>(19, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Int, 20 },
+        QtMocHelpers::SignalData<void(int)>(20, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Int, 21 },
         }}),
         // Signal 'downloadFinished'
-        QtMocHelpers::SignalData<void(bool, const QString &)>(21, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Bool, 22 }, { QMetaType::QString, 15 },
+        QtMocHelpers::SignalData<void(bool, const QString &)>(22, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Bool, 23 }, { QMetaType::QString, 16 },
         }}),
         // Signal 'serviceChecked'
-        QtMocHelpers::SignalData<void(int, const QString &, const QString &, const QString &, const QString &, qulonglong, qulonglong, qulonglong, const QString &)>(23, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Int, 24 }, { QMetaType::QString, 25 }, { QMetaType::QString, 26 }, { QMetaType::QString, 27 },
-            { QMetaType::QString, 11 }, { QMetaType::ULongLong, 28 }, { QMetaType::ULongLong, 29 }, { QMetaType::ULongLong, 30 },
-            { QMetaType::QString, 15 },
+        QtMocHelpers::SignalData<void(int, const QString &, const QString &, const QString &, const QString &, qulonglong, qulonglong, qulonglong, const QString &)>(24, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Int, 25 }, { QMetaType::QString, 26 }, { QMetaType::QString, 27 }, { QMetaType::QString, 28 },
+            { QMetaType::QString, 12 }, { QMetaType::ULongLong, 29 }, { QMetaType::ULongLong, 30 }, { QMetaType::ULongLong, 31 },
+            { QMetaType::QString, 16 },
         }}),
         // Signal 'serviceRegistered'
-        QtMocHelpers::SignalData<void(int, const QString &, const QString &, const QString &, const QString &, qulonglong, qulonglong, const QString &)>(31, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Int, 22 }, { QMetaType::QString, 26 }, { QMetaType::QString, 27 }, { QMetaType::QString, 32 },
-            { QMetaType::QString, 11 }, { QMetaType::ULongLong, 28 }, { QMetaType::ULongLong, 29 }, { QMetaType::QString, 15 },
+        QtMocHelpers::SignalData<void(int, const QString &, const QString &, const QString &, const QString &, qulonglong, qulonglong, const QString &)>(32, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Int, 23 }, { QMetaType::QString, 27 }, { QMetaType::QString, 28 }, { QMetaType::QString, 33 },
+            { QMetaType::QString, 12 }, { QMetaType::ULongLong, 29 }, { QMetaType::ULongLong, 30 }, { QMetaType::QString, 16 },
         }}),
         // Signal 'serviceServers'
-        QtMocHelpers::SignalData<void(int, const QString &)>(33, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Int, 34 }, { QMetaType::QString, 15 },
+        QtMocHelpers::SignalData<void(int, const QString &)>(34, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Int, 35 }, { QMetaType::QString, 16 },
         }}),
         // Signal 'serviceModeChanged'
-        QtMocHelpers::SignalData<void(int)>(35, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Int, 36 },
+        QtMocHelpers::SignalData<void(int)>(36, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Int, 37 },
         }}),
         // Slot 'start'
-        QtMocHelpers::SlotData<void()>(37, 2, QMC::AccessPublic, QMetaType::Void),
-        // Slot 'stop'
         QtMocHelpers::SlotData<void()>(38, 2, QMC::AccessPublic, QMetaType::Void),
+        // Slot 'stop'
+        QtMocHelpers::SlotData<void()>(39, 2, QMC::AccessPublic, QMetaType::Void),
         // Slot 'connect_to_server'
-        QtMocHelpers::SlotData<void(const ServerEntry &)>(39, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { 0x80000000 | 40, 41 },
+        QtMocHelpers::SlotData<void(const ServerEntry &)>(40, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { 0x80000000 | 41, 42 },
         }}),
         // Slot 'check_update'
-        QtMocHelpers::SlotData<void()>(42, 2, QMC::AccessPublic, QMetaType::Void),
+        QtMocHelpers::SlotData<void()>(43, 2, QMC::AccessPublic, QMetaType::Void),
         // Slot 'download_and_install'
-        QtMocHelpers::SlotData<void(const QString &, const QString &, quint64, const QString &)>(43, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::QString, 16 }, { QMetaType::QString, 17 }, { QMetaType::ULongLong, 18 }, { QMetaType::QString, 44 },
+        QtMocHelpers::SlotData<void(const QString &, const QString &, quint64, const QString &)>(44, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 17 }, { QMetaType::QString, 18 }, { QMetaType::ULongLong, 19 }, { QMetaType::QString, 45 },
         }}),
         // Slot 'set_service_mode'
-        QtMocHelpers::SlotData<void(bool)>(45, 2, QMC::AccessPublic, QMetaType::Void, {{
-            { QMetaType::Bool, 36 },
+        QtMocHelpers::SlotData<void(bool)>(46, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::Bool, 37 },
         }}),
         // Slot 'check_service'
-        QtMocHelpers::SlotData<void()>(46, 2, QMC::AccessPublic, QMetaType::Void),
-        // Slot 'register_service'
         QtMocHelpers::SlotData<void()>(47, 2, QMC::AccessPublic, QMetaType::Void),
-        // Slot 'apply_server_list'
+        // Slot 'register_service'
         QtMocHelpers::SlotData<void()>(48, 2, QMC::AccessPublic, QMetaType::Void),
+        // Slot 'apply_server_list'
+        QtMocHelpers::SlotData<void()>(49, 2, QMC::AccessPublic, QMetaType::Void),
         // Slot 'take_managed_servers'
-        QtMocHelpers::SlotData<std::vector<service::ManagedServer>()>(49, 2, QMC::AccessPublic, 0x80000000 | 50),
+        QtMocHelpers::SlotData<std::vector<service::ManagedServer>()>(50, 2, QMC::AccessPublic, 0x80000000 | 51),
     };
     QtMocHelpers::UintData qt_properties {
     };
@@ -189,7 +190,7 @@ void AppBridge::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, v
         switch (_id) {
         case 0: _t->stateChanged((*reinterpret_cast< std::add_pointer_t<ConnState>>(_a[1]))); break;
         case 1: _t->connected((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1]))); break;
-        case 2: _t->logappend((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1]))); break;
+        case 2: _t->logappend((*reinterpret_cast< std::add_pointer_t<int>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2]))); break;
         case 3: _t->tokenRejected(); break;
         case 4: _t->updateChecked((*reinterpret_cast< std::add_pointer_t<int>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<int>>(_a[2])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[3])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[4])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[5])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[6])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[7])),(*reinterpret_cast< std::add_pointer_t<quint64>>(_a[8]))); break;
         case 5: _t->downloadProgress((*reinterpret_cast< std::add_pointer_t<int>>(_a[1]))); break;
@@ -217,7 +218,7 @@ void AppBridge::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, v
             return;
         if (QtMocHelpers::indexOfMethod<void (AppBridge::*)(const QString & )>(_a, &AppBridge::connected, 1))
             return;
-        if (QtMocHelpers::indexOfMethod<void (AppBridge::*)(const QString & )>(_a, &AppBridge::logappend, 2))
+        if (QtMocHelpers::indexOfMethod<void (AppBridge::*)(int , const QString & )>(_a, &AppBridge::logappend, 2))
             return;
         if (QtMocHelpers::indexOfMethod<void (AppBridge::*)()>(_a, &AppBridge::tokenRejected, 3))
             return;
@@ -282,9 +283,9 @@ void AppBridge::connected(const QString & _t1)
 }
 
 // SIGNAL 2
-void AppBridge::logappend(const QString & _t1)
+void AppBridge::logappend(int _t1, const QString & _t2)
 {
-    QMetaObject::activate<void>(this, &staticMetaObject, 2, nullptr, _t1);
+    QMetaObject::activate<void>(this, &staticMetaObject, 2, nullptr, _t1, _t2);
 }
 
 // SIGNAL 3

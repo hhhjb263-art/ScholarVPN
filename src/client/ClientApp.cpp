@@ -87,7 +87,36 @@ void ClientApp::emit_log(const char* fmt, ...)
     LOG_INFO("%s", buf);
     if (m_onLog)
     {
-        m_onLog(buf);
+        m_onLog(0, buf);
+    }
+}
+
+// 分级别版本：写文件时带上正确级别，同时把级别传给 GUI 用于着色与筛选
+void ClientApp::emit_warn(const char* fmt, ...)
+{
+    char buf[2048]{};
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    LOG_WARN("%s", buf);
+    if (m_onLog)
+    {
+        m_onLog(1, buf);
+    }
+}
+
+void ClientApp::emit_err(const char* fmt, ...)
+{
+    char buf[2048]{};
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    LOG_ERR("%s", buf);
+    if (m_onLog)
+    {
+        m_onLog(2, buf);
     }
 }
 
@@ -404,14 +433,14 @@ bool ClientApp::start()
     if (m_updateBlocked.load())
     {
         LOG_ERR("[Update] 当前版本被要求强制更新，拒绝连接");
-        emit_log("当前版本已被要求强制更新，请先更新后再连接");
+        emit_warn("当前版本已被要求强制更新，请先更新后再连接");
         m_running.store(false);
         return false;
     }
     if (m_serviceBlocked.load())
     {
         LOG_ERR("[Service] 当前设备服务状态不允许使用，拒绝连接");
-        emit_log("服务状态不允许连接（试用期结束或额度用完，等待服务方确认授权）");
+        emit_warn("服务状态不允许连接（试用期结束或额度用完，等待服务方确认授权）");
         m_running.store(false);
         return false;
     }
@@ -422,7 +451,7 @@ bool ClientApp::start()
         if (!resolve_host(m_serverHost, ip))
         {
             LOG_ERR("[DNS] 解析服务器地址失败: %s", m_serverHost.c_str());
-            emit_log("无法解析服务器地址 %s（检查域名拼写 / 本机 DNS）", m_serverHost.c_str());
+            emit_err("无法解析服务器地址 %s（检查域名拼写 / 本机 DNS）", m_serverHost.c_str());
             m_running.store(false);
             return false;
         }
@@ -501,7 +530,7 @@ bool ClientApp::start()
                 {
                     if (routing_intranet() && m_serverManaged)
                     {
-                        emit_log("[Intranet] 受管服务器不支持内网访问，本次按全局模式连接");
+                        emit_warn("[Intranet] 受管服务器不支持内网访问，本次按全局模式连接");
                     }
                     apply_split_routing();
                     m_route->add_default_route(m_cfg.Metric);

@@ -45,7 +45,7 @@ public slots:
 signals:
 	void stateChanged(ConnState  s);
 	void connected(const QString& ip);
-	void logappend(const QString &line);
+	void logappend(int level, const QString &line);
 	void tokenRejected();
 	void updateChecked(int status, int action, const QString& latest,
 	                   const QString& notes, const QString& error,

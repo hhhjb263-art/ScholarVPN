@@ -43,7 +43,8 @@ class ClientApp {
 public:
     using StateCallback = std::function<void(ConnState)>;
 	using ConnectedCallback = std::function<void(const std::string&)>;
-    using LogCallback = std::function<void(const std::string& line)>;
+    // 日志级别：0=信息 1=警告 2=错误
+    using LogCallback = std::function<void(int level, const std::string& line)>;
 	using TokenRejectedCallback = std::function<void()>;
 public:
 	ClientApp();
@@ -86,6 +87,8 @@ public:
 
 private:
 	void emit_log(const char* fmt, ...);
+	void emit_warn(const char* fmt, ...);
+	void emit_err(const char* fmt, ...);
 	void save_config();
 	void tun_to_udp_loop();
 	void udp_to_tun_loop();

@@ -42,8 +42,8 @@ AppBridge::AppBridge(QObject* parent)
 	m_app->set_connected_callback([this](const std::string& ip) {
 		emit connected(QString::fromStdString(ip));
 	});
-	m_app->set_log_callback([this](const std::string& line) {
-		emit logappend(QString::fromStdString(line));
+	m_app->set_log_callback([this](int level, const std::string& line) {
+		emit logappend(level, QString::fromStdString(line));
 	});
 	m_app->set_register_token_rejected_callback([this]() {
 		emit tokenRejected();
@@ -65,7 +65,7 @@ void AppBridge::start()
 {
 	if (!m_inited) {
 		if (!m_app->init()) {
-			emit logappend(QStringLiteral("初始化失败：请检查 config.ini、密钥与管理员权限"));
+			emit logappend(2, QStringLiteral("初始化失败：请检查 config.ini、密钥与管理员权限"));
 			return;
 		}
 		m_inited = true;
@@ -82,7 +82,7 @@ void AppBridge::connect_to_server(const ServerEntry& entry)
 {
 	if (!m_inited) {
 		if (!m_app->init()) {
-			emit logappend(QStringLiteral("初始化失败：请检查 config.ini、密钥与管理员权限"));
+			emit logappend(2, QStringLiteral("初始化失败：请检查 config.ini、密钥与管理员权限"));
 			return;
 		}
 		m_inited = true;
@@ -104,7 +104,12 @@ void AppBridge::check_update()
 
 	// 受管模式：更新策略由后台托管，不再依赖本地写死的 PolicyURL/SigURL
 	const cfgstr svcMode = IniGetStr(iniPath, CS("Service"), CS("Mode"), CS(""));
-	const cfgstr svcBase = IniGetStr(iniPath, CS("Service"), CS("ServiceURL"), CS(""));
+	cfgstr svcBase = IniGetStr(iniPath, CS("Service"), CS("ServiceURL"), CS(""));
+	if (svcBase.empty() && svcMode == CS("managed"))
+	{
+		// 与 read_service_cfg 一致：配置没填 ServiceURL 时用内置地址
+		svcBase = cfg_from_utf8(service::kServiceBaseUrl);
+	}
 	if (svcMode == CS("managed") && !svcBase.empty())
 	{
 		QString base = toQString(svcBase);

@@ -18,6 +18,12 @@
 #include <QSystemTrayIcon>
 #include <QMenu>
 #include <QCloseEvent>
+#include <QHash>
+#include <QVector>
+#include <vector>
+#include <mutex>
+#include <QPlainTextEdit>
+#include <QComboBox>
 
 class Setting;
 class QMessageBox;
@@ -118,6 +124,70 @@ private:
 	}
 };
 
+// GUI 日志环形缓冲的一条记录（级别：0=信息 1=警告 2=错误）
+struct UiLogEntry
+{
+	quint64 seq = 0;   // 全局递增序号，环形缓冲裁剪后仍能正确增量渲染
+	int level = 0;
+	QString time;
+	QString text;
+};
+
+// 主连接圆盘：自绘外环 + 内圆 + 两行文案，替代原来的方块按钮
+class DialButton : public QPushButton
+{
+public:
+	explicit DialButton(QWidget* parent = nullptr);
+
+	void set_sub_text(const QString& s);
+	void set_accent(const QColor& c);
+	// 0=未连接 1=进行中 2=已连接 3=错误
+	void set_dial_state(int state);
+
+protected:
+	void paintEvent(QPaintEvent* e) override;
+
+private:
+	QString m_sub;
+	QColor  m_accent{ 0x25, 0x63, 0xEB };
+	int     m_state = 0;
+};
+
+// 迷你趋势线：固定窗口的采样环，只负责画，不管取数
+class Sparkline : public QWidget
+{
+public:
+	explicit Sparkline(QWidget* parent = nullptr);
+
+	void set_color(const QColor& c);
+	void push(double v);
+
+protected:
+	void paintEvent(QPaintEvent* e) override;
+
+private:
+	static constexpr int kN = 36;
+	QColor m_color{ 0x25, 0x63, 0xEB };
+	double m_v[kN]{};
+	int    m_count = 0;
+	double m_max = 1024.0;
+};
+
+// 速率块：上下行两张小卡（数字 + 趋势线）
+class SpeedPanel : public QWidget
+{
+public:
+	explicit SpeedPanel(QWidget* parent = nullptr);
+
+	void push(double rxBytesPerSec, double txBytesPerSec);
+
+private:
+	Sparkline* m_rxLine = nullptr;
+	Sparkline* m_txLine = nullptr;
+	QLabel*    m_rxValue = nullptr;
+	QLabel*    m_txValue = nullptr;
+};
+
 class QtWidgetsClass : public QWidget
 {
 	Q_OBJECT
@@ -188,7 +258,21 @@ private:
 	ConnState   m_state{ ConnState::Stopped };
 	int m_activeCard = -1;
 
-	SpeedChart* m_speedChart = nullptr;
+	QVector<UiLogEntry> m_logs;
+	quint64 m_logSeq = 0;
+	void append_log_line(int level, const QString& text);
+
+public:
+	const QVector<UiLogEntry>& logs() const { return m_logs; }
+	quint64 log_seq() const { return m_logSeq; }
+	void clear_logs();
+
+private:
+	SpeedPanel* m_speedPanel = nullptr;
+	QVBoxLayout* m_homeLay = nullptr;
+	QString m_dialIp;
+	QLabel*     m_statusPill = nullptr;
+	void update_status_pill();
 	uint64_t m_rxLast = 0;
 	uint64_t m_txLast = 0;
 	bool m_speedFirst = true;
@@ -221,6 +305,41 @@ private:
 
 };
 
+// 连接市场：列出全部节点、实测 TCP 握手延迟，一键切换
+class MarketDialog : public QDialog
+{
+public:
+	MarketDialog(QWidget* parent, const QList<ServerEntry>& servers, int current);
+	int chosen() const { return m_chosen; }
+
+private:
+	void build_ui();
+	void rebuild_list();
+	void start_probe();
+	void apply_latency();
+	QString region_of(const ServerEntry& e) const;
+
+	// 探测状态放堆上共享，线程只碰这个结构，不碰窗口对象
+	struct LatState
+	{
+		std::mutex mtx;
+		std::vector<int> lat;
+		std::atomic<bool> done{ false };
+	};
+
+	QList<ServerEntry>  m_servers;
+	int                 m_current = -1;
+	int                 m_chosen = -1;
+	QString             m_filter;
+	QString             m_region;
+	QWidget*            m_listHost = nullptr;
+	QVBoxLayout*        m_listLay = nullptr;
+	class QLineEdit*    m_search = nullptr;
+	QHash<int, class QLabel*> m_latLabels;
+	std::shared_ptr<LatState> m_lat;
+	class QTimer*       m_pollTimer = nullptr;
+};
+
 class Setting : public QDialog {
 public:
 	explicit Setting(QWidget* parent, AppBridge* bridge, int initialPage = 0);
@@ -239,7 +358,23 @@ private:
 	void create_setting();
 	void build_about_page(class QStackedWidget* stack, class QListWidget* nav);
 	void build_service_page(class QStackedWidget* stack, class QListWidget* nav);
+	void build_log_page(class QStackedWidget* stack, class QListWidget* nav);
+	void refresh_log_view(bool rebuild);
+	void refresh_traffic_stats();
 	bool st_cfg_managed() const;
+	QtWidgetsClass* m_owner = nullptr;
+	QPlainTextEdit* m_logView = nullptr;
+	QComboBox* m_logFilter = nullptr;
+	QCheckBox* m_logAutoScroll = nullptr;
+	QLabel* m_statTotal = nullptr;
+	QLabel* m_statSpeed = nullptr;
+	QLabel* m_statPeak = nullptr;
+	quint64 m_logSeen = 0;
+	quint64 m_statRxLast = 0;
+	quint64 m_statTxLast = 0;
+	double m_peakRx = 0.0;
+	double m_peakTx = 0.0;
+	QTimer* m_logTimer = nullptr;
 	int m_initialPage = 0;
 	QCheckBox* m_chkAutoStart = nullptr;
 	AppBridge* m_bridge = nullptr;

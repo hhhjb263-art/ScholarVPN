@@ -260,7 +260,7 @@ sudo ./build/vpn_server --gen-token 5      # 输出 register_token: <64位hex>�
 
 ### 首次运行
 
-**Windows**：双击 `ScholarVPN.exe` 可免 UAC 启动，但**建立连接需管理员**（建网卡、改路由、改 DNS），连接前右键「以管理员身份运行」。身份密钥生成在 `%APPDATA%\ScholarVPN\keys\`：`client.id.pub`（公钥，交给管理员）与 `client.id.enc`（DPAPI 加密私钥）。
+**Windows**：程序清单声明了 `requireAdministrator`，**启动时即弹 UAC**，确认后以管理员身份运行（建网卡、改路由、改 DNS 都需要），不用再手动右键。身份密钥生成在 `%APPDATA%\ScholarVPN\keys\`：`client.id.pub`（公钥，交给管理员）与 `client.id.enc`（DPAPI 加密私钥）。
 
 **Linux**：从应用菜单启动（首次弹一次 `pkexec` 认证）或 `sudo ./build-client/vpn_client`。密钥在 `~/.config/scholarvpn/keys/`，`client.id.enc` 权限 `0600`。
 

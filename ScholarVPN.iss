@@ -30,6 +30,10 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 ; 杈撳嚭鐩綍涓庢枃浠跺悕
 OutputDir=x64\Release
 OutputBaseFilename=ScholarVPNsetup
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription=ScholarVPN Setup
 ; 瀹夎鍖呭浘鏍?
 SetupIconFile=source\icon.ico
 Compression=lzma2
@@ -69,6 +73,17 @@ Source: "x64\Release\networkinformation\*"; DestDir: "{app}\networkinformation";
 Source: "x64\Release\style.qss"; DestDir: "{app}"; Flags: ignoreversion
 ; 鎵樼洏鍥炬爣锛堢▼搴忎粠 exe 鍚岀洰褰曡鍙?icon.ico锛岀己浜嗕細閫€鍥炵郴缁熼粯璁ゅ浘鏍囷級
 Source: "x64\Release\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+; split routing data (read from exe dir at runtime)
+Source: "x64\Release\chnroute.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "x64\Release\chn-domains.txt"; DestDir: "{app}"; Flags: ignoreversion
+
+; VC++ runtime (app-local deployment, target machine needs no prereq)
+Source: "x64\Release\msvcp140.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "x64\Release\msvcp140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "x64\Release\msvcp140_2.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "x64\Release\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "x64\Release\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "x64\Release\concrt140.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

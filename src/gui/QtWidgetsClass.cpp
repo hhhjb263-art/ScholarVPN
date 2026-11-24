@@ -3466,7 +3466,7 @@ void Setting::build_log_page(QStackedWidget* stack, QListWidget* nav)
 	m_logView->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
 	QFont mono(QStringLiteral("Consolas"));
 	mono.setStyleHint(QFont::Monospace);
-	mono.setPointSize(9);
+	mono.setPointSizeF(8.2);   // 日志窗格窄，字号大了换行太碎
 	m_logView->setFont(mono);
 	m_logView->setStyleSheet(
 	    "QPlainTextEdit{ background-color:#fbfcfe; border:1px solid #e8ecf3; border-radius:10px;"
